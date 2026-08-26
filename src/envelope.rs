@@ -57,6 +57,17 @@ pub enum EnvelopeError {
     LengthExceedsLimit { length: u64, limit: u64 },
 }
 
+/// Encodes an Envelope (`length` + `type` + `payload`) onto the end of `out`.
+///
+/// `length` is `payload.len()` (spec 2.1.1, DR-032); callers are
+/// responsible for ensuring `payload.len()` respects the destination
+/// stream's length limit before calling this.
+pub fn encode(type_raw: u16, payload: &[u8], out: &mut Vec<u8>) {
+    varint::encode(payload.len() as u64, out);
+    out.extend_from_slice(&type_raw.to_le_bytes());
+    out.extend_from_slice(payload);
+}
+
 /// Attempts to decode one Envelope from the start of `buf`.
 ///
 /// `max_length` is the length limit for the stream kind this data arrived
@@ -118,6 +129,30 @@ mod tests {
         buf.extend_from_slice(&type_raw.to_le_bytes());
         buf.extend_from_slice(payload);
         buf
+    }
+
+    #[test]
+    fn encode_matches_hand_built_bytes() {
+        let mut out = Vec::new();
+        encode(0x0001, b"hello", &mut out);
+        assert_eq!(out, build(0x0001, b"hello"));
+    }
+
+    #[test]
+    fn encode_decode_round_trip() {
+        let mut out = Vec::new();
+        encode(0x4002, b"payload bytes here", &mut out);
+        let (env, consumed) = parse(&out, 1024).unwrap().unwrap();
+        assert_eq!(consumed, out.len());
+        assert_eq!(env.type_raw, 0x4002);
+        assert_eq!(env.payload, b"payload bytes here");
+    }
+
+    #[test]
+    fn encode_appends_without_clearing_existing_contents() {
+        let mut out = vec![0xFF];
+        encode(0x0001, b"x", &mut out);
+        assert_eq!(out[0], 0xFF);
     }
 
     #[test]

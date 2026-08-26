@@ -29,6 +29,83 @@ pub fn decode(buf: &[u8]) -> Result<(u64, usize), VarintError> {
     Ok((value, len))
 }
 
+/// The largest value representable by a QUIC varint (2^62 - 1).
+pub const MAX: u64 = (1 << 62) - 1;
+
+/// Encodes `value` as a QUIC varint, appending it to `out`.
+///
+/// Chooses the shortest of the four wire lengths (1/2/4/8 bytes) that fits
+/// `value`. Panics (debug and release) if `value > MAX`, since that is a
+/// programmer error on the encoding side, not attacker-controlled input.
+pub fn encode(value: u64, out: &mut Vec<u8>) {
+    assert!(value <= MAX, "varint value {value} exceeds 2^62-1");
+    if value < (1 << 6) {
+        out.push(value as u8);
+    } else if value < (1 << 14) {
+        let v = value as u16;
+        out.extend_from_slice(&[0x40 | (v >> 8) as u8, v as u8]);
+    } else if value < (1 << 30) {
+        let v = value as u32;
+        out.extend_from_slice(&(0x8000_0000 | v).to_be_bytes());
+    } else {
+        out.extend_from_slice(&(0xC000_0000_0000_0000 | value).to_be_bytes());
+    }
+}
+
+#[cfg(test)]
+mod encode_tests {
+    use super::*;
+
+    #[test]
+    fn round_trips_boundary_values() {
+        for value in [
+            0,
+            1,
+            63,             // max 1-byte
+            64,             // min 2-byte
+            16_383,         // max 2-byte
+            16_384,         // min 4-byte
+            1_073_741_823,  // max 4-byte
+            1_073_741_824,  // min 8-byte
+            MAX,
+        ] {
+            let mut buf = Vec::new();
+            encode(value, &mut buf);
+            let (decoded, consumed) = decode(&buf).unwrap();
+            assert_eq!(decoded, value);
+            assert_eq!(consumed, buf.len());
+        }
+    }
+
+    #[test]
+    fn chooses_shortest_encoding() {
+        let mut buf = Vec::new();
+        encode(37, &mut buf);
+        assert_eq!(buf, vec![0x25]);
+    }
+
+    #[test]
+    fn matches_rfc9000_2_byte_example() {
+        let mut buf = Vec::new();
+        encode(15293, &mut buf);
+        assert_eq!(buf, vec![0x7b, 0xbd]);
+    }
+
+    #[test]
+    #[should_panic]
+    fn panics_on_value_exceeding_max() {
+        let mut buf = Vec::new();
+        encode(MAX + 1, &mut buf);
+    }
+
+    #[test]
+    fn appends_without_clearing_existing_contents() {
+        let mut buf = vec![0xAA, 0xBB];
+        encode(37, &mut buf);
+        assert_eq!(buf, vec![0xAA, 0xBB, 0x25]);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

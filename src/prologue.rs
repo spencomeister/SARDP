@@ -39,6 +39,15 @@ pub enum PrologueError {
     UnknownKind(u8),
 }
 
+/// Encodes a StreamPrologue (`magic` + `kind` + `version` + `context_id`)
+/// onto the end of `out`.
+pub fn encode(kind: StreamKind, version: u8, context_id: u64, out: &mut Vec<u8>) {
+    out.extend_from_slice(&MAGIC);
+    out.push(kind.to_byte());
+    out.push(version);
+    varint::encode(context_id, out);
+}
+
 /// Attempts to decode one StreamPrologue from the start of `buf`.
 ///
 /// Returns:
@@ -83,6 +92,17 @@ pub fn parse(buf: &[u8]) -> Result<Option<(StreamPrologue, usize)>, PrologueErro
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn encode_decode_round_trip() {
+        let mut out = Vec::new();
+        encode(StreamKind::Video, 1, 300, &mut out);
+        let (prologue, consumed) = parse(&out).unwrap().unwrap();
+        assert_eq!(consumed, out.len());
+        assert_eq!(prologue.kind, StreamKind::Video);
+        assert_eq!(prologue.version, 1);
+        assert_eq!(prologue.context_id, 300);
+    }
 
     fn build(kind: u8, version: u8, context_id_byte: u8) -> Vec<u8> {
         let mut buf = MAGIC.to_vec();
