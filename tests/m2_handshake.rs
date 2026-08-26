@@ -73,11 +73,13 @@ async fn full_handshake_reaches_authenticated_on_both_sides() {
         ),
         server_handshake(&server_connection, "test-server", &trusted_public_key),
     );
-    let client_outcome = client_result.expect("client handshake succeeds");
-    let server_outcome = server_result.expect("server handshake succeeds");
+    let (client_outcome, client_sm, _client_control) =
+        client_result.expect("client handshake succeeds");
+    let (server_outcome, server_sm, _server_control) =
+        server_result.expect("server handshake succeeds");
 
-    assert_eq!(client_outcome.state, ConnectionState::Authenticated);
-    assert_eq!(server_outcome.state, ConnectionState::Authenticated);
+    assert_eq!(client_sm.state(), ConnectionState::Authenticated);
+    assert_eq!(server_sm.state(), ConnectionState::Authenticated);
     assert_eq!(client_outcome.session_id, server_outcome.session_id);
     assert_eq!(
         client_outcome.reconnect_token,

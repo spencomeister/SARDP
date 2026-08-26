@@ -11,7 +11,7 @@
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use rand::Rng;
 
-use crate::connection_sm::{ConnectionSm, ConnectionState};
+use crate::connection_sm::ConnectionSm;
 use crate::messages::{
     self, AuthMethod, AuthPubkey, AuthResult, AuthStatus, ClientHello, ServerHello,
 };
@@ -19,6 +19,14 @@ use crate::reason_code::ReasonCode;
 use crate::stream_kind::StreamKind;
 use crate::stream_reader::{EnvelopeReader, StreamReadError, write_envelope};
 use crate::{auth, permission_set, prologue};
+
+/// The `control` stream, kept alive past the handshake (spec 4.2: persistent
+/// for the whole session) so later exchanges -- TimeSync, KeepAlive, ...
+/// -- can keep using the same stream and its already-buffered bytes.
+pub struct ControlChannel {
+    pub send: quinn::SendStream,
+    pub reader: EnvelopeReader,
+}
 
 /// Everything that can go wrong while driving the M2 handshake.
 #[derive(Debug)]
@@ -47,13 +55,15 @@ impl From<quinn::WriteError> for HandshakeError {
     }
 }
 
-/// Outcome of a successful M2 handshake.
+/// Outcome of a successful M2 handshake. The resulting [`ConnectionSm`]
+/// (state `Authenticated`) and the still-open `control` stream are
+/// returned alongside this so the caller can keep driving the session
+/// (spec 4.2: `control` is persistent for the whole session).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HandshakeOutcome {
     pub session_id: [u8; 16],
     pub reconnect_token: [u8; 32],
     pub granted_permissions: u32,
-    pub state: ConnectionState,
 }
 
 fn check(sm: &ConnectionSm, type_id: u16) -> Result<(), HandshakeError> {
@@ -70,9 +80,9 @@ pub async fn client_handshake(
     client_name: &str,
     user_id: &str,
     device_id: &str,
-) -> Result<HandshakeOutcome, HandshakeError> {
+) -> Result<(HandshakeOutcome, ConnectionSm, ControlChannel), HandshakeError> {
     let mut sm = ConnectionSm::new();
-    let (mut send, mut recv) = connection.open_bi().await.map_err(HandshakeError::Quic)?;
+    let (mut send, recv) = connection.open_bi().await.map_err(HandshakeError::Quic)?;
 
     let mut prologue_bytes = Vec::new();
     prologue::encode(StreamKind::Control, 1, 0, &mut prologue_bytes);
@@ -93,7 +103,7 @@ pub async fn client_handshake(
     )
     .await?;
 
-    let mut reader = EnvelopeReader::new(&mut recv);
+    let mut reader = EnvelopeReader::new(recv);
     let (type_raw, payload) = reader
         .read_envelope(StreamKind::Control.max_envelope_length())
         .await?;
@@ -142,12 +152,12 @@ pub async fn client_handshake(
         AuthStatus::Ok => {
             sm.complete_authentication()
                 .map_err(|v| HandshakeError::ProtocolViolation(v.reason))?;
-            Ok(HandshakeOutcome {
+            let outcome = HandshakeOutcome {
                 session_id: auth_result.session_id,
                 reconnect_token: auth_result.reconnect_token,
                 granted_permissions: auth_result.granted_permissions,
-                state: sm.state(),
-            })
+            };
+            Ok((outcome, sm, ControlChannel { send, reader }))
         }
         AuthStatus::MfaRequired | AuthStatus::Denied => Err(HandshakeError::AuthDenied),
     }
@@ -161,11 +171,11 @@ pub async fn server_handshake(
     connection: &quinn::Connection,
     server_name: &str,
     trusted_public_key: &VerifyingKey,
-) -> Result<HandshakeOutcome, HandshakeError> {
+) -> Result<(HandshakeOutcome, ConnectionSm, ControlChannel), HandshakeError> {
     let mut sm = ConnectionSm::new();
-    let (mut send, mut recv) = connection.accept_bi().await.map_err(HandshakeError::Quic)?;
+    let (mut send, recv) = connection.accept_bi().await.map_err(HandshakeError::Quic)?;
 
-    let mut reader = EnvelopeReader::new(&mut recv);
+    let mut reader = EnvelopeReader::new(recv);
     let stream_prologue = reader.read_prologue().await?;
     if stream_prologue.kind != StreamKind::Control {
         // Spec 2.2.1: "未認証状態でcontrol以外のストリームが開かれたら即切断".
@@ -251,12 +261,12 @@ pub async fn server_handshake(
                 &messages::encode(&auth_result),
             )
             .await?;
-            Ok(HandshakeOutcome {
+            let outcome = HandshakeOutcome {
                 session_id,
                 reconnect_token,
                 granted_permissions,
-                state: sm.state(),
-            })
+            };
+            Ok((outcome, sm, ControlChannel { send, reader }))
         }
         Err(auth_error) => {
             let violation = sm.record_auth_failure();

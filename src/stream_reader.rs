@@ -1,8 +1,13 @@
 //! Buffers bytes read from a QUIC `RecvStream` so `StreamPrologue`/
 //! `Envelope` parsing (incremental, per M1) can be retried as more data
 //! arrives, without losing bytes that belong to the next frame. Shared by
-//! the `control` stream (handshake) and `video` stream (video session)
-//! readers.
+//! the `control` stream (handshake, TimeSync) and `video` stream (video
+//! session) readers.
+//!
+//! Owns its `RecvStream` (rather than borrowing it) so a long-lived
+//! stream -- `control` is persistent for the whole session, spec 4.2 --
+//! can be handed off between the functions that use it in sequence (e.g.
+//! `handshake` to `timesync`) without losing already-buffered bytes.
 
 use crate::{envelope, prologue};
 
@@ -21,13 +26,13 @@ impl From<quinn::ReadError> for StreamReadError {
     }
 }
 
-pub struct EnvelopeReader<'s> {
-    recv: &'s mut quinn::RecvStream,
+pub struct EnvelopeReader {
+    recv: quinn::RecvStream,
     buf: Vec<u8>,
 }
 
-impl<'s> EnvelopeReader<'s> {
-    pub fn new(recv: &'s mut quinn::RecvStream) -> Self {
+impl EnvelopeReader {
+    pub fn new(recv: quinn::RecvStream) -> Self {
         Self {
             recv,
             buf: Vec::new(),

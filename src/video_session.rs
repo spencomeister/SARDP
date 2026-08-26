@@ -158,8 +158,8 @@ pub async fn read_video_instance_intro(
     connection: &quinn::Connection,
 ) -> Result<VideoInstanceIntro, VideoError> {
     let mut sm = VideoInstanceSm::new();
-    let mut recv = connection.accept_uni().await.map_err(VideoError::Quic)?;
-    let mut reader = EnvelopeReader::new(&mut recv);
+    let recv = connection.accept_uni().await.map_err(VideoError::Quic)?;
+    let mut reader = EnvelopeReader::new(recv);
 
     let stream_prologue = reader.read_prologue().await?;
     if stream_prologue.kind != StreamKind::Video {

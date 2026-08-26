@@ -3,9 +3,14 @@
 //! "no hand-written parsers" rule.
 
 pub mod auth;
+pub mod channel_sm;
+pub mod client_display;
+pub mod clock;
 pub mod connection_sm;
+pub mod decoder;
 pub mod encoder;
 pub mod envelope;
+pub mod feedback_session;
 pub mod h264;
 pub mod handshake;
 pub mod messages;
@@ -17,6 +22,7 @@ pub mod reason_code;
 pub mod stream_kind;
 pub mod stream_reader;
 pub mod timecode_frame;
+pub mod timesync;
 pub mod varint;
 pub mod video_session;
 pub mod video_sm;

@@ -1,7 +1,8 @@
-//! Connection State Machine (spec 4.1), scoped to the M2 milestone:
-//! `Handshaking -> Authenticating -> Authenticated`. Later milestones add
-//! `Active`, `Suspended`, `Closed` and the fuller message catalog that
-//! governs legality once `Authenticated`.
+//! Connection State Machine (spec 4.1). Through M4:
+//! `Handshaking -> Authenticating -> Authenticated -> Active`, the last
+//! step on the first VideoStream Channel reaching `Live` (DR-024).
+//! `Suspended`/reconnection and the fuller message catalog that further
+//! restricts `Active` are out of scope until later milestones.
 //!
 //! Per-state message legality (the "許可されるメッセージ" column of the
 //! 4.1 table) is enforced here; wall-clock timeouts (`HANDSHAKE_TIMEOUT`,
@@ -21,6 +22,7 @@ pub enum ConnectionState {
     Handshaking,
     Authenticating,
     Authenticated,
+    Active,
     Closing(ReasonCode),
 }
 
@@ -66,6 +68,13 @@ impl ConnectionSm {
         type_id == type_id::AUTH_PUBKEY
     }
 
+    /// Spec 4.1 Active row: "すべて許可(ClientHello/ServerHello/
+    /// AuthChallengeRenewを除く)". `AuthChallengeRenew` isn't implemented
+    /// (M2 scope), so only the Hello resend case applies here.
+    fn allowed_in_active(type_id: u16) -> bool {
+        !matches!(type_id, type_id::CLIENT_HELLO | type_id::SERVER_HELLO)
+    }
+
     /// Checks whether an incoming control message with this `type_id` is
     /// legal in the current state (spec 4.1's per-state message column).
     /// Does not itself change state.
@@ -77,6 +86,7 @@ impl ConnectionSm {
             // stream openings, ...) arrives with later milestones; nothing
             // to reject against yet.
             ConnectionState::Authenticated => true,
+            ConnectionState::Active => Self::allowed_in_active(type_id),
             ConnectionState::Closing(_) => false,
         };
         if allowed {
@@ -132,6 +142,22 @@ impl ConnectionSm {
         match self.state {
             ConnectionState::Authenticating => {
                 self.state = ConnectionState::Authenticated;
+                Ok(())
+            }
+            _ => Err(ProtocolViolation {
+                reason: ReasonCode::PROTOCOL_UNEXPECTED_MESSAGE,
+            }),
+        }
+    }
+
+    /// `Authenticated -> Active`, on the first VideoStream Channel
+    /// reaching `Live` (spec 4.1, DR-024). Each side (client/server)
+    /// calls this from its own observation of its own
+    /// [`crate::channel_sm::ChannelSm`] reaching `Live`.
+    pub fn on_channel_live(&mut self) -> Result<(), ProtocolViolation> {
+        match self.state {
+            ConnectionState::Authenticated => {
+                self.state = ConnectionState::Active;
                 Ok(())
             }
             _ => Err(ProtocolViolation {
@@ -267,6 +293,33 @@ mod tests {
         sm.record_auth_failure().unwrap_err(); // 1st bad signature
         sm.complete_authentication().unwrap(); // then a good one succeeds
         assert_eq!(sm.state(), ConnectionState::Authenticated);
+    }
+
+    #[test]
+    fn channel_live_transitions_authenticated_to_active() {
+        let mut sm = ConnectionSm::new();
+        sm.complete_handshake().unwrap();
+        sm.complete_authentication().unwrap();
+        assert_eq!(sm.on_channel_live(), Ok(()));
+        assert_eq!(sm.state(), ConnectionState::Active);
+    }
+
+    #[test]
+    fn channel_live_before_authenticated_is_rejected() {
+        let mut sm = ConnectionSm::new();
+        assert!(sm.on_channel_live().is_err());
+        assert_eq!(sm.state(), ConnectionState::Handshaking);
+    }
+
+    #[test]
+    fn active_rejects_hello_resend_but_allows_other_messages() {
+        let mut sm = ConnectionSm::new();
+        sm.complete_handshake().unwrap();
+        sm.complete_authentication().unwrap();
+        sm.on_channel_live().unwrap();
+        assert!(sm.check_message(type_id::CLIENT_HELLO).is_err());
+        assert!(sm.check_message(type_id::SERVER_HELLO).is_err());
+        assert_eq!(sm.check_message(type_id::TRANSPORT_FEEDBACK), Ok(()));
     }
 
     #[test]

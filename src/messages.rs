@@ -15,6 +15,9 @@
 //! messages anywhere; [`type_id`] is this implementation's own core-range
 //! (DR-014) assignment, not a spec-mandated value.
 //!
+//! M4 adds `TimeSyncRequest`/`TimeSyncResponse` (spec 2.9, control) and
+//! `TransportFeedback` (spec 2.14, `feedback` stream).
+//!
 //! Per DR-035, the logical `VideoFrame` is split on the wire into two
 //! consecutive Envelopes: [`VideoFrameHeader`] (CBOR, this module) and a
 //! raw-bytes `VideoFramePayload` (not a struct here at all -- it's just
@@ -45,6 +48,10 @@ pub mod type_id {
     pub const VIDEO_FRAME_HEADER: u16 = 0x0007;
     /// Raw H.264 Annex-B bytes; not CBOR-encoded (DR-035).
     pub const VIDEO_FRAME_PAYLOAD: u16 = 0x0008;
+    pub const TIME_SYNC_REQUEST: u16 = 0x0009;
+    pub const TIME_SYNC_RESPONSE: u16 = 0x000A;
+    /// `feedback` stream (not `control`).
+    pub const TRANSPORT_FEEDBACK: u16 = 0x000B;
 }
 
 /// `AuthMethod` enum (spec 2.3).
@@ -196,6 +203,46 @@ impl VideoFrameHeader {
     pub fn is_idr(&self) -> bool {
         self.flags & VIDEO_FRAME_FLAG_IDR != 0
     }
+}
+
+/// `TimeSyncRequest` (spec 2.9, control, either side may initiate).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TimeSyncRequest {
+    /// Requester's local monotonic send time, microseconds.
+    pub t1: u64,
+}
+
+/// `TimeSyncResponse` (spec 2.9, control).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TimeSyncResponse {
+    /// Echoed from the request.
+    pub t1: u64,
+    /// Responder's local monotonic receive time, microseconds.
+    pub t2: u64,
+    /// Responder's local monotonic send time, microseconds.
+    pub t3: u64,
+}
+
+/// `TransportFeedback` (spec 2.14, `feedback` stream, client->server).
+/// Sent every `TRANSPORT_FEEDBACK_INTERVAL` (100ms, spec 4.7) and on
+/// `last_displayed_frame_id` change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransportFeedback {
+    pub last_received_frame_id: u64,
+    pub last_decoded_frame_id: u64,
+    pub last_displayed_frame_id: u64,
+    pub frames_received: u32,
+    pub frames_dropped: u32,
+    pub receive_bitrate_bps: u64,
+    pub decode_delay_us: u32,
+    pub display_delay_us: u32,
+    /// Client-desired target latency (UI setting or similar); not
+    /// computed from measurements.
+    pub target_latency_us: u32,
+    /// The spec 2.10 backpressure primary signal: measured delay from
+    /// the frame's `capture_ts` (server clock) to client display time,
+    /// converted to a common clock via the TimeSync offset.
+    pub client_queue_delay_us: u32,
 }
 
 /// CBOR-encodes `msg` (the DR-021 message-body scheme for this
@@ -374,6 +421,45 @@ mod tests {
         assert!(!msg.is_idr());
         msg.flags |= VIDEO_FRAME_FLAG_IDR;
         assert!(msg.is_idr());
+    }
+
+    #[test]
+    fn time_sync_request_round_trips() {
+        let msg = TimeSyncRequest { t1: 123_456_789 };
+        let bytes = encode(&msg);
+        let decoded: TimeSyncRequest = decode(&bytes).unwrap();
+        assert_eq!(decoded, msg);
+    }
+
+    #[test]
+    fn time_sync_response_round_trips() {
+        let msg = TimeSyncResponse {
+            t1: 1,
+            t2: 2,
+            t3: 3,
+        };
+        let bytes = encode(&msg);
+        let decoded: TimeSyncResponse = decode(&bytes).unwrap();
+        assert_eq!(decoded, msg);
+    }
+
+    #[test]
+    fn transport_feedback_round_trips() {
+        let msg = TransportFeedback {
+            last_received_frame_id: 10,
+            last_decoded_frame_id: 10,
+            last_displayed_frame_id: 9,
+            frames_received: 11,
+            frames_dropped: 1,
+            receive_bitrate_bps: 5_000_000,
+            decode_delay_us: 2_000,
+            display_delay_us: 1_000,
+            target_latency_us: 50_000,
+            client_queue_delay_us: 15_000,
+        };
+        let bytes = encode(&msg);
+        let decoded: TransportFeedback = decode(&bytes).unwrap();
+        assert_eq!(decoded, msg);
     }
 
     #[test]
