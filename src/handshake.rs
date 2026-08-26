@@ -17,17 +17,15 @@ use crate::messages::{
 };
 use crate::reason_code::ReasonCode;
 use crate::stream_kind::StreamKind;
-use crate::{auth, envelope, permission_set, prologue};
+use crate::stream_reader::{EnvelopeReader, StreamReadError, write_envelope};
+use crate::{auth, permission_set, prologue};
 
 /// Everything that can go wrong while driving the M2 handshake.
 #[derive(Debug)]
 pub enum HandshakeError {
     Quic(quinn::ConnectionError),
-    Read(quinn::ReadError),
+    Read(StreamReadError),
     Write(quinn::WriteError),
-    StreamClosedEarly,
-    Prologue(prologue::PrologueError),
-    Envelope(envelope::EnvelopeError),
     Decode(ciborium::de::Error<std::io::Error>),
     /// A message arrived that spec 4.1 does not permit in the current
     /// Connection SM state.
@@ -37,8 +35,8 @@ pub enum HandshakeError {
     AuthDenied,
 }
 
-impl From<quinn::ReadError> for HandshakeError {
-    fn from(e: quinn::ReadError) -> Self {
+impl From<StreamReadError> for HandshakeError {
+    fn from(e: StreamReadError) -> Self {
         Self::Read(e)
     }
 }
@@ -47,73 +45,6 @@ impl From<quinn::WriteError> for HandshakeError {
     fn from(e: quinn::WriteError) -> Self {
         Self::Write(e)
     }
-}
-
-/// Buffers bytes read from a QUIC `RecvStream` so `StreamPrologue`/
-/// `Envelope` parsing (which is incremental, per M1) can be retried as
-/// more data arrives, without losing bytes that belong to the next frame.
-struct ControlReader<'s> {
-    recv: &'s mut quinn::RecvStream,
-    buf: Vec<u8>,
-}
-
-impl<'s> ControlReader<'s> {
-    fn new(recv: &'s mut quinn::RecvStream) -> Self {
-        Self {
-            recv,
-            buf: Vec::new(),
-        }
-    }
-
-    async fn fill_more(&mut self) -> Result<(), HandshakeError> {
-        let mut chunk = [0u8; 4096];
-        let n = self
-            .recv
-            .read(&mut chunk)
-            .await?
-            .ok_or(HandshakeError::StreamClosedEarly)?;
-        self.buf.extend_from_slice(&chunk[..n]);
-        Ok(())
-    }
-
-    async fn read_prologue(&mut self) -> Result<prologue::StreamPrologue, HandshakeError> {
-        loop {
-            match prologue::parse(&self.buf) {
-                Ok(Some((p, consumed))) => {
-                    self.buf.drain(..consumed);
-                    return Ok(p);
-                }
-                Ok(None) => self.fill_more().await?,
-                Err(e) => return Err(HandshakeError::Prologue(e)),
-            }
-        }
-    }
-
-    /// Reads one Envelope and returns its `type_raw` plus payload bytes.
-    async fn read_envelope(&mut self) -> Result<(u16, Vec<u8>), HandshakeError> {
-        loop {
-            match envelope::parse(&self.buf, StreamKind::Control.max_envelope_length()) {
-                Ok(Some((env, consumed))) => {
-                    let result = (env.type_raw, env.payload.to_vec());
-                    self.buf.drain(..consumed);
-                    return Ok(result);
-                }
-                Ok(None) => self.fill_more().await?,
-                Err(e) => return Err(HandshakeError::Envelope(e)),
-            }
-        }
-    }
-}
-
-async fn write_envelope(
-    send: &mut quinn::SendStream,
-    type_raw: u16,
-    payload: &[u8],
-) -> Result<(), HandshakeError> {
-    let mut buf = Vec::new();
-    envelope::encode(type_raw, payload, &mut buf);
-    send.write_all(&buf).await?;
-    Ok(())
 }
 
 /// Outcome of a successful M2 handshake.
@@ -162,8 +93,10 @@ pub async fn client_handshake(
     )
     .await?;
 
-    let mut reader = ControlReader::new(&mut recv);
-    let (type_raw, payload) = reader.read_envelope().await?;
+    let mut reader = EnvelopeReader::new(&mut recv);
+    let (type_raw, payload) = reader
+        .read_envelope(StreamKind::Control.max_envelope_length())
+        .await?;
     check(&sm, type_raw)?;
     let server_hello: ServerHello = messages::decode(&payload).map_err(HandshakeError::Decode)?;
     let server_hello_bytes = payload;
@@ -200,7 +133,9 @@ pub async fn client_handshake(
     // *in* that state (AuthPubkey, retries), not this transition itself.
     // So its legality is enforced by `complete_authentication()` /
     // `record_auth_failure()` below, not by `check()`.
-    let (_type_raw, payload) = reader.read_envelope().await?;
+    let (_type_raw, payload) = reader
+        .read_envelope(StreamKind::Control.max_envelope_length())
+        .await?;
     let auth_result: AuthResult = messages::decode(&payload).map_err(HandshakeError::Decode)?;
 
     match auth_result.status {
@@ -230,7 +165,7 @@ pub async fn server_handshake(
     let mut sm = ConnectionSm::new();
     let (mut send, mut recv) = connection.accept_bi().await.map_err(HandshakeError::Quic)?;
 
-    let mut reader = ControlReader::new(&mut recv);
+    let mut reader = EnvelopeReader::new(&mut recv);
     let stream_prologue = reader.read_prologue().await?;
     if stream_prologue.kind != StreamKind::Control {
         // Spec 2.2.1: "未認証状態でcontrol以外のストリームが開かれたら即切断".
@@ -239,7 +174,9 @@ pub async fn server_handshake(
         ));
     }
 
-    let (type_raw, payload) = reader.read_envelope().await?;
+    let (type_raw, payload) = reader
+        .read_envelope(StreamKind::Control.max_envelope_length())
+        .await?;
     check(&sm, type_raw)?;
     let client_hello: ClientHello = messages::decode(&payload).map_err(HandshakeError::Decode)?;
     let client_hello_bytes = payload;
@@ -272,7 +209,9 @@ pub async fn server_handshake(
     sm.complete_handshake()
         .map_err(|v| HandshakeError::ProtocolViolation(v.reason))?;
 
-    let (type_raw, payload) = reader.read_envelope().await?;
+    let (type_raw, payload) = reader
+        .read_envelope(StreamKind::Control.max_envelope_length())
+        .await?;
     check(&sm, type_raw)?;
     let auth_pubkey: AuthPubkey = messages::decode(&payload).map_err(HandshakeError::Decode)?;
 

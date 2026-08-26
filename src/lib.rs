@@ -4,7 +4,9 @@
 
 pub mod auth;
 pub mod connection_sm;
+pub mod encoder;
 pub mod envelope;
+pub mod h264;
 pub mod handshake;
 pub mod messages;
 pub mod net;
@@ -13,7 +15,11 @@ pub mod pki;
 pub mod prologue;
 pub mod reason_code;
 pub mod stream_kind;
+pub mod stream_reader;
+pub mod timecode_frame;
 pub mod varint;
+pub mod video_session;
+pub mod video_sm;
 
 pub use connection_sm::{ConnectionSm, ConnectionState, ProtocolViolation};
 pub use envelope::{Envelope, EnvelopeError};
