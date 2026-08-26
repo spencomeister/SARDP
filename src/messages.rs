@@ -9,26 +9,25 @@
 //! and retry limits are explicitly optional in the PoC brief).
 //!
 //! M3 adds the video setup/frame messages: `VideoStreamGeneration`,
-//! `EncoderConfig`, `VideoFrame` (spec 2.10).
+//! `EncoderConfig`, `VideoFrameHeader` (spec 2.10).
 //!
 //! v0.3 does not assign numeric `Envelope.type` ids to individual control
 //! messages anywhere; [`type_id`] is this implementation's own core-range
 //! (DR-014) assignment, not a spec-mandated value.
 //!
-//! DR-021 puts "映像・音声・ファイルのペイロード" (video/audio/file
-//! *payload*) in a separate, unwrapped-raw-bytes category from the
-//! schema-encoded "メッセージ本体" category it explicitly lists as
-//! control/input/feedback/clipboard. `VideoFrame` sits at the boundary:
-//! it carries both small structured header fields (`generation`,
-//! `frame_id`, timestamps, ...) and the bulk H.264 payload. This
-//! implementation reads "生バイト列のまま扱う、スキーマでラップしない" as
-//! constraining how the *payload bytes* are represented (unencoded, via
-//! CBOR's native byte-string type through `serde_bytes` -- no
-//! byte-by-byte re-encoding), not as a ban on using the chosen
-//! schema-format for `VideoFrame`'s header fields; the alternative
-//! reading (hand-roll a separate fixed-layout binary format for
-//! `VideoFrame`, `AudioFrame`, `FileChunk`, matching Envelope's own
-//! hand-written treatment) is equally defensible and should be confirmed.
+//! Per DR-035, the logical `VideoFrame` is split on the wire into two
+//! consecutive Envelopes: [`VideoFrameHeader`] (CBOR, this module) and a
+//! raw-bytes `VideoFramePayload` (not a struct here at all -- it's just
+//! the H.264 Annex-B bytes handed directly to `Envelope::encode`, with no
+//! schema wrapping). This resolves the M3 ambiguity between DR-021's
+//! schema-encoded "メッセージ本体" category and its unwrapped-raw-bytes
+//! "映像...のペイロード" category: cramming both into one CBOR struct (M3's
+//! original approach) forced a copy into a schema-allocated buffer for
+//! the payload field, defeating the zero-copy intent; two Envelopes let
+//! the payload ride entirely inside the Envelope layer's own raw-bytes
+//! handling (spec 2.1.1). See `video_session` for the send/receive
+//! sequencing (`VideoFramePayload` MUST immediately follow
+//! `VideoFrameHeader`, spec 2.10).
 
 use serde::{Deserialize, Serialize};
 
@@ -43,7 +42,9 @@ pub mod type_id {
     pub const AUTH_RESULT: u16 = 0x0004;
     pub const VIDEO_STREAM_GENERATION: u16 = 0x0005;
     pub const ENCODER_CONFIG: u16 = 0x0006;
-    pub const VIDEO_FRAME: u16 = 0x0007;
+    pub const VIDEO_FRAME_HEADER: u16 = 0x0007;
+    /// Raw H.264 Annex-B bytes; not CBOR-encoded (DR-035).
+    pub const VIDEO_FRAME_PAYLOAD: u16 = 0x0008;
 }
 
 /// `AuthMethod` enum (spec 2.3).
@@ -162,13 +163,13 @@ pub struct EncoderConfig {
     pub server_cursor_excludable: bool,
 }
 
-/// `VideoFrame` (spec 2.10, video, server->client).
-///
-/// `payload` is H.264 Annex-B bytes (a self-contained IDR for the first
-/// frame of a generation, spec 2.10's H.264 operating rules). `flags`
-/// bit 0 is the IDR flag.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct VideoFrame {
+/// `VideoFrameHeader` (spec 2.10, DR-035): the CBOR half of the logical
+/// `VideoFrame`. Always immediately followed, on the same stream, by a
+/// raw-bytes `VideoFramePayload` Envelope (`type_id::VIDEO_FRAME_PAYLOAD`)
+/// carrying the H.264 Annex-B bytes -- see `video_session` for the
+/// send/receive sequencing and the `payload_len` cross-check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VideoFrameHeader {
     pub generation: u64,
     /// 0-based within `generation`; send order = decode order = display
     /// order since B-frames are prohibited (spec 2.10, DR-019).
@@ -182,27 +183,16 @@ pub struct VideoFrame {
     /// sets it, matching `EncoderConfig.width/height`.
     pub width: u32,
     pub height: u32,
-    /// Declared length of `payload`, independently checked against it
-    /// (spec 2.10: "Envelope.lengthとの整合をMUSTで検証する", spec 4.8:
-    /// `PROTOCOL.8 FRAME_LENGTH_MISMATCH`). Since `payload` is itself a
-    /// self-describing CBOR byte string, this is a redundant declared
-    /// value the receiver cross-checks, not something the wire format
-    /// needs to determine `payload`'s length.
+    /// MUST equal the immediately-following `VideoFramePayload`
+    /// Envelope's `length` (spec 2.10, 4.8 `PROTOCOL.8
+    /// FRAME_LENGTH_MISMATCH`).
     pub payload_len: u64,
-    #[serde(with = "serde_bytes")]
-    pub payload: Vec<u8>,
 }
 
-/// `VideoFrame.flags` bit 0 (spec 2.10).
+/// `VideoFrameHeader.flags` bit 0 (spec 2.10).
 pub const VIDEO_FRAME_FLAG_IDR: u8 = 0x01;
 
-impl VideoFrame {
-    /// Checks `payload_len` against the actual `payload` byte count (spec
-    /// 2.10 / 4.8 `PROTOCOL.8 FRAME_LENGTH_MISMATCH`).
-    pub fn payload_len_is_consistent(&self) -> bool {
-        self.payload_len as usize == self.payload.len()
-    }
-
+impl VideoFrameHeader {
     pub fn is_idr(&self) -> bool {
         self.flags & VIDEO_FRAME_FLAG_IDR != 0
     }
@@ -326,9 +316,8 @@ mod tests {
     }
 
     #[test]
-    fn video_frame_round_trips_with_binary_payload() {
-        let payload = vec![0x00, 0x00, 0x00, 0x01, 0x67, 0xAB, 0xCD];
-        let msg = VideoFrame {
+    fn video_frame_header_round_trips() {
+        let msg = VideoFrameHeader {
             generation: 0,
             frame_id: 0,
             config_id: 1,
@@ -337,40 +326,20 @@ mod tests {
             encode_done_ts: 1_000_500,
             width: 1920,
             height: 1080,
-            payload_len: payload.len() as u64,
-            payload,
+            payload_len: 7,
         };
         let bytes = encode(&msg);
-        let decoded: VideoFrame = decode(&bytes).unwrap();
+        let decoded: VideoFrameHeader = decode(&bytes).unwrap();
         assert_eq!(decoded, msg);
         assert!(decoded.is_idr());
-        assert!(decoded.payload_len_is_consistent());
     }
 
     #[test]
-    fn video_frame_detects_payload_len_mismatch() {
-        let msg = VideoFrame {
-            generation: 0,
-            frame_id: 0,
-            config_id: 1,
-            flags: 0,
-            capture_ts: 0,
-            encode_done_ts: 0,
-            width: 0,
-            height: 0,
-            payload_len: 999, // deliberately wrong
-            payload: vec![1, 2, 3],
-        };
-        assert!(!msg.payload_len_is_consistent());
-    }
-
-    #[test]
-    fn video_frame_binary_payload_is_compact_not_an_integer_array() {
-        // Sanity check that `serde_bytes` is actually doing its job: a
-        // CBOR byte string is far more compact than a CBOR array of the
-        // same integers would be.
-        let payload = vec![0xAB; 1000];
-        let msg = VideoFrame {
+    fn video_frame_header_is_compact() {
+        // Sanity check that the header alone (no payload bytes attached)
+        // stays small regardless of how large the frame it describes is
+        // -- the whole point of separating it from the payload (DR-035).
+        let msg = VideoFrameHeader {
             generation: 0,
             frame_id: 0,
             config_id: 0,
@@ -379,24 +348,19 @@ mod tests {
             encode_done_ts: 0,
             width: 0,
             height: 0,
-            payload_len: payload.len() as u64,
-            payload,
+            payload_len: 8_000_000, // an 8 MiB frame, at the video stream limit
         };
         let bytes = encode(&msg);
-        // A CBOR array-of-integers encoding of 1000 bytes (the behavior
-        // without `serde_bytes`) would run roughly 2-3x the payload size;
-        // a byte-string encoding stays close to it plus header overhead
-        // for the other fields.
         assert!(
-            bytes.len() < 1300,
-            "expected close to 1000 bytes (byte-string encoding), got {}",
+            bytes.len() < 200,
+            "header should be tiny regardless of payload_len, got {}",
             bytes.len()
         );
     }
 
     #[test]
     fn is_idr_checks_only_bit_0() {
-        let mut msg = VideoFrame {
+        let mut msg = VideoFrameHeader {
             generation: 0,
             frame_id: 1,
             config_id: 0,
@@ -406,7 +370,6 @@ mod tests {
             width: 0,
             height: 0,
             payload_len: 0,
-            payload: vec![],
         };
         assert!(!msg.is_idr());
         msg.flags |= VIDEO_FRAME_FLAG_IDR;

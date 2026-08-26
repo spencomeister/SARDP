@@ -1,21 +1,26 @@
 //! M3 integration test: single video stream Instance opening over a real
 //! loopback QUIC connection. Generates a synthetic timecode frame,
 //! encodes it via ffmpeg into a self-contained H.264 IDR, and sends
-//! StreamPrologue -> VideoStreamGeneration -> EncoderConfig -> VideoFrame
-//! (spec 2.10, 2.2.1, 4.3.2) to a receiver that validates the wire
-//! contract (message order, `payload_len` consistency, IDR
-//! self-containment). Client-side decode/display is M4's scope, not
-//! tested here.
+//! StreamPrologue -> VideoStreamGeneration -> EncoderConfig ->
+//! VideoFrameHeader -> VideoFramePayload (spec 2.10, 2.2.1, 4.3.2,
+//! DR-035) to a receiver that validates the wire contract (message
+//! order, header/payload length consistency, IDR self-containment).
+//! Client-side decode/display is M4's scope, not tested here.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use sardp::encoder::{encode_single_frame_idr, ffmpeg_available};
 use sardp::h264::is_self_contained_idr;
-use sardp::messages::{ChromaFormat, Codec, EncoderConfig};
+use sardp::messages::{
+    self, ChromaFormat, Codec, EncoderConfig, VideoFrameHeader, VideoStreamGeneration,
+};
+use sardp::stream_kind::StreamKind;
 use sardp::timecode_frame::generate_timecode_frame;
-use sardp::video_session::{VideoInstanceIntro, open_video_instance, read_video_instance_intro};
+use sardp::video_session::{
+    VideoError, VideoInstanceIntro, open_video_instance, read_video_instance_intro,
+};
 use sardp::video_sm::InstanceState;
-use sardp::{net, pki};
+use sardp::{net, pki, prologue};
 
 fn loopback(port: u16) -> SocketAddr {
     SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)
@@ -115,15 +120,18 @@ async fn opens_video_instance_and_delivers_self_contained_idr() {
     assert_eq!(intro.encoder_config.width, WIDTH);
     assert_eq!(intro.encoder_config.height, HEIGHT);
 
-    assert_eq!(intro.first_frame.generation, GENERATION);
-    assert_eq!(intro.first_frame.frame_id, 0);
-    assert!(intro.first_frame.is_idr());
-    assert!(intro.first_frame.payload_len_is_consistent());
-    assert_eq!(intro.first_frame.capture_ts, capture_ts);
-    assert_eq!(intro.first_frame.encode_done_ts, encode_done_ts);
-    assert_eq!(intro.first_frame.payload, h264_bytes);
+    assert_eq!(intro.first_frame_header.generation, GENERATION);
+    assert_eq!(intro.first_frame_header.frame_id, 0);
+    assert!(intro.first_frame_header.is_idr());
+    assert_eq!(
+        intro.first_frame_header.payload_len,
+        intro.first_frame_payload.len() as u64
+    );
+    assert_eq!(intro.first_frame_header.capture_ts, capture_ts);
+    assert_eq!(intro.first_frame_header.encode_done_ts, encode_done_ts);
+    assert_eq!(intro.first_frame_payload, h264_bytes);
     assert!(
-        is_self_contained_idr(&intro.first_frame.payload),
+        is_self_contained_idr(&intro.first_frame_payload),
         "the frame as received over the wire must still be self-contained"
     );
 }
@@ -165,5 +173,100 @@ async fn frame_ids_and_generation_are_monotonic_from_zero() {
     server_result.expect("server sends the instance intro");
     let intro = client_result.expect("client receives the instance intro");
     assert_eq!(intro.generation.generation, 0);
-    assert_eq!(intro.first_frame.frame_id, 0);
+    assert_eq!(intro.first_frame_header.frame_id, 0);
+}
+
+#[tokio::test]
+async fn payload_not_immediately_after_header_is_rejected() {
+    // Spec 2.10 / DR-035: VideoFramePayload MUST immediately follow
+    // VideoFrameHeader with nothing else in between. Hand-craft a
+    // malformed stream (header, then some other Envelope instead of the
+    // payload) to prove the receiver actually enforces this rather than
+    // just happening to work when a well-behaved sender is on the other
+    // end.
+    let (client_connection, server_connection) = connect_pair().await;
+
+    let encoder_config = EncoderConfig {
+        codec: Codec::H264,
+        profile: 66,
+        chroma_format: ChromaFormat::C420,
+        bit_depth: 8,
+        width: 64,
+        height: 64,
+        max_fps: 30,
+        tier: 4,
+        b_frames: 0,
+        server_cursor_excludable: false,
+    };
+
+    // Not `async move`: `server_connection` must stay alive in this
+    // function's scope for the whole `join!` (see the M2 handshake test's
+    // note on why `tokio::spawn`/moving a `Connection` into a short-lived
+    // task causes an implicit `ApplicationClose` that can race the read).
+    let send_malformed = async {
+        let mut send = server_connection.open_uni().await.unwrap();
+
+        let mut buf = Vec::new();
+        prologue::encode(StreamKind::Video, 1, 0, &mut buf);
+        send.write_all(&buf).await.unwrap();
+
+        buf.clear();
+        sardp::envelope::encode(
+            messages::type_id::VIDEO_STREAM_GENERATION,
+            &messages::encode(&VideoStreamGeneration {
+                generation: 0,
+                config_id: 1,
+            }),
+            &mut buf,
+        );
+        send.write_all(&buf).await.unwrap();
+
+        buf.clear();
+        sardp::envelope::encode(
+            messages::type_id::ENCODER_CONFIG,
+            &messages::encode(&encoder_config),
+            &mut buf,
+        );
+        send.write_all(&buf).await.unwrap();
+
+        buf.clear();
+        sardp::envelope::encode(
+            messages::type_id::VIDEO_FRAME_HEADER,
+            &messages::encode(&VideoFrameHeader {
+                generation: 0,
+                frame_id: 0,
+                config_id: 1,
+                flags: 1,
+                capture_ts: 0,
+                encode_done_ts: 0,
+                width: 64,
+                height: 64,
+                payload_len: 3,
+            }),
+            &mut buf,
+        );
+        send.write_all(&buf).await.unwrap();
+
+        // Instead of VideoFramePayload, send another VideoStreamGeneration.
+        buf.clear();
+        sardp::envelope::encode(
+            messages::type_id::VIDEO_STREAM_GENERATION,
+            &messages::encode(&VideoStreamGeneration {
+                generation: 1,
+                config_id: 1,
+            }),
+            &mut buf,
+        );
+        send.write_all(&buf).await.unwrap();
+    };
+
+    let (_, client_result) = tokio::join!(
+        send_malformed,
+        read_video_instance_intro(&client_connection)
+    );
+
+    assert!(matches!(
+        client_result,
+        Err(VideoError::ProtocolViolation(_))
+    ));
 }

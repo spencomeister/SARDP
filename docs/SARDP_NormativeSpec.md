@@ -399,6 +399,29 @@ DisplayCapabilities {               // control、client→server。デコード�
     }]
 }
 
+**`VideoFrame` はワイヤ上で2つの連続したEnvelopeに分割する(DR-035)**。DR-021の「メッセージ本体はスキーマ生成コード」「映像・音声・ファイルのペイロードは生バイト列のままゼロコピーで扱う」という2分類は、単一のCBOR構造体にヘッダとペイロードを混在させると両立しない(ペイロードが構造体の一フィールドである以上、デコード時にスキーマ層が確保する新規バッファへコピーされてしまう)。ヘッダとペイロードをそれぞれ独立したEnvelopeとして送ることで、ペイロード側はEnvelope層(2.1.1節)が本来持つ生バイト列の扱いをそのまま利用できる。
+
+```text
+VideoFrameHeader {                 // CBOR。type_id: VIDEO_FRAME_HEADER
+    generation     : varint         // このフレームが属する世代
+    frame_id       : varint         // 世代内で0起点、送信順=デコード順=表示順(Bフレーム禁止のため)
+    config_id      : u64
+    flags          : u8             // bit0: IDR
+    capture_ts     : u64
+    encode_done_ts : u64
+    width, height  : u32            // 解像度変更時のみ必須
+    payload_len    : varint         // 直後に続くVIDEO_FRAME_PAYLOADのEnvelope.lengthと
+                                     // 一致することをMUSTで検証する(PROTOCOL.8参照)
+}
+
+VideoFramePayload {                 // type_id: VIDEO_FRAME_PAYLOAD
+                                     // CBORでラップしない。Envelope.payloadがそのままH.264 Annex-Bバイト列
+}
+```
+
+`VideoFrameHeader` の直後に、同一ストリーム上で `VideoFramePayload` がMUSTで続く(間に他のEnvelopeを挟まない)。受信側はヘッダを読み終えた時点で `payload_len` バイトを期待し、後続Envelopeの `length` と付き合わせて `PROTOCOL.8 FRAME_LENGTH_MISMATCH` を検証する。
+
+```text
 VideoFrame {
     generation     : varint         // このフレームが属する世代
     frame_id       : varint         // 世代内で0起点、送信順=デコード順=表示順(Bフレーム禁止のため)
@@ -411,6 +434,8 @@ VideoFrame {
     payload        : bytes          // H.264 Annex-B
 }
 ```
+
+上記 `VideoFrame` はワイヤ形式ではなく、実装が2つのEnvelope(`VideoFrameHeader` + `VideoFramePayload`)を受信して組み立てる論理ビューとして参照してよい。以降の本書の記述(4.3.2節等)で単に「`VideoFrame`」と言及する箇所は、この論理ビューを指す。
 
 `monitor_id` はいずれのメッセージにも含めない。ストリーム自体がmonitor_idに束縛されている(2.2.1節)ため冗長である。
 
@@ -1035,6 +1060,7 @@ USBリダイレクト: デバイスクラス単位の許可制+用途プリセ�
 | DR-032 | Envelope.lengthはpayloadのみのバイト数とし、typeフィールド(2バイト)は含めない | typeを含めた長さとする(v0.1初期案。length<2という無意味なエラー状態を生むだけで撤回) |
 | DR-033 | PermissionSetのビット位置を宣言順(VIEW=bit0起点)で正式に割り当てる | ビット位置を実装依存のまま放置する(M2実装での自然発生的な採番を追認) |
 | DR-034 | ReasonCode.domain=0を「エラーなし」の予約値とし、4.1/4.6/4.7で名前のみ参照していたコードに正式番号を割り当てる一覧表(4.8.1節)を新設する | 個々の参照箇所に断片的な番号を残したままにする |
+| DR-035 | VideoFrameをVideoFrameHeader(CBOR)+VideoFramePayload(生バイト、ラップなし)の連続する2つのEnvelopeに分割する | ヘッダとペイロードを1つのCBOR構造体に混在させる(M3実装がこれで実装し、payload_lenの冗長性とゼロコピー未達成を指摘して確認を求めた) |
 
 ---
 
