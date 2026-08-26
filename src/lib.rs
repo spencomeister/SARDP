@@ -3,6 +3,7 @@
 //! "no hand-written parsers" rule.
 
 pub mod auth;
+pub mod backpressure;
 pub mod channel_sm;
 pub mod client_display;
 pub mod clock;
@@ -24,6 +25,7 @@ pub mod stream_reader;
 pub mod timecode_frame;
 pub mod timesync;
 pub mod varint;
+pub mod video_channel;
 pub mod video_session;
 pub mod video_sm;
 

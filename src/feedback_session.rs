@@ -50,34 +50,56 @@ pub async fn send_transport_feedback(
     .await
 }
 
-/// Server side: accepts the next incoming unidirectional stream and reads
-/// back one `TransportFeedback` (test/verification helper; a real server
-/// would keep reading in a loop for the session's duration).
+/// Server side: the accepted `feedback` stream, positioned to read
+/// `TransportFeedback` messages one after another. A real server keeps
+/// one of these per client for the session's duration (spec 2.14: sent
+/// every 100ms, plus on `last_displayed_frame_id` change).
+pub struct FeedbackReceiver {
+    reader: EnvelopeReader,
+}
+
+impl FeedbackReceiver {
+    /// Accepts the next incoming unidirectional stream and validates its
+    /// `StreamPrologue` as `feedback`.
+    pub async fn accept(connection: &quinn::Connection) -> Result<Self, ReadFeedbackError> {
+        let recv = connection
+            .accept_uni()
+            .await
+            .map_err(ReadFeedbackError::Quic)?;
+        let mut reader = EnvelopeReader::new(recv);
+        let stream_prologue = reader
+            .read_prologue()
+            .await
+            .map_err(ReadFeedbackError::Read)?;
+        if stream_prologue.kind != StreamKind::Feedback {
+            return Err(ReadFeedbackError::WrongStreamKind);
+        }
+        Ok(Self { reader })
+    }
+
+    /// Reads the next `TransportFeedback` Envelope on this stream.
+    pub async fn read_one(&mut self) -> Result<TransportFeedback, ReadFeedbackError> {
+        let (type_raw, payload) = self
+            .reader
+            .read_envelope(StreamKind::Feedback.max_envelope_length())
+            .await
+            .map_err(ReadFeedbackError::Read)?;
+        if type_raw != messages::type_id::TRANSPORT_FEEDBACK {
+            return Err(ReadFeedbackError::UnexpectedType(type_raw));
+        }
+        messages::decode(&payload).map_err(ReadFeedbackError::Decode)
+    }
+}
+
+/// Server side, one-shot convenience: accepts the next incoming
+/// unidirectional stream and reads back exactly one `TransportFeedback`.
+/// For reading more than one message on the same stream, use
+/// [`FeedbackReceiver`] directly instead of calling this repeatedly (each
+/// call accepts a *new* stream).
 pub async fn read_transport_feedback(
     connection: &quinn::Connection,
 ) -> Result<TransportFeedback, ReadFeedbackError> {
-    let recv = connection
-        .accept_uni()
-        .await
-        .map_err(ReadFeedbackError::Quic)?;
-    let mut reader = EnvelopeReader::new(recv);
-
-    let stream_prologue = reader
-        .read_prologue()
-        .await
-        .map_err(ReadFeedbackError::Read)?;
-    if stream_prologue.kind != StreamKind::Feedback {
-        return Err(ReadFeedbackError::WrongStreamKind);
-    }
-
-    let (type_raw, payload) = reader
-        .read_envelope(StreamKind::Feedback.max_envelope_length())
-        .await
-        .map_err(ReadFeedbackError::Read)?;
-    if type_raw != messages::type_id::TRANSPORT_FEEDBACK {
-        return Err(ReadFeedbackError::UnexpectedType(type_raw));
-    }
-    messages::decode(&payload).map_err(ReadFeedbackError::Decode)
+    FeedbackReceiver::accept(connection).await?.read_one().await
 }
 
 /// Per-frame client-local timestamps needed to build a `TransportFeedback`

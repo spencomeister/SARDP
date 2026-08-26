@@ -1,8 +1,11 @@
-//! VideoStream Instance State Machine (spec 4.3.2), scoped to the M3
-//! milestone: `Created -> Configuring -> Streaming`. `Congested` and
-//! `Closed(Reset)` (the backpressure/generation-reopen machinery, spec
-//! 2.10/4.3.2) arrive with M5; the Channel layer (spec 4.3.1, which spans
-//! Instance reopens) is also out of scope until then.
+//! VideoStream Instance State Machine (spec 4.3.2), through M5:
+//! `Created -> Configuring -> Streaming -> Congested -> Closed(Reset)`.
+//! The Channel layer (spec 4.3.1, which spans Instance reopens) lives in
+//! [`crate::channel_sm`]; the backpressure decision logic that decides
+//! *when* to call [`VideoInstanceSm::on_congested`] /
+//! [`VideoInstanceSm::on_recovered`] / [`VideoInstanceSm::on_reset`] lives
+//! in [`crate::backpressure`] -- this type only encodes which transitions
+//! are legal from which state, not the threshold math.
 //!
 //! Per the spec 4.3.2 table, an Instance's `Configuring` state only
 //! permits exactly one `VideoStreamGeneration` followed by exactly one
@@ -12,12 +15,27 @@
 
 use crate::reason_code::ReasonCode;
 
-/// Instance states relevant through M3 (spec 4.3.2).
+/// Why an Instance closed (spec 4.3.2: `Closed(Reset)` / `Closed(Failed)`
+/// / `Closed(Normal)`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloseReason {
+    /// Backpressure hard threshold exceeded; the Channel reopens with
+    /// `generation + 1` (spec 2.10, DR-029).
+    Reset,
+    /// `VIDEO_CONFIGURING_TIMEOUT` exceeded before the first IDR.
+    Failed,
+    /// `SessionClose` / connection teardown.
+    Normal,
+}
+
+/// Instance states through M5 (spec 4.3.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InstanceState {
     Created,
     Configuring,
     Streaming,
+    Congested,
+    Closed(CloseReason),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -105,6 +123,45 @@ impl VideoInstanceSm {
             _ => Err(unexpected()),
         }
     }
+
+    /// `Streaming -> Congested`, on a
+    /// [`crate::backpressure::CongestionTracker::evaluate`] ->
+    /// `EnterCongested` decision.
+    pub fn on_congested(&mut self) -> Result<(), ProtocolViolation> {
+        match self.state {
+            InstanceState::Streaming => {
+                self.state = InstanceState::Congested;
+                Ok(())
+            }
+            _ => Err(unexpected()),
+        }
+    }
+
+    /// `Congested -> Streaming`, on an `ExitCongested` decision
+    /// (hysteresis satisfied).
+    pub fn on_recovered(&mut self) -> Result<(), ProtocolViolation> {
+        match self.state {
+            InstanceState::Congested => {
+                self.state = InstanceState::Streaming;
+                Ok(())
+            }
+            _ => Err(unexpected()),
+        }
+    }
+
+    /// `Congested -> Closed(Reset)`, on a `ResetStream` decision. The
+    /// caller MUST then abandon this Instance's QUIC stream
+    /// (`RESET_STREAM`) and open a new one with `generation + 1` (spec
+    /// 2.10).
+    pub fn on_reset(&mut self) -> Result<(), ProtocolViolation> {
+        match self.state {
+            InstanceState::Congested => {
+                self.state = InstanceState::Closed(CloseReason::Reset);
+                Ok(())
+            }
+            _ => Err(unexpected()),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -169,6 +226,58 @@ mod tests {
         sm.on_generation_sent().unwrap();
         sm.on_encoder_config_sent().unwrap();
         assert!(sm.on_encoder_config_sent().is_err());
+    }
+
+    #[test]
+    fn congested_then_reset_reaches_closed_reset() {
+        let mut sm = VideoInstanceSm::new();
+        sm.on_prologue_sent().unwrap();
+        sm.on_generation_sent().unwrap();
+        sm.on_encoder_config_sent().unwrap();
+        sm.on_first_idr_sent().unwrap();
+        assert_eq!(sm.on_congested(), Ok(()));
+        assert_eq!(sm.state(), InstanceState::Congested);
+        assert_eq!(sm.on_reset(), Ok(()));
+        assert_eq!(sm.state(), InstanceState::Closed(CloseReason::Reset));
+    }
+
+    #[test]
+    fn congested_can_recover_back_to_streaming() {
+        let mut sm = VideoInstanceSm::new();
+        sm.on_prologue_sent().unwrap();
+        sm.on_generation_sent().unwrap();
+        sm.on_encoder_config_sent().unwrap();
+        sm.on_first_idr_sent().unwrap();
+        sm.on_congested().unwrap();
+        assert_eq!(sm.on_recovered(), Ok(()));
+        assert_eq!(sm.state(), InstanceState::Streaming);
+    }
+
+    #[test]
+    fn congested_before_streaming_is_rejected() {
+        let mut sm = VideoInstanceSm::new();
+        assert!(sm.on_congested().is_err());
+    }
+
+    #[test]
+    fn reset_before_congested_is_rejected() {
+        let mut sm = VideoInstanceSm::new();
+        sm.on_prologue_sent().unwrap();
+        sm.on_generation_sent().unwrap();
+        sm.on_encoder_config_sent().unwrap();
+        sm.on_first_idr_sent().unwrap();
+        assert!(sm.on_reset().is_err());
+        assert_eq!(sm.state(), InstanceState::Streaming);
+    }
+
+    #[test]
+    fn recovered_before_congested_is_rejected() {
+        let mut sm = VideoInstanceSm::new();
+        sm.on_prologue_sent().unwrap();
+        sm.on_generation_sent().unwrap();
+        sm.on_encoder_config_sent().unwrap();
+        sm.on_first_idr_sent().unwrap();
+        assert!(sm.on_recovered().is_err());
     }
 
     #[test]
