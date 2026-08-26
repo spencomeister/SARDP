@@ -9,12 +9,7 @@
 //! }
 //! ```
 //!
-//! Spec 2.1.1 does not state explicitly whether `length` counts only
-//! `payload` or `type + payload`. This parser treats `length` as the
-//! length of `payload` alone: `type` is a fixed-width field that is always
-//! present, so folding it into `length` would only introduce a spurious
-//! `length < 2` error case with no corresponding benefit. This choice
-//! should be confirmed against the spec author's intent.
+//! `length` counts `payload` only, not `type` (spec 2.1.1, DR-032).
 
 use crate::varint;
 
