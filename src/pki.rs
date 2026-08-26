@@ -13,8 +13,8 @@
 
 use std::sync::Arc;
 
-use quinn::rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
 use quinn::rustls::RootCertStore;
+use quinn::rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
 
 /// A self-signed test certificate/key pair plus the DER bytes a client
 /// needs to trust it.

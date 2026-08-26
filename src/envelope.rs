@@ -124,7 +124,10 @@ mod tests {
 
     /// Builds raw envelope bytes: 1-byte-form varint length, LE type, payload.
     fn build(type_raw: u16, payload: &[u8]) -> Vec<u8> {
-        assert!(payload.len() < 64, "test helper only supports 1-byte varint lengths");
+        assert!(
+            payload.len() < 64,
+            "test helper only supports 1-byte varint lengths"
+        );
         let mut buf = vec![payload.len() as u8];
         buf.extend_from_slice(&type_raw.to_le_bytes());
         buf.extend_from_slice(payload);

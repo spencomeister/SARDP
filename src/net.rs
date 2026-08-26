@@ -4,8 +4,8 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
-use quinn::rustls::pki_types::CertificateDer;
 use quinn::rustls::RootCertStore;
+use quinn::rustls::pki_types::CertificateDer;
 use quinn::{ClientConfig, Endpoint, ServerConfig};
 
 use crate::pki::TestCertificate;
@@ -30,7 +30,10 @@ pub fn server_endpoint(bind_addr: SocketAddr, test_cert: &TestCertificate) -> En
         )
         .expect("freshly generated test cert/key are well-formed");
     rustls_config.alpn_protocols = vec![ALPN.to_vec()];
-    rustls_config.max_early_data_size = u32::MAX;
+    // Spec 2.3 / Part 3: "初期版は0-RTT自体を無効化する" (0-RTT is disabled
+    // in this version) -- MUST NOT accept early data. Leave
+    // `max_early_data_size` at rustls's default of 0 rather than
+    // `u32::MAX` (QUIC requires it be exactly one of the two).
 
     let quic_server_config = QuicServerConfig::try_from(rustls_config)
         .expect("TLS 1.3 is enabled, satisfying QuicServerConfig's requirement");
@@ -58,8 +61,7 @@ pub fn client_endpoint(bind_addr: SocketAddr, trusted_root: &CertificateDer<'sta
         .expect("TLS 1.3 is enabled, satisfying QuicClientConfig's requirement");
     let client_config = ClientConfig::new(Arc::new(quic_client_config));
 
-    let mut endpoint =
-        Endpoint::client(bind_addr).expect("binding a loopback UDP socket");
+    let mut endpoint = Endpoint::client(bind_addr).expect("binding a loopback UDP socket");
     endpoint.set_default_client_config(client_config);
     endpoint
 }

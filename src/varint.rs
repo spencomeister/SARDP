@@ -61,12 +61,12 @@ mod encode_tests {
         for value in [
             0,
             1,
-            63,             // max 1-byte
-            64,             // min 2-byte
-            16_383,         // max 2-byte
-            16_384,         // min 4-byte
-            1_073_741_823,  // max 4-byte
-            1_073_741_824,  // min 8-byte
+            63,            // max 1-byte
+            64,            // min 2-byte
+            16_383,        // max 2-byte
+            16_384,        // min 4-byte
+            1_073_741_823, // max 4-byte
+            1_073_741_824, // min 8-byte
             MAX,
         ] {
             let mut buf = Vec::new();

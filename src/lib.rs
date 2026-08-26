@@ -8,6 +8,7 @@ pub mod envelope;
 pub mod handshake;
 pub mod messages;
 pub mod net;
+pub mod permission_set;
 pub mod pki;
 pub mod prologue;
 pub mod reason_code;

@@ -17,7 +17,7 @@ use crate::messages::{
 };
 use crate::reason_code::ReasonCode;
 use crate::stream_kind::StreamKind;
-use crate::{auth, envelope, prologue};
+use crate::{auth, envelope, permission_set, prologue};
 
 /// Everything that can go wrong while driving the M2 handshake.
 #[derive(Debug)]
@@ -141,10 +141,7 @@ pub async fn client_handshake(
     device_id: &str,
 ) -> Result<HandshakeOutcome, HandshakeError> {
     let mut sm = ConnectionSm::new();
-    let (mut send, mut recv) = connection
-        .open_bi()
-        .await
-        .map_err(HandshakeError::Quic)?;
+    let (mut send, mut recv) = connection.open_bi().await.map_err(HandshakeError::Quic)?;
 
     let mut prologue_bytes = Vec::new();
     prologue::encode(StreamKind::Control, 1, 0, &mut prologue_bytes);
@@ -168,8 +165,7 @@ pub async fn client_handshake(
     let mut reader = ControlReader::new(&mut recv);
     let (type_raw, payload) = reader.read_envelope().await?;
     check(&sm, type_raw)?;
-    let server_hello: ServerHello =
-        messages::decode(&payload).map_err(HandshakeError::Decode)?;
+    let server_hello: ServerHello = messages::decode(&payload).map_err(HandshakeError::Decode)?;
     let server_hello_bytes = payload;
 
     sm.complete_handshake()
@@ -180,8 +176,7 @@ pub async fn client_handshake(
         &server_hello_bytes,
         &server_hello.auth_challenge,
     );
-    let exporter =
-        auth::compute_exporter(connection, &context).map_err(HandshakeError::Auth)?;
+    let exporter = auth::compute_exporter(connection, &context).map_err(HandshakeError::Auth)?;
     let signature = auth::sign_exporter(signing_key, &exporter);
 
     let auth_pubkey = AuthPubkey {
@@ -233,10 +228,7 @@ pub async fn server_handshake(
     trusted_public_key: &VerifyingKey,
 ) -> Result<HandshakeOutcome, HandshakeError> {
     let mut sm = ConnectionSm::new();
-    let (mut send, mut recv) = connection
-        .accept_bi()
-        .await
-        .map_err(HandshakeError::Quic)?;
+    let (mut send, mut recv) = connection.accept_bi().await.map_err(HandshakeError::Quic)?;
 
     let mut reader = ControlReader::new(&mut recv);
     let stream_prologue = reader.read_prologue().await?;
@@ -249,8 +241,7 @@ pub async fn server_handshake(
 
     let (type_raw, payload) = reader.read_envelope().await?;
     check(&sm, type_raw)?;
-    let client_hello: ClientHello =
-        messages::decode(&payload).map_err(HandshakeError::Decode)?;
+    let client_hello: ClientHello = messages::decode(&payload).map_err(HandshakeError::Decode)?;
     let client_hello_bytes = payload;
     let _ = client_hello; // only its bytes are needed for the channel binding
 
@@ -285,11 +276,8 @@ pub async fn server_handshake(
     check(&sm, type_raw)?;
     let auth_pubkey: AuthPubkey = messages::decode(&payload).map_err(HandshakeError::Decode)?;
 
-    let context = auth::channel_binding_context(
-        &client_hello_bytes,
-        &server_hello_bytes,
-        &auth_challenge,
-    );
+    let context =
+        auth::channel_binding_context(&client_hello_bytes, &server_hello_bytes, &auth_challenge);
     let verification = (|| -> Result<(), auth::AuthError> {
         if auth_pubkey.public_key != trusted_public_key.as_bytes() {
             return Err(auth::AuthError::SignatureInvalid);
@@ -307,13 +295,13 @@ pub async fn server_handshake(
             rand::rng().fill_bytes(&mut session_id);
             let mut reconnect_token = [0u8; 32];
             rand::rng().fill_bytes(&mut reconnect_token);
-            // VIEW | INPUT_KEYBOARD | INPUT_MOUSE, spec 2.5 PermissionSet
-            // bit order is implementation-defined (not numbered in v0.3).
-            let granted_permissions = 0b0000_0111;
+            let granted_permissions = permission_set::bit::VIEW
+                | permission_set::bit::INPUT_KEYBOARD
+                | permission_set::bit::INPUT_MOUSE;
 
             let auth_result = AuthResult {
                 status: AuthStatus::Ok,
-                reason: ReasonCode { domain: 0, code: 0 },
+                reason: ReasonCode::NONE,
                 session_id,
                 reconnect_token,
                 granted_permissions,

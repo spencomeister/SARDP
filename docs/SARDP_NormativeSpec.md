@@ -222,7 +222,7 @@ ActiveMonitor { monitor_id : u8 }   // control、client→server
 ## 2.5 権限
 
 ```text
-PermissionSet : bitflags {
+PermissionSet : bitflags(u32) {
     VIEW, INPUT_KEYBOARD, INPUT_MOUSE,
     CLIP_READ, CLIP_WRITE,
     FILE_UP, FILE_DOWN,
@@ -235,6 +235,23 @@ PermissionUpdate {                 // control、server→client
     immediate_revoke     : PermissionSet
 }
 ```
+
+**ビット割り当て(DR-033)**:
+
+| bit | フラグ |
+|---|---|
+| 0 | VIEW |
+| 1 | INPUT_KEYBOARD |
+| 2 | INPUT_MOUSE |
+| 3 | CLIP_READ |
+| 4 | CLIP_WRITE |
+| 5 | FILE_UP |
+| 6 | FILE_DOWN |
+| 7 | AUDIO_PLAYBACK |
+| 8 | AUDIO_CAPTURE |
+| 9 | ADMIN |
+
+bit 10〜31は将来の拡張用に予約する。宣言順=ビット番号順という規約は、今後フラグを追加する際も末尾に足す限り既存ビットと衝突しない。
 
 `granted_permissions` は常に現在の実効許可状態を表す。`immediate_revoke` に含まれる権限は進行中の操作があっても即座に無効化し、含まれない権限(`FILE_*`)は進行中の転送を完了まで許容し以降の新規リクエストのみ拒否する。`CLIP_*` は次回の `ClipboardRequest` から新しい状態を適用する。
 
@@ -314,10 +331,12 @@ ClipboardError { request_id, reason : ReasonCode }
 
 ```text
 ReasonCode {
-    domain : u8    // 1=AUTH, 2=POLICY, 3=TRANSPORT, 4=PROTOCOL, 5=OS
+    domain : u8    // 0=NONE(エラーなし、予約), 1=AUTH, 2=POLICY, 3=TRANSPORT, 4=PROTOCOL, 5=OS
     code   : u16
 }
 ```
+
+**`domain = 0, code = 0` はエラーなしを表す予約値(DR-034)**である。`AuthResult`等、成功時にも `ReasonCode` フィールドを送る必要がある(構造体の必須フィールドである)メッセージでは、`status = OK` の場合MUSTで `ReasonCode{domain: 0, code: 0}` を設定する。個々のドメイン内の具体的な `code` の割り当ては4.8節のReasonCode一覧を参照。
 
 ## 2.9 時刻同期(レビュー指摘#3(前版), #8)
 
@@ -837,6 +856,69 @@ Suspended
 | MAX_SESSION_DURATION超過 | Connection(Active) | POLICY.4 MAX_SESSION_DURATION_EXCEEDED | `SessionClose`送出、Closing遷移 |
 | 管理者による強制切断 | Connection(Active) | POLICY.3 FORCED_DISCONNECT | `SessionClose`送出、Closing遷移 |
 
+### 4.8.1 ReasonCode 一覧(正式版、DR-034)
+
+上表と4.1/4.6/4.7節で名前のみ参照していたコードを合わせ、`domain.code` の割り当てをここに一元化する。以降、本書内の全参照はこの表を正とする。
+
+**AUTH(domain=1)**
+
+| code | 名前 |
+|---|---|
+| 1 | AUTH_TIMEOUT |
+| 2 | TOO_MANY_ATTEMPTS |
+| 3 | SIGNATURE_INVALID |
+| 4 | CHALLENGE_REUSE |
+| 5 | RECONNECT_TOKEN_INVALID |
+| 6 | RECONNECT_TOKEN_EXPIRED |
+| 7 | RECONNECT_TOKEN_ALREADY_CONSUMED |
+
+**POLICY(domain=2)**
+
+| code | 名前 |
+|---|---|
+| 1 | PERMISSION_DENIED |
+| 2 | PERMISSION_REVOKED |
+| 3 | FORCED_DISCONNECT |
+| 4 | MAX_SESSION_DURATION_EXCEEDED |
+| 5 | FILE_POLICY_REJECTED |
+| 6 | CLIPBOARD_FORMAT_TOO_LARGE |
+
+**TRANSPORT(domain=3)**
+
+| code | 名前 |
+|---|---|
+| 1 | HANDSHAKE_TIMEOUT |
+| 2 | IDLE_TIMEOUT |
+| 3 | RECONNECT_TIMEOUT |
+| 4 | VIDEO_RECOVERY_TIMEOUT |
+| 5 | STREAM_STALL_TIMEOUT |
+
+**PROTOCOL(domain=4)**
+
+| code | 名前 |
+|---|---|
+| 1 | UNEXPECTED_MESSAGE |
+| 2 | UNKNOWN_CORE_MESSAGE |
+| 3 | PROLOGUE_MAGIC_MISMATCH |
+| 4 | UNKNOWN_STREAM_KIND |
+| 5 | WRONG_INITIATOR |
+| 6 | SESSION_SETUP_TIMEOUT |
+| 7 | VIDEO_CONFIGURING_TIMEOUT |
+| 8 | FRAME_LENGTH_MISMATCH |
+| 9 | GENERATION_MISMATCH |
+| 10 | FILE_CHUNK_OVERLAP |
+| 11 | FILE_CHUNK_OUT_OF_RANGE |
+| 12 | FILE_INCOMPLETE_TRANSFER |
+| 13 | FILE_CHECKSUM_MISMATCH |
+
+**OS(domain=5)**
+
+| code | 名前 |
+|---|---|
+| 2 | DECODE_ERROR |
+
+(1, 3の`CAPTURE_FAILURE`/`INPUT_INJECTION_FAILURE`は本文中で未使用のため、必要になった時点で改めて割り当てる。2番から始まる欠番は元の設計メモに合わせたもので、詰め直す実益がないためそのままにしてある。)
+
 ## 4.9 未決定事項(本改訂で残る2件)
 
 前回の改訂で洗い出した10項目のうち、数値的な決定が必要だった8項目はすべて4.7節で確定した(値の根拠・サブエージェントによる妥当性検証はチャット履歴および各節の注記を参照)。数値ではなく挙動そのものが未決定の残り2項目のみ、引き続き未決定事項として一覧化する。
@@ -951,6 +1033,8 @@ USBリダイレクト: デバイスクラス単位の許可制+用途プリセ�
 | DR-030 | VideoChannelのRecovering失敗時は無期限の指数バックオフ再試行とし(上限30秒でキャップ)、恒久的な「諦め」状態を設けない | 再試行回数に上限を設けてDegraded等の終端状態にエスカレーションする |
 | DR-031 | MAX_SESSION_DURATIONは既定24時間・ポリシーで無制限化可能とし、無人セッション向けの運用指針を明記する | 全セッションに一律の強制的な上限を課す |
 | DR-032 | Envelope.lengthはpayloadのみのバイト数とし、typeフィールド(2バイト)は含めない | typeを含めた長さとする(v0.1初期案。length<2という無意味なエラー状態を生むだけで撤回) |
+| DR-033 | PermissionSetのビット位置を宣言順(VIEW=bit0起点)で正式に割り当てる | ビット位置を実装依存のまま放置する(M2実装での自然発生的な採番を追認) |
+| DR-034 | ReasonCode.domain=0を「エラーなし」の予約値とし、4.1/4.6/4.7で名前のみ参照していたコードに正式番号を割り当てる一覧表(4.8.1節)を新設する | 個々の参照箇所に断片的な番号を残したままにする |
 
 ---
 

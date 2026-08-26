@@ -8,7 +8,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use ed25519_dalek::SigningKey;
 use sardp::connection_sm::ConnectionState;
-use sardp::handshake::{client_handshake, server_handshake, HandshakeError};
+use sardp::handshake::{HandshakeError, client_handshake, server_handshake};
 use sardp::{net, pki};
 
 fn loopback(port: u16) -> SocketAddr {
@@ -125,10 +125,7 @@ async fn tampered_signature_over_correct_exporter_is_rejected() {
     let wrong_exporter = [0xBB; sardp::auth::EXPORTER_LENGTH];
     let signature = sardp::auth::sign_exporter(&signing_key, &wrong_exporter);
 
-    assert!(sardp::auth::verify_exporter(
-        verifying_key.as_bytes(),
-        &real_exporter,
-        &signature
-    )
-    .is_err());
+    assert!(
+        sardp::auth::verify_exporter(verifying_key.as_bytes(), &real_exporter, &signature).is_err()
+    );
 }
