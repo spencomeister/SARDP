@@ -15,6 +15,15 @@
 
 use crate::reason_code::ReasonCode;
 
+/// Instance-scoped timeouts (spec 4.7), applied by callers via
+/// `tokio::time::timeout` (same convention as `connection_sm::defaults`).
+pub mod defaults {
+    use std::time::Duration;
+
+    /// Time allowed in `Configuring` before the first IDR must be sent.
+    pub const VIDEO_CONFIGURING_TIMEOUT: Duration = Duration::from_secs(3);
+}
+
 /// Why an Instance closed (spec 4.3.2: `Closed(Reset)` / `Closed(Failed)`
 /// / `Closed(Normal)`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

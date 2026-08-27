@@ -24,10 +24,16 @@
 
 /// DR-030's backoff sequence and plateau (spec 4.3.1).
 pub mod defaults {
+    use std::time::Duration;
+
     pub const RECOVERY_BACKOFF_SEQUENCE_US: [u64; 6] = [
         1_000_000, 2_000_000, 4_000_000, 8_000_000, 16_000_000, 30_000_000,
     ];
     pub const RECOVERY_BACKOFF_PLATEAU_US: u64 = 30_000_000;
+    /// Time allowed for a Recovering episode's retry Instance to reach
+    /// `Streaming` before `on_retry_timeout` applies the next backoff step
+    /// (spec 4.3.1/4.7).
+    pub const VIDEO_RECOVERY_TIMEOUT: Duration = Duration::from_secs(5);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

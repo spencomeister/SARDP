@@ -129,6 +129,47 @@ pub async fn open_video_instance(
     Ok((send, sm))
 }
 
+/// Sends one non-initial `VideoFrame` (spec 4.3.2 Streaming/Congested row)
+/// on an already-open Instance's `SendStream`: `VideoFrameHeader` +
+/// `VideoFramePayload` as two consecutive Envelopes (DR-035), same wire
+/// shape as the first frame `open_video_instance` sends, but without
+/// resending `VideoStreamGeneration`/`EncoderConfig` -- spec 4.3.2 treats
+/// resending those on an already-`Streaming` Instance as a protocol
+/// violation (new generations always go through a brand new Instance).
+#[allow(clippy::too_many_arguments)]
+pub async fn send_video_frame(
+    send: &mut quinn::SendStream,
+    generation: u64,
+    frame_id: u64,
+    config_id: u64,
+    flags: u8,
+    capture_ts: u64,
+    encode_done_ts: u64,
+    width: u32,
+    height: u32,
+    payload: &[u8],
+) -> Result<(), VideoError> {
+    let header = VideoFrameHeader {
+        generation,
+        frame_id,
+        config_id,
+        flags,
+        capture_ts,
+        encode_done_ts,
+        width,
+        height,
+        payload_len: payload.len() as u64,
+    };
+    write_envelope(
+        send,
+        messages::type_id::VIDEO_FRAME_HEADER,
+        &messages::encode(&header),
+    )
+    .await?;
+    write_envelope(send, messages::type_id::VIDEO_FRAME_PAYLOAD, payload).await?;
+    Ok(())
+}
+
 /// The setup messages plus first frame of a video Instance, as observed
 /// by the receiving side. `first_frame_header`/`first_frame_payload`
 /// stand in for the logical `VideoFrame` (spec 2.10, DR-035).
@@ -141,22 +182,13 @@ pub struct VideoInstanceIntro {
     pub first_frame_payload: Vec<u8>,
 }
 
-/// Client side: accepts the next incoming unidirectional stream and reads
-/// back a full Instance intro (`StreamPrologue`, `VideoStreamGeneration`,
-/// `EncoderConfig`, and the first frame's `VideoFrameHeader` +
-/// `VideoFramePayload` pair), validating message order (spec 4.3.2) and
-/// the header/payload length cross-check (spec 2.10) along the way.
-///
-/// This is wire-level validation only: it does not decode or display the
-/// frame (spec 4's decode/display client behavior is M4's scope). The
-/// payload bytes are still copied out of the read buffer here
-/// (`EnvelopeReader::read_envelope`'s `to_vec()`) -- DR-035 only asks for
-/// the two-Envelope split in M3; wiring the payload straight to a
-/// zero-copy buffer reference is left for when a real decode pipeline
-/// needs it.
-pub async fn read_video_instance_intro(
+/// Shared by [`read_video_instance_intro`] (which discards the reader,
+/// M3-M6's one-shot usage) and [`accept_video_instance`] (which keeps it
+/// for reading the Instance's subsequent frames, Phase 1's continuous
+/// streaming loop).
+async fn accept_intro(
     connection: &quinn::Connection,
-) -> Result<VideoInstanceIntro, VideoError> {
+) -> Result<(VideoInstanceIntro, EnvelopeReader), VideoError> {
     let mut sm = VideoInstanceSm::new();
     let recv = connection.accept_uni().await.map_err(VideoError::Quic)?;
     let mut reader = EnvelopeReader::new(recv);
@@ -211,11 +243,83 @@ pub async fn read_video_instance_intro(
     }
     sm.on_first_idr_sent().map_err(violation)?;
 
-    Ok(VideoInstanceIntro {
+    let intro = VideoInstanceIntro {
         monitor_id: stream_prologue.context_id,
         generation,
         encoder_config,
         first_frame_header: header,
         first_frame_payload: frame_payload,
-    })
+    };
+    Ok((intro, reader))
+}
+
+/// Client side: accepts the next incoming unidirectional stream and reads
+/// back a full Instance intro (`StreamPrologue`, `VideoStreamGeneration`,
+/// `EncoderConfig`, and the first frame's `VideoFrameHeader` +
+/// `VideoFramePayload` pair), validating message order (spec 4.3.2) and
+/// the header/payload length cross-check (spec 2.10) along the way.
+///
+/// This is wire-level validation only: it does not decode or display the
+/// frame (spec 4's decode/display client behavior is M4's scope). The
+/// payload bytes are still copied out of the read buffer here
+/// (`EnvelopeReader::read_envelope`'s `to_vec()`) -- DR-035 only asks for
+/// the two-Envelope split in M3; wiring the payload straight to a
+/// zero-copy buffer reference is left for when a real decode pipeline
+/// needs it.
+///
+/// This discards the reader after the intro: only useful for a one-shot
+/// read (as M3-M6's tests do). For reading the Instance's subsequent
+/// frames as they keep arriving, use [`accept_video_instance`] instead.
+pub async fn read_video_instance_intro(
+    connection: &quinn::Connection,
+) -> Result<VideoInstanceIntro, VideoError> {
+    let (intro, _reader) = accept_intro(connection).await?;
+    Ok(intro)
+}
+
+/// Client side, continuous-streaming variant: like
+/// [`read_video_instance_intro`], but also returns a [`VideoFrameReader`]
+/// positioned to read this Instance's subsequent frames (spec 4.3.2
+/// Streaming/Congested row) as they arrive.
+pub async fn accept_video_instance(
+    connection: &quinn::Connection,
+) -> Result<(VideoInstanceIntro, VideoFrameReader), VideoError> {
+    let (intro, reader) = accept_intro(connection).await?;
+    Ok((intro, VideoFrameReader { reader }))
+}
+
+/// Reads an Instance's `VideoFrame`s (spec 4.3.2 Streaming/Congested row)
+/// one after another, after the intro. Constructed via
+/// [`accept_video_instance`].
+pub struct VideoFrameReader {
+    reader: EnvelopeReader,
+}
+
+impl VideoFrameReader {
+    /// Reads the next `VideoFrameHeader` + `VideoFramePayload` pair,
+    /// enforcing the same "payload immediately follows header" and
+    /// length-match rules (spec 2.10, DR-035) as the intro's first frame.
+    pub async fn read_next_frame(&mut self) -> Result<(VideoFrameHeader, Vec<u8>), VideoError> {
+        let max_len = StreamKind::Video.max_envelope_length();
+
+        let (type_raw, payload) = self.reader.read_envelope(max_len).await?;
+        if type_raw != messages::type_id::VIDEO_FRAME_HEADER {
+            return Err(VideoError::ProtocolViolation(
+                ReasonCode::PROTOCOL_UNEXPECTED_MESSAGE,
+            ));
+        }
+        let header: VideoFrameHeader = messages::decode(&payload).map_err(VideoError::Decode)?;
+
+        let (type_raw, frame_payload) = self.reader.read_envelope(max_len).await?;
+        if type_raw != messages::type_id::VIDEO_FRAME_PAYLOAD {
+            return Err(VideoError::ProtocolViolation(
+                ReasonCode::PROTOCOL_UNEXPECTED_MESSAGE,
+            ));
+        }
+        if frame_payload.len() as u64 != header.payload_len {
+            return Err(VideoError::FrameLengthMismatch);
+        }
+
+        Ok((header, frame_payload))
+    }
 }

@@ -16,6 +16,35 @@ use crate::reason_code::ReasonCode;
 /// Spec 2.3 / 4.7: connection-level authentication attempt limit.
 pub const AUTH_ATTEMPT_LIMIT: u8 = 3;
 
+/// Connection-scoped timeouts (spec 4.7), applied by callers via
+/// `tokio::time::timeout` around the relevant phase -- this module stays a
+/// pure state machine with no clock of its own (see the module docs).
+pub mod defaults {
+    use std::time::Duration;
+
+    /// `Handshaking` phase (ClientHello/ServerHello exchange).
+    pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+    /// `Authenticating` phase, reset on each attempt (spec 4.7). This PoC
+    /// does not implement the `AuthChallengeRenew` retry loop (M2's
+    /// documented out-of-scope item), so in practice this bounds the
+    /// single AuthPubkey/AuthResult round trip.
+    pub const AUTH_TIMEOUT: Duration = Duration::from_secs(60);
+    /// `Authenticated` phase: time allowed to reach `Active` (spec 4.1,
+    /// DR-024's first-Channel-Live trigger).
+    pub const SESSION_SETUP_TIMEOUT: Duration = Duration::from_secs(15);
+    /// `Active` phase: time since the last received message before
+    /// `Active -> Suspended` (spec 4.1, 3x `KEEPALIVE_INTERVAL`).
+    pub const IDLE_TIMEOUT: Duration = Duration::from_secs(45);
+    /// Period `KeepAlive` is sent on, both directions (spec 2.9).
+    pub const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
+    /// `Suspended` phase: time allowed for a reconnection before the
+    /// session is permanently `Closed` (spec 4.1, 4.6).
+    pub const RECONNECT_GRACE_PERIOD: Duration = Duration::from_secs(300);
+    /// `Closing` phase: grace period before the transport connection is
+    /// actually torn down (spec 4.1, 4.7).
+    pub const CLOSING_GRACE_PERIOD: Duration = Duration::from_secs(2);
+}
+
 /// Connection SM states relevant through M2 (spec 4.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectionState {

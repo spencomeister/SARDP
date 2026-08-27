@@ -17,7 +17,8 @@ use sardp::messages::{
 use sardp::stream_kind::StreamKind;
 use sardp::timecode_frame::generate_timecode_frame;
 use sardp::video_session::{
-    VideoError, VideoInstanceIntro, open_video_instance, read_video_instance_intro,
+    VideoError, VideoInstanceIntro, accept_video_instance, open_video_instance,
+    read_video_instance_intro, send_video_frame,
 };
 use sardp::video_sm::InstanceState;
 use sardp::{net, pki, prologue};
@@ -174,6 +175,70 @@ async fn frame_ids_and_generation_are_monotonic_from_zero() {
     let intro = client_result.expect("client receives the instance intro");
     assert_eq!(intro.generation.generation, 0);
     assert_eq!(intro.first_frame_header.frame_id, 0);
+}
+
+#[tokio::test]
+async fn subsequent_frames_are_read_after_the_intro() {
+    // Phase 1's continuous streaming loop needs more than one frame per
+    // Instance: `accept_video_instance` must hand back a reader that keeps
+    // working for frames sent after the intro via `send_video_frame`, on
+    // the same still-open stream.
+    let (client_connection, server_connection) = connect_pair().await;
+
+    let encoder_config = EncoderConfig {
+        codec: Codec::H264,
+        profile: 66,
+        chroma_format: ChromaFormat::C420,
+        bit_depth: 8,
+        width: 64,
+        height: 64,
+        max_fps: 30,
+        tier: 4,
+        b_frames: 0,
+        server_cursor_excludable: false,
+    };
+    let fake_idr_payload = vec![0x00, 0x00, 0x00, 0x01, 0x67, 0xAA, 0xBB];
+
+    let (server_result, client_result) = tokio::join!(
+        open_video_instance(
+            &server_connection,
+            0,
+            0,
+            1,
+            encoder_config,
+            fake_idr_payload,
+            0,
+            0,
+        ),
+        accept_video_instance(&client_connection),
+    );
+    let (mut send_stream, _server_sm) = server_result.expect("server sends the instance intro");
+    let (intro, mut frame_reader) =
+        client_result.expect("client receives the instance intro and a frame reader");
+    assert_eq!(intro.first_frame_header.frame_id, 0);
+
+    let second_payload = vec![0x00, 0x00, 0x00, 0x01, 0x61, 0xCC];
+    let (send_result, read_result) = tokio::join!(
+        send_video_frame(
+            &mut send_stream,
+            0,   // generation
+            1,   // frame_id
+            1,   // config_id
+            0,   // flags: not IDR
+            100, // capture_ts
+            150, // encode_done_ts
+            64,
+            64,
+            &second_payload,
+        ),
+        frame_reader.read_next_frame(),
+    );
+    send_result.expect("sending the second frame succeeds");
+    let (header, payload) = read_result.expect("reading the second frame succeeds");
+    assert_eq!(header.frame_id, 1);
+    assert!(!header.is_idr());
+    assert_eq!(header.capture_ts, 100);
+    assert_eq!(payload, second_payload);
 }
 
 #[tokio::test]

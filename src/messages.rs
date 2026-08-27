@@ -52,6 +52,10 @@ pub mod type_id {
     pub const TIME_SYNC_RESPONSE: u16 = 0x000A;
     /// `feedback` stream (not `control`).
     pub const TRANSPORT_FEEDBACK: u16 = 0x000B;
+    pub const KEEP_ALIVE: u16 = 0x000C;
+    pub const SESSION_CLOSE: u16 = 0x000D;
+    pub const SESSION_REAUTHENTICATE: u16 = 0x000E;
+    pub const PERMISSION_UPDATE: u16 = 0x000F;
 }
 
 /// `AuthMethod` enum (spec 2.3).
@@ -243,6 +247,52 @@ pub struct TransportFeedback {
     /// the frame's `capture_ts` (server clock) to client display time,
     /// converted to a common clock via the TimeSync offset.
     pub client_queue_delay_us: u32,
+}
+
+/// `KeepAlive` (spec 2.9, control, both directions). Sent every
+/// `KEEPALIVE_INTERVAL` (15s, spec 4.7) to bound `IDLE_TIMEOUT` detection
+/// independently of whatever application traffic (video/feedback) happens
+/// to be flowing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeepAlive {}
+
+/// `SessionClose` (spec 4.1: `Active`/`Closing` rows, either direction).
+/// Not concretely typed in v0.3's Part 2 message catalog (referenced only
+/// by name in Part 4's state tables); this implementation's own core-range
+/// assignment, matching the DR-014 policy already used for the rest of
+/// this module's `type_id`s.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionClose {
+    pub reason: ReasonCode,
+}
+
+/// `SessionReauthenticate.reason` (spec 4.6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReauthenticateReason {
+    Reconnect,
+    PermissionRefresh,
+}
+
+/// `SessionReauthenticate` (spec 2.3 "再接続" box, 4.6, control,
+/// client->server). Sent as the first message after `StreamPrologue` on a
+/// new connection's `control` stream when resuming a `Suspended` session,
+/// in place of `ClientHello` (spec 4.6: "新規コネクションのcontrolストリーム
+/// でStreamPrologue直後にSessionReauthenticateを受信").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionReauthenticate {
+    pub reason: ReauthenticateReason,
+    pub prior_session_id: [u8; 16],
+    pub reconnect_token: [u8; 32],
+}
+
+/// `PermissionUpdate` (spec 2.5, control, server->client).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PermissionUpdate {
+    /// Always the current effective permission state (spec 2.5).
+    pub granted_permissions: u32,
+    /// Bits removed from `granted_permissions` by this update that MUST
+    /// take effect immediately, even on in-progress operations (spec 2.5).
+    pub immediate_revoke: u32,
 }
 
 /// CBOR-encodes `msg` (the DR-021 message-body scheme for this
@@ -459,6 +509,45 @@ mod tests {
         };
         let bytes = encode(&msg);
         let decoded: TransportFeedback = decode(&bytes).unwrap();
+        assert_eq!(decoded, msg);
+    }
+
+    #[test]
+    fn keep_alive_round_trips() {
+        let bytes = encode(&KeepAlive {});
+        let _decoded: KeepAlive = decode(&bytes).unwrap();
+    }
+
+    #[test]
+    fn session_close_round_trips() {
+        let msg = SessionClose {
+            reason: ReasonCode::NONE,
+        };
+        let bytes = encode(&msg);
+        let decoded: SessionClose = decode(&bytes).unwrap();
+        assert_eq!(decoded, msg);
+    }
+
+    #[test]
+    fn session_reauthenticate_round_trips() {
+        let msg = SessionReauthenticate {
+            reason: ReauthenticateReason::Reconnect,
+            prior_session_id: [1; 16],
+            reconnect_token: [2; 32],
+        };
+        let bytes = encode(&msg);
+        let decoded: SessionReauthenticate = decode(&bytes).unwrap();
+        assert_eq!(decoded, msg);
+    }
+
+    #[test]
+    fn permission_update_round_trips() {
+        let msg = PermissionUpdate {
+            granted_permissions: 0b0101,
+            immediate_revoke: 0b0010,
+        };
+        let bytes = encode(&msg);
+        let decoded: PermissionUpdate = decode(&bytes).unwrap();
         assert_eq!(decoded, msg);
     }
 

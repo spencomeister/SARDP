@@ -5,10 +5,14 @@
 //! `quinn::Connection::export_keying_material`, not a stub.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
 use sardp::connection_sm::ConnectionState;
-use sardp::handshake::{HandshakeError, client_handshake, server_handshake};
+use sardp::handshake::{
+    HandshakeError, client_handshake, client_handshake_with_timeouts, server_handshake,
+};
+use sardp::stream_kind::StreamKind;
 use sardp::{net, pki};
 
 fn loopback(port: u16) -> SocketAddr {
@@ -114,6 +118,102 @@ async fn handshake_with_untrusted_key_is_denied() {
 
     assert!(matches!(client_result, Err(HandshakeError::AuthDenied)));
     assert!(matches!(server_result, Err(HandshakeError::Auth(_))));
+}
+
+#[tokio::test]
+async fn handshake_timeout_fires_if_server_never_responds() {
+    // Spec 4.7 HANDSHAKE_TIMEOUT (10s in production, `client_handshake`'s
+    // default): proves the `tokio::time::timeout` wiring in
+    // `client_handshake_with_timeouts` actually elapses and surfaces
+    // `HandshakeError::HandshakeTimeout`, using a tiny override so the
+    // test itself stays fast rather than waiting out the real 10s value.
+    let (client_connection, server_connection, _cert) = connect_pair().await;
+
+    let unresponsive_server = async move {
+        // Accepts the control stream (so the client's writes aren't stuck
+        // behind an unaccepted stream) but never reads or sends anything
+        // on it. Binding (not discarding) the accepted streams matters:
+        // dropping an unfinished `SendStream` implicitly resets it, which
+        // would deliver the client an early, unrelated stream-reset error
+        // instead of genuinely exercising the timeout.
+        let _accepted = server_connection.accept_bi().await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    };
+
+    let client_signing_key = SigningKey::from_bytes(&[0x66; 32]);
+    let (client_result, ()) = tokio::join!(
+        client_handshake_with_timeouts(
+            &client_connection,
+            &client_signing_key,
+            "test-client",
+            "alice",
+            "device-1",
+            Duration::from_millis(50),
+            Duration::from_secs(60),
+        ),
+        unresponsive_server,
+    );
+
+    assert!(matches!(
+        client_result,
+        Err(HandshakeError::HandshakeTimeout)
+    ));
+}
+
+#[tokio::test]
+async fn auth_timeout_fires_if_server_never_sends_auth_result() {
+    // Spec 4.7 AUTH_TIMEOUT: same proof as the HANDSHAKE_TIMEOUT test
+    // above, but for the second phase -- a server that completes the
+    // ClientHello/ServerHello exchange (so the client legitimately enters
+    // Authenticating) and then goes silent instead of ever sending
+    // AuthResult.
+    let (client_connection, server_connection, _cert) = connect_pair().await;
+
+    let stalls_after_server_hello = async move {
+        let (mut send, recv) = server_connection.accept_bi().await.unwrap();
+        let mut reader = sardp::stream_reader::EnvelopeReader::new(recv);
+        reader.read_prologue().await.unwrap();
+        reader
+            .read_envelope(StreamKind::Control.max_envelope_length())
+            .await
+            .unwrap(); // ClientHello
+
+        let server_hello = sardp::messages::ServerHello {
+            server_name: "stalling-server".into(),
+            server_version: "0".into(),
+            capabilities: vec![],
+            auth_policy: sardp::messages::AuthPolicy {
+                accepted_combinations: vec![],
+            },
+            auth_challenge: [0u8; 32],
+        };
+        sardp::stream_reader::write_envelope(
+            &mut send,
+            sardp::messages::type_id::SERVER_HELLO,
+            &sardp::messages::encode(&server_hello),
+        )
+        .await
+        .unwrap();
+
+        // Never reads AuthPubkey, never sends AuthResult.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    };
+
+    let client_signing_key = SigningKey::from_bytes(&[0x77; 32]);
+    let (client_result, ()) = tokio::join!(
+        client_handshake_with_timeouts(
+            &client_connection,
+            &client_signing_key,
+            "test-client",
+            "alice",
+            "device-1",
+            Duration::from_secs(5),
+            Duration::from_millis(50),
+        ),
+        stalls_after_server_hello,
+    );
+
+    assert!(matches!(client_result, Err(HandshakeError::AuthTimeout)));
 }
 
 #[tokio::test]
