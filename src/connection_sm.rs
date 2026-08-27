@@ -45,13 +45,17 @@ pub mod defaults {
     pub const CLOSING_GRACE_PERIOD: Duration = Duration::from_secs(2);
 }
 
-/// Connection SM states relevant through M2 (spec 4.1).
+/// Connection SM states (spec 4.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectionState {
     Handshaking,
     Authenticating,
     Authenticated,
     Active,
+    /// The transport connection is gone (IDLE_TIMEOUT or an actual
+    /// disconnect); a new connection may resume this session within
+    /// `RECONNECT_GRACE_PERIOD` via the Reconnection SM (spec 4.6).
+    Suspended,
     Closing(ReasonCode),
 }
 
@@ -116,6 +120,10 @@ impl ConnectionSm {
             // to reject against yet.
             ConnectionState::Authenticated => true,
             ConnectionState::Active => Self::allowed_in_active(type_id),
+            // Spec 4.1: "接続が存在しないため本状態自体にはメッセージ往来が
+            // ない" -- Suspended's only way out is the Reconnection SM
+            // (spec 4.6) on a *new* connection, not a message on this one.
+            ConnectionState::Suspended => false,
             ConnectionState::Closing(_) => false,
         };
         if allowed {
@@ -186,6 +194,41 @@ impl ConnectionSm {
     pub fn on_channel_live(&mut self) -> Result<(), ProtocolViolation> {
         match self.state {
             ConnectionState::Authenticated => {
+                self.state = ConnectionState::Active;
+                Ok(())
+            }
+            _ => Err(ProtocolViolation {
+                reason: ReasonCode::PROTOCOL_UNEXPECTED_MESSAGE,
+            }),
+        }
+    }
+
+    /// `Active -> Suspended`: the transport connection is gone, whether
+    /// from `IDLE_TIMEOUT` or an actual disconnect (spec 4.1). Does not
+    /// itself start the `RECONNECT_GRACE_PERIOD` clock or touch any
+    /// session store -- that's the caller's job (spec 4.6); this only
+    /// tracks the state transition itself.
+    pub fn suspend(&mut self) -> Result<(), ProtocolViolation> {
+        match self.state {
+            ConnectionState::Active => {
+                self.state = ConnectionState::Suspended;
+                Ok(())
+            }
+            _ => Err(ProtocolViolation {
+                reason: ReasonCode::PROTOCOL_UNEXPECTED_MESSAGE,
+            }),
+        }
+    }
+
+    /// `Suspended -> Active`, once a reconnection on a new connection is
+    /// accepted (spec 4.6: "ReconnectAccepted -> \[Connection SM:
+    /// Active\]"). Skips back through Authenticating/Authenticated
+    /// deliberately: `AuthPubkey` is not re-verified on reconnect (the
+    /// `reconnect_token` alone is spec 4.6's proof of continuity), so
+    /// there is no second `Authenticated` moment to pass through.
+    pub fn resume(&mut self) -> Result<(), ProtocolViolation> {
+        match self.state {
+            ConnectionState::Suspended => {
                 self.state = ConnectionState::Active;
                 Ok(())
             }
@@ -360,5 +403,59 @@ mod tests {
         sm.record_auth_failure().unwrap_err();
         assert!(matches!(sm.state(), ConnectionState::Closing(_)));
         assert!(sm.check_message(type_id::AUTH_PUBKEY).is_err());
+    }
+
+    fn active_sm() -> ConnectionSm {
+        let mut sm = ConnectionSm::new();
+        sm.complete_handshake().unwrap();
+        sm.complete_authentication().unwrap();
+        sm.on_channel_live().unwrap();
+        sm
+    }
+
+    #[test]
+    fn suspend_transitions_active_to_suspended() {
+        let mut sm = active_sm();
+        assert_eq!(sm.suspend(), Ok(()));
+        assert_eq!(sm.state(), ConnectionState::Suspended);
+    }
+
+    #[test]
+    fn suspend_outside_active_is_rejected() {
+        let mut sm = ConnectionSm::new();
+        assert!(sm.suspend().is_err());
+        assert_eq!(sm.state(), ConnectionState::Handshaking);
+    }
+
+    #[test]
+    fn suspended_rejects_all_messages() {
+        let mut sm = active_sm();
+        sm.suspend().unwrap();
+        assert!(sm.check_message(type_id::TRANSPORT_FEEDBACK).is_err());
+        assert!(sm.check_message(type_id::KEEP_ALIVE).is_err());
+    }
+
+    #[test]
+    fn resume_transitions_suspended_to_active() {
+        let mut sm = active_sm();
+        sm.suspend().unwrap();
+        assert_eq!(sm.resume(), Ok(()));
+        assert_eq!(sm.state(), ConnectionState::Active);
+    }
+
+    #[test]
+    fn resume_outside_suspended_is_rejected() {
+        let mut sm = active_sm();
+        assert!(sm.resume().is_err());
+        assert_eq!(sm.state(), ConnectionState::Active);
+    }
+
+    #[test]
+    fn resumed_connection_behaves_like_a_normal_active_connection() {
+        let mut sm = active_sm();
+        sm.suspend().unwrap();
+        sm.resume().unwrap();
+        assert_eq!(sm.check_message(type_id::TRANSPORT_FEEDBACK), Ok(()));
+        assert!(sm.check_message(type_id::CLIENT_HELLO).is_err());
     }
 }

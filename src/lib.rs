@@ -24,6 +24,8 @@ pub mod permission_sm;
 pub mod pki;
 pub mod prologue;
 pub mod reason_code;
+pub mod reconnection;
+pub mod session_store;
 pub mod stream_kind;
 pub mod stream_reader;
 pub mod timecode_frame;
