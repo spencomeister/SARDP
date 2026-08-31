@@ -1,8 +1,13 @@
-//! VideoStream Channel State Machine (spec 4.3.1), through M5:
+//! VideoStream Channel State Machine (spec 4.3.1):
 //! `Initializing -> Live -> Recovering -> Live` (backpressure-triggered
-//! generation reopen, DR-030's unbounded-retry policy). `Paused` (the
-//! multi-monitor `ActiveMonitor` handoff) is out of scope: the PoC brief
-//! limits this implementation to a single monitor.
+//! generation reopen, DR-030's unbounded-retry policy), plus `Live <->
+//! Paused` for the multi-monitor `ActiveMonitor` handoff (Phase 2a; see
+//! [`crate::monitor_manager`] for the per-connection multi-Channel
+//! bookkeeping this drives). Per spec 4.3.1: "Paused状態では、下位の
+//! Instanceは Streaming のまま維持し、エンコーダが送出レート・解像度のみを
+//! 下げる(generationは変えない)" -- this PoC keeps that FPS/resolution
+//! reduction out of scope (only the state transition itself matters here);
+//! `Recovering`, unlike `Paused`, always bumps the generation.
 //!
 //! A Channel is the per-monitor concept that persists across Instance
 //! reopens -- this is exactly why [`crate::backpressure::BaselineTracker`]
@@ -41,6 +46,9 @@ pub enum ChannelState {
     Initializing,
     Live,
     Recovering,
+    /// Not the focused monitor (spec 2.4/4.3.1: `ActiveMonitor` points
+    /// elsewhere). The underlying Instance stays `Streaming`.
+    Paused,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -136,6 +144,26 @@ impl ChannelSm {
     /// `false`.
     pub fn next_retry_allowed_at_us(&self) -> Option<u64> {
         self.next_retry_allowed_at_us
+    }
+
+    /// `Live -> Paused`, when this Channel's monitor loses focus (spec
+    /// 4.3.1, driven by an incoming `ActiveMonitor` naming a different
+    /// monitor). A no-op outside `Live`: losing focus while
+    /// `Initializing`/`Recovering` doesn't cancel whatever's already
+    /// happening, it only matters once/if the Channel would otherwise be
+    /// `Live` while unfocused.
+    pub fn deactivate(&mut self) {
+        if self.state == ChannelState::Live {
+            self.state = ChannelState::Paused;
+        }
+    }
+
+    /// `Paused -> Live`, when this Channel's monitor regains focus. A
+    /// no-op outside `Paused`.
+    pub fn activate(&mut self) {
+        if self.state == ChannelState::Paused {
+            self.state = ChannelState::Live;
+        }
     }
 }
 
@@ -237,5 +265,65 @@ mod tests {
         // A brand new episode starts fresh, not mid-backoff from before.
         sm.on_reset();
         assert!(sm.may_retry(0));
+    }
+
+    #[test]
+    fn deactivate_transitions_live_to_paused() {
+        let mut sm = ChannelSm::new();
+        sm.on_instance_streaming();
+        sm.deactivate();
+        assert_eq!(sm.state(), ChannelState::Paused);
+    }
+
+    #[test]
+    fn activate_transitions_paused_to_live() {
+        let mut sm = ChannelSm::new();
+        sm.on_instance_streaming();
+        sm.deactivate();
+        sm.activate();
+        assert_eq!(sm.state(), ChannelState::Live);
+    }
+
+    #[test]
+    fn deactivate_outside_live_is_a_no_op() {
+        let mut sm = ChannelSm::new();
+        assert_eq!(sm.state(), ChannelState::Initializing);
+        sm.deactivate();
+        assert_eq!(sm.state(), ChannelState::Initializing);
+
+        sm.on_instance_streaming();
+        sm.on_reset();
+        assert_eq!(sm.state(), ChannelState::Recovering);
+        sm.deactivate();
+        assert_eq!(
+            sm.state(),
+            ChannelState::Recovering,
+            "losing focus mid-recovery must not cancel the recovery"
+        );
+    }
+
+    #[test]
+    fn activate_outside_paused_is_a_no_op() {
+        let mut sm = ChannelSm::new();
+        sm.on_instance_streaming();
+        assert_eq!(sm.state(), ChannelState::Live);
+        sm.activate(); // already Live
+        assert_eq!(sm.state(), ChannelState::Live);
+    }
+
+    #[test]
+    fn recovering_while_paused_leaves_the_channel_paused_not_live() {
+        // A Paused Channel's Instance can still be reset by backpressure
+        // (spec 4.3.1 doesn't exempt unfocused monitors from congestion
+        // handling); on_reset() is unconditional, matching the spec's
+        // "任意の状態" framing for the transitions it does specify -- but
+        // Paused itself isn't one of the states on_reset lists a source
+        // for, so this documents the actual (Paused-clobbering) behavior.
+        let mut sm = ChannelSm::new();
+        sm.on_instance_streaming();
+        sm.deactivate();
+        assert_eq!(sm.state(), ChannelState::Paused);
+        sm.on_reset();
+        assert_eq!(sm.state(), ChannelState::Recovering);
     }
 }

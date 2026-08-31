@@ -51,6 +51,19 @@ impl VideoChannel {
         self.baseline.baseline_us()
     }
 
+    /// `Live -> Paused` (spec 4.3.1, 2.4's `ActiveMonitor` pointing at a
+    /// different monitor). A no-op outside `Live` -- see
+    /// [`crate::channel_sm::ChannelSm::deactivate`].
+    pub fn deactivate(&mut self) {
+        self.channel_sm.deactivate();
+    }
+
+    /// `Paused -> Live` (spec 4.3.1, this monitor regaining focus). A
+    /// no-op outside `Paused`.
+    pub fn activate(&mut self) {
+        self.channel_sm.activate();
+    }
+
     /// Drives the current Instance's SM through `Configuring ->
     /// Streaming` and the Channel's SM to `Live`. Call once after the
     /// Instance's setup messages + first IDR have actually been sent
@@ -223,5 +236,21 @@ mod tests {
         assert_eq!(channel.instance_state(), InstanceState::Streaming);
         assert_eq!(channel.channel_state(), ChannelState::Live);
         assert_eq!(channel.generation(), 0);
+    }
+
+    #[test]
+    fn deactivate_and_activate_toggle_live_and_paused() {
+        let mut channel = VideoChannel::new(0);
+        channel.mark_instance_streaming().unwrap();
+        assert_eq!(channel.channel_state(), ChannelState::Live);
+
+        channel.deactivate();
+        assert_eq!(channel.channel_state(), ChannelState::Paused);
+        // The underlying Instance is untouched (spec 4.3.1: it stays
+        // Streaming while Paused).
+        assert_eq!(channel.instance_state(), InstanceState::Streaming);
+
+        channel.activate();
+        assert_eq!(channel.channel_state(), ChannelState::Live);
     }
 }

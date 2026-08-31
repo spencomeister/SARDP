@@ -17,6 +17,7 @@ pub mod h264;
 pub mod handshake;
 pub mod measurement;
 pub mod messages;
+pub mod monitor_manager;
 pub mod net;
 pub mod netem;
 pub mod permission_set;

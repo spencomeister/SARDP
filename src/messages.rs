@@ -56,6 +56,17 @@ pub mod type_id {
     pub const SESSION_CLOSE: u16 = 0x000D;
     pub const SESSION_REAUTHENTICATE: u16 = 0x000E;
     pub const PERMISSION_UPDATE: u16 = 0x000F;
+    pub const ACTIVE_MONITOR: u16 = 0x0010;
+    pub const CLIPBOARD_FORMATS: u16 = 0x0011;
+    pub const CLIPBOARD_REQUEST: u16 = 0x0012;
+    pub const CLIPBOARD_DATA: u16 = 0x0013;
+    pub const CLIPBOARD_ERROR: u16 = 0x0014;
+    pub const FILE_TRANSFER_REQUEST: u16 = 0x0015;
+    pub const FILE_TRANSFER_ACCEPT: u16 = 0x0016;
+    pub const FILE_TRANSFER_REJECT: u16 = 0x0017;
+    pub const FILE_CHUNK: u16 = 0x0018;
+    pub const FILE_TRANSFER_COMPLETE: u16 = 0x0019;
+    pub const FILE_TRANSFER_ERROR: u16 = 0x001A;
 }
 
 /// `AuthMethod` enum (spec 2.3).
@@ -293,6 +304,14 @@ pub struct PermissionUpdate {
     /// Bits removed from `granted_permissions` by this update that MUST
     /// take effect immediately, even on in-progress operations (spec 2.5).
     pub immediate_revoke: u32,
+}
+
+/// `ActiveMonitor` (spec 2.4, control, client->server): the client's
+/// currently-focused monitor. Drives the `Live <-> Paused` transition on
+/// each `VideoChannel` (spec 4.3.1; see [`crate::monitor_manager`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActiveMonitor {
+    pub monitor_id: u8,
 }
 
 /// CBOR-encodes `msg` (the DR-021 message-body scheme for this
@@ -548,6 +567,14 @@ mod tests {
         };
         let bytes = encode(&msg);
         let decoded: PermissionUpdate = decode(&bytes).unwrap();
+        assert_eq!(decoded, msg);
+    }
+
+    #[test]
+    fn active_monitor_round_trips() {
+        let msg = ActiveMonitor { monitor_id: 2 };
+        let bytes = encode(&msg);
+        let decoded: ActiveMonitor = decode(&bytes).unwrap();
         assert_eq!(decoded, msg);
     }
 
