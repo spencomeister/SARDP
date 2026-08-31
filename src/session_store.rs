@@ -10,6 +10,8 @@ use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::sync::Mutex;
 
+use subtle::ConstantTimeEq;
+
 use crate::connection_sm::ConnectionSm;
 
 /// Everything a `Suspended` session needs to resume on a new connection.
@@ -61,6 +63,14 @@ impl SessionStore {
     /// on any failure, the store is left exactly as it was, so a client
     /// that made a typo (or an attacker guessing) doesn't get to
     /// invalidate the legitimate session's chance to reconnect.
+    ///
+    /// The token comparison itself is constant-time (`subtle`'s
+    /// `ct_eq`, not `==`): a `reconnect_token` is a bearer credential --
+    /// spec 2.3/4.6's whole reason for making it single-use and atomically
+    /// consumed is to resist theft/replay, which a byte-by-byte
+    /// short-circuiting `==` would partially undermine by leaking timing
+    /// information about how many leading bytes an attacker's guess got
+    /// right.
     pub fn try_reconnect(
         &self,
         session_id: [u8; 16],
@@ -69,7 +79,7 @@ impl SessionStore {
         let mut sessions = self.sessions.lock().unwrap();
         match sessions.entry(session_id) {
             Entry::Occupied(entry) => {
-                if entry.get().reconnect_token == token {
+                if bool::from(entry.get().reconnect_token.ct_eq(&token)) {
                     Ok(entry.remove())
                 } else {
                     Err(ReconnectError::TokenMismatch)
