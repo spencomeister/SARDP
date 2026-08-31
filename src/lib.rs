@@ -6,6 +6,7 @@ pub mod auth;
 pub mod backpressure;
 pub mod channel_sm;
 pub mod client_display;
+pub mod clipboard_session;
 pub mod clock;
 pub mod connection_sm;
 pub mod decoder;

@@ -314,6 +314,61 @@ pub struct ActiveMonitor {
     pub monitor_id: u8,
 }
 
+/// `ClipboardFormats.formats[].namespace` (spec 2.7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FormatNamespace {
+    Mime,
+    Win32,
+    MacosUti,
+}
+
+/// One advertised clipboard format (spec 2.7, `ClipboardFormats.formats[]`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClipboardFormatEntry {
+    pub namespace: FormatNamespace,
+    pub format_id: String,
+}
+
+/// `ClipboardFormats` (spec 2.7, `clipboard` stream, sent by whichever
+/// side's clipboard content just changed -- the "announcer", spec 2.2.1's
+/// per-exchange initiator).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClipboardFormats {
+    /// Identifies this exchange; MUST equal the `clipboard` stream's
+    /// `StreamPrologue.context_id` (spec 2.2.1, 2.7).
+    pub request_id: u64,
+    pub formats: Vec<ClipboardFormatEntry>,
+}
+
+/// `ClipboardRequest` (spec 2.7, `clipboard` stream, sent by the side
+/// that received `ClipboardFormats` -- the "requester").
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClipboardRequest {
+    /// MUST match the `ClipboardFormats.request_id` this replies to.
+    pub request_id: u64,
+    pub namespace: FormatNamespace,
+    pub format_id: String,
+}
+
+/// `ClipboardData` (spec 2.7, `clipboard` stream, announcer->requester).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClipboardData {
+    pub request_id: u64,
+    pub namespace: FormatNamespace,
+    pub format_id: String,
+    #[serde(with = "serde_bytes")]
+    pub data: Vec<u8>,
+}
+
+/// `ClipboardError` (spec 2.7, `clipboard` stream, announcer->requester):
+/// sent instead of `ClipboardData` when the request can't be satisfied
+/// (spec 4.8: e.g. `POLICY.6 CLIPBOARD_FORMAT_TOO_LARGE`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClipboardError {
+    pub request_id: u64,
+    pub reason: ReasonCode,
+}
+
 /// CBOR-encodes `msg` (the DR-021 message-body scheme for this
 /// implementation). Encoding an owned, in-memory `Vec<u8>` sink cannot
 /// fail for any of the message types in this module.
@@ -575,6 +630,62 @@ mod tests {
         let msg = ActiveMonitor { monitor_id: 2 };
         let bytes = encode(&msg);
         let decoded: ActiveMonitor = decode(&bytes).unwrap();
+        assert_eq!(decoded, msg);
+    }
+
+    #[test]
+    fn clipboard_formats_round_trips() {
+        let msg = ClipboardFormats {
+            request_id: 7,
+            formats: vec![
+                ClipboardFormatEntry {
+                    namespace: FormatNamespace::Mime,
+                    format_id: "text/plain".into(),
+                },
+                ClipboardFormatEntry {
+                    namespace: FormatNamespace::Win32,
+                    format_id: "CF_UNICODETEXT".into(),
+                },
+            ],
+        };
+        let bytes = encode(&msg);
+        let decoded: ClipboardFormats = decode(&bytes).unwrap();
+        assert_eq!(decoded, msg);
+    }
+
+    #[test]
+    fn clipboard_request_round_trips() {
+        let msg = ClipboardRequest {
+            request_id: 7,
+            namespace: FormatNamespace::Mime,
+            format_id: "text/plain".into(),
+        };
+        let bytes = encode(&msg);
+        let decoded: ClipboardRequest = decode(&bytes).unwrap();
+        assert_eq!(decoded, msg);
+    }
+
+    #[test]
+    fn clipboard_data_round_trips() {
+        let msg = ClipboardData {
+            request_id: 7,
+            namespace: FormatNamespace::Mime,
+            format_id: "text/plain".into(),
+            data: b"hello clipboard".to_vec(),
+        };
+        let bytes = encode(&msg);
+        let decoded: ClipboardData = decode(&bytes).unwrap();
+        assert_eq!(decoded, msg);
+    }
+
+    #[test]
+    fn clipboard_error_round_trips() {
+        let msg = ClipboardError {
+            request_id: 7,
+            reason: ReasonCode::POLICY_CLIPBOARD_FORMAT_TOO_LARGE,
+        };
+        let bytes = encode(&msg);
+        let decoded: ClipboardError = decode(&bytes).unwrap();
         assert_eq!(decoded, msg);
     }
 

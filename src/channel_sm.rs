@@ -312,7 +312,7 @@ mod tests {
     }
 
     #[test]
-    fn recovering_while_paused_leaves_the_channel_paused_not_live() {
+    fn reset_while_paused_overrides_pause_and_enters_recovering() {
         // A Paused Channel's Instance can still be reset by backpressure
         // (spec 4.3.1 doesn't exempt unfocused monitors from congestion
         // handling); on_reset() is unconditional, matching the spec's
