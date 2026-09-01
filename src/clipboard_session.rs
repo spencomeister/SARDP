@@ -34,6 +34,12 @@ pub enum ClipboardSessionError {
     WrongStreamKind,
     /// A message arrived with a type this exchange doesn't expect next.
     UnexpectedType(u16),
+    /// `ClipboardFormats.request_id` didn't match the stream's own
+    /// `context_id` (spec 2.2.1/2.7).
+    RequestIdMismatch {
+        context_id: u64,
+        request_id: u64,
+    },
     /// Spec 2.7: no `ClipboardData`/`ClipboardError` within
     /// `CLIPBOARD_RESPONSE_TIMEOUT`.
     ResponseTimeout,
@@ -107,10 +113,12 @@ pub async fn accept_clipboard_formats(
     }
     let formats: ClipboardFormats =
         messages::decode(&payload).map_err(ClipboardSessionError::Decode)?;
-    debug_assert_eq!(
-        formats.request_id, stream_prologue.context_id,
-        "ClipboardFormats.request_id must match the stream's own context_id (spec 2.2.1/2.7)"
-    );
+    if formats.request_id != stream_prologue.context_id {
+        return Err(ClipboardSessionError::RequestIdMismatch {
+            context_id: stream_prologue.context_id,
+            request_id: formats.request_id,
+        });
+    }
 
     Ok((send, reader, formats))
 }

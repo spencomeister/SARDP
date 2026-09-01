@@ -13,9 +13,13 @@ use sardp::clipboard_session::{
     read_clipboard_request, request_clipboard_data, request_clipboard_data_with_timeout,
     respond_to_clipboard_request,
 };
-use sardp::messages::{ClipboardFormatEntry, ClipboardFormats, ClipboardRequest, FormatNamespace};
+use sardp::messages::{
+    self, ClipboardFormatEntry, ClipboardFormats, ClipboardRequest, FormatNamespace,
+};
 use sardp::reason_code::ReasonCode;
-use sardp::{net, pki};
+use sardp::stream_kind::StreamKind;
+use sardp::stream_reader::write_envelope;
+use sardp::{net, pki, prologue};
 
 fn loopback(port: u16) -> SocketAddr {
     SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)
@@ -212,4 +216,57 @@ async fn requester_times_out_if_announcer_never_responds() {
         result,
         Err(ClipboardSessionError::ResponseTimeout)
     ));
+}
+
+/// spec 2.2.1/2.7: `ClipboardFormats.request_id` must match the stream's
+/// own `context_id`. This deliberately crafts a mismatched stream (bypassing
+/// `announce_clipboard_formats`, which always keeps them equal) to verify
+/// `accept_clipboard_formats` rejects it at runtime rather than only in a
+/// debug assertion that a release build would compile away.
+#[tokio::test]
+async fn request_id_mismatch_between_prologue_context_id_and_clipboard_formats_is_rejected() {
+    let (client_connection, server_connection) = connect_pair().await;
+
+    const CONTEXT_ID: u64 = 1;
+    const MISMATCHED_REQUEST_ID: u64 = 2;
+    let formats = ClipboardFormats {
+        request_id: MISMATCHED_REQUEST_ID,
+        formats: vec![ClipboardFormatEntry {
+            namespace: FormatNamespace::Mime,
+            format_id: "text/plain".into(),
+        }],
+    };
+
+    let (mut send, _accept_result) = tokio::join!(
+        async {
+            let (mut send, _recv) = server_connection.open_bi().await.expect("open_bi");
+            let mut prologue_bytes = Vec::new();
+            prologue::encode(StreamKind::Clipboard, 1, CONTEXT_ID, &mut prologue_bytes);
+            send.write_all(&prologue_bytes)
+                .await
+                .expect("write prologue");
+            write_envelope(
+                &mut send,
+                messages::type_id::CLIPBOARD_FORMATS,
+                &messages::encode(&formats),
+            )
+            .await
+            .expect("write ClipboardFormats");
+            send
+        },
+        accept_clipboard_formats(&client_connection),
+    );
+    // Keep the send stream open until the requester has read the mismatched
+    // message; otherwise dropping it early would reset the stream first.
+    let result = _accept_result;
+
+    assert!(matches!(
+        result,
+        Err(ClipboardSessionError::RequestIdMismatch {
+            context_id: CONTEXT_ID,
+            request_id: MISMATCHED_REQUEST_ID,
+        })
+    ));
+
+    send.finish().ok();
 }
