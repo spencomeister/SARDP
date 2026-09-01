@@ -1,0 +1,35 @@
+[package]
+name = "sardp-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.sardp]
+path = ".."
+
+[[bin]]
+name = "envelope_parse"
+path = "fuzz_targets/envelope_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "envelope_parse_stream"
+path = "fuzz_targets/envelope_parse_stream.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "prologue_parse"
+path = "fuzz_targets/prologue_parse.rs"
+test = false
+doc = false
+bench = false
