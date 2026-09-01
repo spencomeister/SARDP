@@ -14,6 +14,7 @@ pub mod dev_identity;
 pub mod encoder;
 pub mod envelope;
 pub mod feedback_session;
+pub mod file_transfer_session;
 pub mod h264;
 pub mod handshake;
 pub mod measurement;

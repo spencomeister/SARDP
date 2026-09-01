@@ -369,6 +369,79 @@ pub struct ClipboardError {
     pub reason: ReasonCode,
 }
 
+/// `FileTransferRequest.direction` (spec 2.6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FileTransferDirection {
+    Upload,
+    Download,
+}
+
+/// `FileTransferRequest` (spec 2.6, control, client->server: the client
+/// always sends this, regardless of `direction`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileTransferRequest {
+    pub request_id: u64,
+    pub direction: FileTransferDirection,
+    pub virtual_path: String,
+    /// Unverified hint; the server independently computes `resolved_size`.
+    pub declared_size: u64,
+}
+
+/// `FileTransferAccept` (spec 2.6, control, server->client).
+///
+/// Spec 2.6 defines `file_handle` as an opaque `bytes(16)`, but this
+/// implementation's `StreamPrologue.context_id` is a varint capped at
+/// `crate::varint::MAX` (2^62-1) -- it cannot literally carry 16 bytes.
+/// Spec 2.6 also requires the later `file` stream's
+/// `StreamPrologue.context_id` to equal `file_handle`, so this
+/// implementation represents `file_handle` as a `u64` instead, letting that
+/// equality hold exactly rather than approximately.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileTransferAccept {
+    pub request_id: u64,
+    pub file_handle: u64,
+    pub resolved_size: u64,
+    /// Monotonic-clock deadline after which `file_handle` is no longer valid.
+    pub expiry_ts: u64,
+}
+
+/// `FileTransferReject` (spec 2.6, control, server->client).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileTransferReject {
+    pub request_id: u64,
+    pub reason: ReasonCode,
+}
+
+/// `FileChunk` (spec 2.6, `file` stream).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileChunk {
+    pub offset: u64,
+    /// `data`'s length, verified independently of the Envelope's own length
+    /// (spec 2.6).
+    pub length: u32,
+    #[serde(with = "serde_bytes")]
+    pub data: Vec<u8>,
+}
+
+/// `FileTransferComplete` (spec 2.6, `file` stream).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileTransferComplete {
+    /// SHA-256 over the entire transferred file.
+    #[serde(with = "serde_bytes")]
+    pub checksum: Vec<u8>,
+}
+
+/// `FileTransferError` (spec 2.6, `file` stream, either side): sent when one
+/// of the receiver's spec 2.6 MUST-reject conditions is hit (spec 4.8:
+/// `PROTOCOL.10 FILE_CHUNK_OVERLAP`, `PROTOCOL.11 FILE_CHUNK_OUT_OF_RANGE`,
+/// `PROTOCOL.12 FILE_INCOMPLETE_TRANSFER`, `PROTOCOL.13
+/// FILE_CHECKSUM_MISMATCH`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileTransferError {
+    pub file_handle: u64,
+    pub reason: ReasonCode,
+}
+
 /// CBOR-encodes `msg` (the DR-021 message-body scheme for this
 /// implementation). Encoding an owned, in-memory `Vec<u8>` sink cannot
 /// fail for any of the message types in this module.
@@ -686,6 +759,76 @@ mod tests {
         };
         let bytes = encode(&msg);
         let decoded: ClipboardError = decode(&bytes).unwrap();
+        assert_eq!(decoded, msg);
+    }
+
+    #[test]
+    fn file_transfer_request_round_trips() {
+        let msg = FileTransferRequest {
+            request_id: 3,
+            direction: FileTransferDirection::Upload,
+            virtual_path: "/uploads/report.pdf".into(),
+            declared_size: 4096,
+        };
+        let bytes = encode(&msg);
+        let decoded: FileTransferRequest = decode(&bytes).unwrap();
+        assert_eq!(decoded, msg);
+    }
+
+    #[test]
+    fn file_transfer_accept_round_trips() {
+        let msg = FileTransferAccept {
+            request_id: 3,
+            file_handle: 0xDEAD_BEEF,
+            resolved_size: 4096,
+            expiry_ts: 123_456,
+        };
+        let bytes = encode(&msg);
+        let decoded: FileTransferAccept = decode(&bytes).unwrap();
+        assert_eq!(decoded, msg);
+    }
+
+    #[test]
+    fn file_transfer_reject_round_trips() {
+        let msg = FileTransferReject {
+            request_id: 3,
+            reason: ReasonCode::POLICY_FILE_POLICY_REJECTED,
+        };
+        let bytes = encode(&msg);
+        let decoded: FileTransferReject = decode(&bytes).unwrap();
+        assert_eq!(decoded, msg);
+    }
+
+    #[test]
+    fn file_chunk_round_trips() {
+        let msg = FileChunk {
+            offset: 512,
+            length: 4,
+            data: vec![1, 2, 3, 4],
+        };
+        let bytes = encode(&msg);
+        let decoded: FileChunk = decode(&bytes).unwrap();
+        assert_eq!(decoded, msg);
+    }
+
+    #[test]
+    fn file_transfer_complete_round_trips() {
+        let msg = FileTransferComplete {
+            checksum: vec![0xAB; 32],
+        };
+        let bytes = encode(&msg);
+        let decoded: FileTransferComplete = decode(&bytes).unwrap();
+        assert_eq!(decoded, msg);
+    }
+
+    #[test]
+    fn file_transfer_error_round_trips() {
+        let msg = FileTransferError {
+            file_handle: 0xDEAD_BEEF,
+            reason: ReasonCode::PROTOCOL_FILE_CHECKSUM_MISMATCH,
+        };
+        let bytes = encode(&msg);
+        let decoded: FileTransferError = decode(&bytes).unwrap();
         assert_eq!(decoded, msg);
     }
 
