@@ -97,7 +97,7 @@ pub async fn read_first_control_message(
 /// The outcome of a successful reconnection: same shape as
 /// [`crate::handshake::HandshakeOutcome`], plus the generation the
 /// resumed video Channel's next Instance should open at.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReconnectOutcome {
     pub session_id: [u8; 16],
     /// Freshly issued: spec 4.6 requires the old token be invalidated and
@@ -108,6 +108,10 @@ pub struct ReconnectOutcome {
     /// Instance must open at this generation, continuing the session's
     /// monotonic counter rather than resetting it.
     pub resumed_generation: u64,
+    /// `AuthPubkey.user_id`, carried through so a session that suspends
+    /// again after being resumed still has it (see
+    /// `crate::session_store::SuspendedSession::user_id`).
+    pub user_id: String,
 }
 
 /// Client side: opens a new `control` stream on `connection` and sends
@@ -120,6 +124,7 @@ pub async fn client_reconnect(
     connection_sm: &mut ConnectionSm,
     prior_session_id: [u8; 16],
     reconnect_token: [u8; 32],
+    user_id: &str,
 ) -> Result<(ReconnectOutcome, ControlChannel), HandshakeError> {
     let (mut send, recv) = connection.open_bi().await.map_err(HandshakeError::Quic)?;
     let mut reader = EnvelopeReader::new(recv);
@@ -165,6 +170,7 @@ pub async fn client_reconnect(
                 // message (spec 2.10) is what actually tells the client
                 // which generation it's on.
                 resumed_generation: 0,
+                user_id: user_id.to_string(),
             };
             Ok((outcome, ControlChannel { send, reader }))
         }
@@ -241,6 +247,7 @@ pub async fn server_complete_reconnect(
                 reconnect_token: new_reconnect_token,
                 granted_permissions: suspended.granted_permissions,
                 resumed_generation: suspended.last_generation + 1,
+                user_id: suspended.user_id.clone(),
             };
             Ok((
                 outcome,

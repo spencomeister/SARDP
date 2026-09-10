@@ -14,12 +14,13 @@ use std::path::PathBuf;
 
 use ed25519_dalek::SigningKey;
 
-use sardp::connection_sm::defaults as timeouts;
+use sardp::connection_sm::{ConnectionSm, defaults as timeouts};
 use sardp::decoder;
 use sardp::feedback_session::{self, FrameTimestamps};
 use sardp::handshake::client_handshake;
 use sardp::messages::{self, SessionClose};
 use sardp::reason_code::ReasonCode;
+use sardp::reconnection::client_reconnect;
 use sardp::stream_reader::write_envelope;
 use sardp::timecode_frame::extract_timecode;
 use sardp::timesync::client_time_sync;
@@ -35,6 +36,15 @@ struct Args {
     device_id: String,
     client_name: String,
     target_latency_us: u32,
+    /// Where to persist `session_id`/`reconnect_token` across process
+    /// runs, so a *second* invocation of this binary can demonstrate
+    /// spec 4.6 reconnection (`SessionReauthenticate`) against a real
+    /// `sardp-server`, instead of always doing a fresh `ClientHello`
+    /// handshake. Not needed for a single long-running client -- only
+    /// for the "kill this process, run it again" demo/test scenario,
+    /// since a real always-up client would auto-reconnect in-process
+    /// instead (out of scope for this PoC).
+    session_file: Option<PathBuf>,
 }
 
 fn print_help() {
@@ -53,6 +63,10 @@ OPTIONS:\n\
     --device-id <ID>          (default demo-device)\n\
     --client-name <NAME>      (default sardp-client)\n\
     --target-latency-us <N>   TransportFeedback.target_latency_us (default 50000)\n\
+    --session-file <PATH>     Persist session_id/reconnect_token here; if the\n\
+                              file already exists on startup, reconnect\n\
+                              (SessionReauthenticate, spec 4.6) instead of a\n\
+                              fresh handshake (demo/test use only)\n\
     --help                    Show this message"
     );
 }
@@ -66,6 +80,7 @@ fn parse_args() -> Args {
     let mut device_id = "demo-device".to_string();
     let mut client_name = "sardp-client".to_string();
     let mut target_latency_us = 50_000u32;
+    let mut session_file: Option<PathBuf> = None;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -101,6 +116,11 @@ fn parse_args() -> Args {
                     .parse()
                     .expect("invalid --target-latency-us")
             }
+            "--session-file" => {
+                session_file = Some(PathBuf::from(
+                    args.next().expect("--session-file requires a value"),
+                ))
+            }
             "--help" | "-h" => {
                 print_help();
                 std::process::exit(0);
@@ -133,6 +153,55 @@ fn parse_args() -> Args {
         device_id,
         client_name,
         target_latency_us,
+        session_file,
+    }
+}
+
+/// Session state persisted across process runs for the `--session-file`
+/// reconnect demo/test (see [`Args::session_file`]). Plain hex/text, not
+/// any format worth a dependency for.
+struct SavedSession {
+    session_id: [u8; 16],
+    reconnect_token: [u8; 32],
+    user_id: String,
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn parse_hex_bytes(s: &str) -> Option<Vec<u8>> {
+    if !s.len().is_multiple_of(2) {
+        return None;
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
+        .collect()
+}
+
+fn read_saved_session(path: &std::path::Path) -> Option<SavedSession> {
+    let contents = std::fs::read_to_string(path).ok()?;
+    let mut lines = contents.lines();
+    let session_id: [u8; 16] = parse_hex_bytes(lines.next()?)?.try_into().ok()?;
+    let reconnect_token: [u8; 32] = parse_hex_bytes(lines.next()?)?.try_into().ok()?;
+    let user_id = lines.next()?.to_string();
+    Some(SavedSession {
+        session_id,
+        reconnect_token,
+        user_id,
+    })
+}
+
+fn write_saved_session(path: &std::path::Path, session: &SavedSession) {
+    let contents = format!(
+        "{}\n{}\n{}\n",
+        hex_encode(&session.session_id),
+        hex_encode(&session.reconnect_token),
+        session.user_id
+    );
+    if let Err(e) = std::fs::write(path, contents) {
+        eprintln!("warning: failed to write --session-file {path:?}: {e}");
     }
 }
 
@@ -263,18 +332,84 @@ async fn close_gracefully(
 }
 
 async fn run(connection: quinn::Connection, args: &Args) -> Result<(), AppError> {
-    let (outcome, mut connection_sm, mut control) = client_handshake(
-        &connection,
-        &args.signing_key,
-        &args.client_name,
-        &args.user_id,
-        &args.device_id,
-    )
-    .await?;
-    eprintln!(
-        "authenticated: session_id={:x?} granted_permissions={:#b}",
-        outcome.session_id, outcome.granted_permissions
-    );
+    let saved_session = args.session_file.as_deref().and_then(read_saved_session);
+
+    let (session_id, reconnect_token, mut connection_sm, mut control, is_resumed) =
+        if let Some(saved) = saved_session {
+            eprintln!(
+                "found --session-file state, reconnecting (session_id={:x?})...",
+                saved.session_id
+            );
+            // A fresh process has no live ConnectionSm from the prior run
+            // to resume -- replay it through the same states that run
+            // actually reached before the connection was lost, so
+            // `client_reconnect`'s internal `resume()` (Suspended ->
+            // Active) has a valid starting point.
+            let mut connection_sm = ConnectionSm::new();
+            connection_sm
+                .complete_handshake()
+                .expect("fresh SM: Handshaking -> Authenticating");
+            connection_sm
+                .complete_authentication()
+                .expect("fresh SM: Authenticating -> Authenticated");
+            connection_sm
+                .on_channel_live()
+                .expect("fresh SM: Authenticated -> Active");
+            connection_sm
+                .suspend()
+                .expect("fresh SM: Active -> Suspended");
+
+            let (outcome, control) = client_reconnect(
+                &connection,
+                &mut connection_sm,
+                saved.session_id,
+                saved.reconnect_token,
+                &saved.user_id,
+            )
+            .await?;
+            eprintln!(
+                "reconnected: session_id={:x?} granted_permissions={:#b}",
+                outcome.session_id, outcome.granted_permissions
+            );
+            (
+                outcome.session_id,
+                outcome.reconnect_token,
+                connection_sm,
+                control,
+                true,
+            )
+        } else {
+            let (outcome, connection_sm, control) = client_handshake(
+                &connection,
+                &args.signing_key,
+                &args.client_name,
+                &args.user_id,
+                &args.device_id,
+            )
+            .await?;
+            eprintln!(
+                "authenticated: session_id={:x?} granted_permissions={:#b}",
+                outcome.session_id, outcome.granted_permissions
+            );
+            (
+                outcome.session_id,
+                outcome.reconnect_token,
+                connection_sm,
+                control,
+                false,
+            )
+        };
+
+    if let Some(path) = &args.session_file {
+        write_saved_session(
+            path,
+            &SavedSession {
+                session_id,
+                reconnect_token,
+                user_id: args.user_id.clone(),
+            },
+        );
+    }
 
     let timesync = client_time_sync(&mut control).await?;
     eprintln!(
@@ -293,7 +428,12 @@ async fn run(connection: quinn::Connection, args: &Args) -> Result<(), AppError>
             timeouts::SESSION_SETUP_TIMEOUT
         )
     })?;
-    connection_sm.on_channel_live()?;
+    if !is_resumed {
+        // A resumed connection_sm is already Active (client_reconnect's
+        // resume() skips straight there); only a fresh handshake needs
+        // this Authenticated -> Active transition.
+        connection_sm.on_channel_live()?;
+    }
     eprintln!(
         "video channel Live (monitor {}, {}x{}), connection Active",
         intro.monitor_id, intro.encoder_config.width, intro.encoder_config.height

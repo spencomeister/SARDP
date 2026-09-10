@@ -15,7 +15,7 @@ use subtle::ConstantTimeEq;
 use crate::connection_sm::ConnectionSm;
 
 /// Everything a `Suspended` session needs to resume on a new connection.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SuspendedSession {
     pub reconnect_token: [u8; 32],
     /// Already `Suspended` (spec 4.1) at the moment it's stored here;
@@ -28,6 +28,11 @@ pub struct SuspendedSession {
     /// DR-026: generation continues monotonically across a reconnect, it
     /// never resets).
     pub last_generation: u64,
+    /// `AuthPubkey.user_id` (spec 2.3), carried across suspend/resume so a
+    /// later re-suspension of a *resumed* session still has it (needed for
+    /// the `file_handle` ownership binding, spec 2.6/DR-037; see
+    /// `crate::handshake::HandshakeOutcome::user_id`).
+    pub user_id: String,
 }
 
 /// Why [`SessionStore::try_reconnect`] failed. Spec 4.6's ReasonCode table
@@ -125,6 +130,7 @@ mod tests {
             session_id,
             SuspendedSession {
                 reconnect_token: [2; 32],
+                user_id: "alice".into(),
                 connection_sm: suspended_sm(),
                 granted_permissions: 0b111,
                 last_generation: 3,
@@ -151,6 +157,7 @@ mod tests {
             session_id,
             SuspendedSession {
                 reconnect_token: [2; 32],
+                user_id: "alice".into(),
                 connection_sm: suspended_sm(),
                 granted_permissions: 0,
                 last_generation: 0,
@@ -183,6 +190,7 @@ mod tests {
             session_id,
             SuspendedSession {
                 reconnect_token: [2; 32],
+                user_id: "alice".into(),
                 connection_sm: suspended_sm(),
                 granted_permissions: 0,
                 last_generation: 0,
@@ -204,6 +212,7 @@ mod tests {
             session_id,
             SuspendedSession {
                 reconnect_token: [2; 32],
+                user_id: "alice".into(),
                 connection_sm: suspended_sm(),
                 granted_permissions: 0,
                 last_generation: 0,
@@ -225,6 +234,7 @@ mod tests {
             session_id,
             SuspendedSession {
                 reconnect_token: [2; 32],
+                user_id: "alice".into(),
                 connection_sm: suspended_sm(),
                 granted_permissions: 0,
                 last_generation: 0,

@@ -97,6 +97,7 @@ async fn reconnect_after_disconnect_resumes_active_with_continued_generation() {
             connection_sm: server_sm,
             granted_permissions: server_outcome.granted_permissions,
             last_generation: generation_before_disconnect,
+            user_id: "alice".into(),
         },
     );
 
@@ -139,6 +140,7 @@ async fn reconnect_after_disconnect_resumes_active_with_continued_generation() {
             &mut client_sm,
             session_id,
             original_reconnect_token,
+            "alice",
         ),
         server_side_reconnect,
     );
@@ -226,6 +228,7 @@ async fn reconnect_with_wrong_token_is_rejected() {
             connection_sm: server_sm,
             granted_permissions: server_outcome.granted_permissions,
             last_generation: 0,
+            user_id: "alice".into(),
         },
     );
     drop(client_connection_1);
@@ -264,7 +267,8 @@ async fn reconnect_with_wrong_token_is_rejected() {
             &client_connection_2,
             &mut client_sm,
             session_id,
-            wrong_token
+            wrong_token,
+            "alice",
         ),
         server_side_reconnect,
     );
