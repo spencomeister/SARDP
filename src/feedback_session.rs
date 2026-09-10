@@ -7,7 +7,7 @@
 //! fits better alongside M5's backpressure work that needs the same
 //! stream kept continuously fed).
 
-use crate::messages::{self, TransportFeedback, VideoFrameHeader};
+use crate::messages::{self, AudioSyncFeedback, TransportFeedback, VideoFrameHeader};
 use crate::prologue;
 use crate::stream_kind::StreamKind;
 use crate::stream_reader::{EnvelopeReader, StreamReadError, write_envelope};
@@ -50,6 +50,30 @@ pub async fn send_transport_feedback(
     .await
 }
 
+/// Sends one `AudioSyncFeedback` Envelope on an already-opened feedback
+/// stream (spec 2.13: same stream as `TransportFeedback`, client->server,
+/// default 2-second period).
+pub async fn send_audio_sync_feedback(
+    send: &mut quinn::SendStream,
+    feedback: &AudioSyncFeedback,
+) -> Result<(), quinn::WriteError> {
+    write_envelope(
+        send,
+        messages::type_id::AUDIO_SYNC_FEEDBACK,
+        &messages::encode(feedback),
+    )
+    .await
+}
+
+/// Either message a `feedback` stream can carry (spec 2.14's
+/// `TransportFeedback` and spec 2.13's `AudioSyncFeedback` share the same
+/// stream). See [`FeedbackReceiver::read_message`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FeedbackMessage {
+    Transport(TransportFeedback),
+    AudioSync(AudioSyncFeedback),
+}
+
 /// Server side: the accepted `feedback` stream, positioned to read
 /// `TransportFeedback` messages one after another. A real server keeps
 /// one of these per client for the session's duration (spec 2.14: sent
@@ -88,6 +112,25 @@ impl FeedbackReceiver {
             return Err(ReadFeedbackError::UnexpectedType(type_raw));
         }
         messages::decode(&payload).map_err(ReadFeedbackError::Decode)
+    }
+
+    /// Like [`Self::read_one`], but also accepts `AudioSyncFeedback` (spec
+    /// 2.13) -- both message types travel on this same `feedback` stream.
+    pub async fn read_message(&mut self) -> Result<FeedbackMessage, ReadFeedbackError> {
+        let (type_raw, payload) = self
+            .reader
+            .read_envelope(StreamKind::Feedback.max_envelope_length())
+            .await
+            .map_err(ReadFeedbackError::Read)?;
+        if type_raw == messages::type_id::TRANSPORT_FEEDBACK {
+            let feedback = messages::decode(&payload).map_err(ReadFeedbackError::Decode)?;
+            Ok(FeedbackMessage::Transport(feedback))
+        } else if type_raw == messages::type_id::AUDIO_SYNC_FEEDBACK {
+            let feedback = messages::decode(&payload).map_err(ReadFeedbackError::Decode)?;
+            Ok(FeedbackMessage::AudioSync(feedback))
+        } else {
+            Err(ReadFeedbackError::UnexpectedType(type_raw))
+        }
     }
 }
 

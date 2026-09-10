@@ -2,6 +2,7 @@
 //! StreamPrologue parsers (spec 2.1.1, 2.2), per DR-021's exception to the
 //! "no hand-written parsers" rule.
 
+pub mod audio_session;
 pub mod auth;
 pub mod backpressure;
 pub mod channel_sm;

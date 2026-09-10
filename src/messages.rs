@@ -67,6 +67,14 @@ pub mod type_id {
     pub const FILE_CHUNK: u16 = 0x0018;
     pub const FILE_TRANSFER_COMPLETE: u16 = 0x0019;
     pub const FILE_TRANSFER_ERROR: u16 = 0x001A;
+    /// `audio_playback`/`audio_capture` stream.
+    pub const AUDIO_CONFIG: u16 = 0x001B;
+    pub const AUDIO_FRAME_HEADER: u16 = 0x001C;
+    /// Raw Opus bytes; not CBOR-encoded (DR-035, same split as
+    /// `VIDEO_FRAME_HEADER`/`VIDEO_FRAME_PAYLOAD`).
+    pub const AUDIO_FRAME_PAYLOAD: u16 = 0x001D;
+    /// `feedback` stream (not `control`).
+    pub const AUDIO_SYNC_FEEDBACK: u16 = 0x001E;
 }
 
 /// `AuthMethod` enum (spec 2.3).
@@ -440,6 +448,55 @@ pub struct FileTransferComplete {
 pub struct FileTransferError {
     pub file_handle: u64,
     pub reason: ReasonCode,
+}
+
+/// `AudioConfig.codec` (spec 2.13).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AudioCodec {
+    Opus,
+}
+
+/// `AudioConfig` (spec 2.13, `audio_playback`/`audio_capture` stream,
+/// sent once by whichever side opens the stream).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AudioConfig {
+    pub codec: AudioCodec,
+    pub sample_rate: u32,
+    pub channels: u8,
+    pub frame_duration_ms: u16,
+}
+
+/// `AudioFrame`'s header half (spec 2.13, `audio_playback`/`audio_capture`
+/// stream). Per DR-035 (same rationale as `VideoFrameHeader`/
+/// `VideoFramePayload`), the logical `AudioFrame` is split on the wire
+/// into this CBOR Envelope immediately followed by a raw-bytes
+/// `AudioFramePayload` Envelope (the Opus data itself, unwrapped) --
+/// see `audio_session` for the send/receive sequencing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AudioFrameHeader {
+    pub sequence: u64,
+    /// Same monotonic clock basis as `VideoFrameHeader.capture_ts` (spec
+    /// 2.13: "映像と同じ単調時計基準").
+    pub capture_ts: u64,
+    pub duration_us: u32,
+    /// MUST equal the immediately-following `AudioFramePayload`
+    /// Envelope's actual byte count (same cross-check as
+    /// `VideoFrameHeader.payload_len`, spec 2.10/2.13).
+    pub payload_len: u64,
+}
+
+/// `AudioSyncFeedback` (spec 2.13, `feedback` stream, client->server,
+/// default 2-second period): lets the server correct for audio/video
+/// capture-clock drift, since the two can drift apart even on the same
+/// host (separate OS/device audio clocks).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AudioSyncFeedback {
+    /// Client monotonic clock, when the corresponding audio was played.
+    pub audio_played_ts: u64,
+    /// Client monotonic clock, when the video frame displayed at the same
+    /// moment was submitted for display.
+    pub video_displayed_ts: u64,
+    pub drift_ppm: i32,
 }
 
 /// CBOR-encodes `msg` (the DR-021 message-body scheme for this
@@ -829,6 +886,44 @@ mod tests {
         };
         let bytes = encode(&msg);
         let decoded: FileTransferError = decode(&bytes).unwrap();
+        assert_eq!(decoded, msg);
+    }
+
+    #[test]
+    fn audio_config_round_trips() {
+        let msg = AudioConfig {
+            codec: AudioCodec::Opus,
+            sample_rate: 48_000,
+            channels: 2,
+            frame_duration_ms: 20,
+        };
+        let bytes = encode(&msg);
+        let decoded: AudioConfig = decode(&bytes).unwrap();
+        assert_eq!(decoded, msg);
+    }
+
+    #[test]
+    fn audio_frame_header_round_trips() {
+        let msg = AudioFrameHeader {
+            sequence: 42,
+            capture_ts: 1_000_000,
+            duration_us: 20_000,
+            payload_len: 160,
+        };
+        let bytes = encode(&msg);
+        let decoded: AudioFrameHeader = decode(&bytes).unwrap();
+        assert_eq!(decoded, msg);
+    }
+
+    #[test]
+    fn audio_sync_feedback_round_trips() {
+        let msg = AudioSyncFeedback {
+            audio_played_ts: 1_234_567,
+            video_displayed_ts: 1_234_500,
+            drift_ppm: -37,
+        };
+        let bytes = encode(&msg);
+        let decoded: AudioSyncFeedback = decode(&bytes).unwrap();
         assert_eq!(decoded, msg);
     }
 
