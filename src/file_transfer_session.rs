@@ -25,6 +25,13 @@ use crate::reason_code::ReasonCode;
 use crate::stream_kind::StreamKind;
 use crate::stream_reader::{EnvelopeReader, StreamReadError, write_envelope};
 
+/// Receiver-side timeout (spec 4.7: "FILE_TRANSFER_STALL_TIMEOUT
+/// 30秒(確定)").
+pub mod defaults {
+    use std::time::Duration;
+    pub const FILE_TRANSFER_STALL_TIMEOUT: Duration = Duration::from_secs(30);
+}
+
 #[derive(Debug)]
 pub enum FileTransferSessionError {
     Quic(quinn::ConnectionError),
@@ -378,20 +385,60 @@ pub enum ReceiveOutcome {
     Error(FileTransferError),
 }
 
-/// Receiver side: reads `FileChunk`s off the `file` stream until either a
-/// verified `FileTransferComplete` or one of spec 2.6's MUST-reject
-/// conditions is hit, sending `FileTransferError` back on the latter.
+/// Receiver side, spec-default `FILE_TRANSFER_STALL_TIMEOUT` (spec 4.7,
+/// 30s). See [`receive_file_with_timeout`] to override it (e.g. a test
+/// proving the timeout mechanism itself fires without a real 30s wait).
 pub async fn receive_file(
     send: &mut quinn::SendStream,
     reader: &mut EnvelopeReader,
     file_handle: u64,
     resolved_size: u64,
 ) -> Result<ReceiveOutcome, FileTransferSessionError> {
+    receive_file_with_timeout(
+        send,
+        reader,
+        file_handle,
+        resolved_size,
+        defaults::FILE_TRANSFER_STALL_TIMEOUT,
+    )
+    .await
+}
+
+/// Receiver side: reads `FileChunk`s off the `file` stream until either a
+/// verified `FileTransferComplete` or one of spec 2.6's MUST-reject
+/// conditions is hit, sending `FileTransferError` back on the latter.
+///
+/// `stall_timeout` bounds each individual wait for the next message (spec
+/// 4.7 `FILE_TRANSFER_STALL_TIMEOUT`: "最終FileChunk受信" from the last
+/// one) -- on expiry the stream is treated as stalled and force-ended,
+/// same MUST-reject-style handling as the other conditions here (a
+/// best-effort `FileTransferError` is sent, since a stall likely means the
+/// peer is already gone).
+pub async fn receive_file_with_timeout(
+    send: &mut quinn::SendStream,
+    reader: &mut EnvelopeReader,
+    file_handle: u64,
+    resolved_size: u64,
+    stall_timeout: std::time::Duration,
+) -> Result<ReceiveOutcome, FileTransferSessionError> {
     let mut reassembly = FileReassembly::new(resolved_size);
     loop {
-        let (type_raw, payload) = reader
-            .read_envelope(StreamKind::File.max_envelope_length())
-            .await?;
+        let (type_raw, payload) = match tokio::time::timeout(
+            stall_timeout,
+            reader.read_envelope(StreamKind::File.max_envelope_length()),
+        )
+        .await
+        {
+            Ok(result) => result?,
+            Err(_elapsed) => {
+                let error = FileTransferError {
+                    file_handle,
+                    reason: ReasonCode::TRANSPORT_STREAM_STALL_TIMEOUT,
+                };
+                let _ = send_file_transfer_error(send, &error).await;
+                return Ok(ReceiveOutcome::Error(error));
+            }
+        };
         if type_raw == messages::type_id::FILE_CHUNK {
             let chunk: FileChunk =
                 messages::decode(&payload).map_err(FileTransferSessionError::Decode)?;

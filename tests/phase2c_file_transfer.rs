@@ -8,14 +8,16 @@
 //! a real filesystem.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
 use sha2::{Digest, Sha256};
 
 use sardp::file_transfer_session::{
     FileReassembly, FileTransferDecision, ReceiveOutcome, accept_file_stream, open_file_stream,
-    read_file_transfer_decision, read_file_transfer_request, send_file_chunk, send_file_data,
-    send_file_transfer_accept, send_file_transfer_complete, send_file_transfer_request,
+    read_file_transfer_decision, read_file_transfer_request, receive_file_with_timeout,
+    send_file_chunk, send_file_data, send_file_transfer_accept, send_file_transfer_complete,
+    send_file_transfer_request,
 };
 use sardp::handshake::{client_handshake, server_handshake};
 use sardp::messages::{
@@ -328,6 +330,46 @@ async fn wrong_checksum_yields_file_checksum_mismatch_error() {
         ReceiveOutcome::Error(error) => {
             assert_eq!(error.file_handle, FILE_HANDLE);
             assert_eq!(error.reason, ReasonCode::PROTOCOL_FILE_CHECKSUM_MISMATCH);
+        }
+        ReceiveOutcome::Complete(_) => panic!("expected FileTransferError, got Complete"),
+    }
+}
+
+/// Spec 4.7 `FILE_TRANSFER_STALL_TIMEOUT` (30s default): if no further
+/// `FileChunk`/`FileTransferComplete` arrives within the timeout of the
+/// last message, the receiver treats the stream as stalled.
+#[tokio::test]
+async fn no_further_chunks_within_the_stall_timeout_yields_stall_timeout_error() {
+    let (mut sender_send, _sender_reader, mut receiver_send, mut receiver_reader) =
+        open_file_stream_pair().await;
+
+    let first_chunk = FileChunk {
+        offset: 0,
+        length: 3,
+        data: b"abc".to_vec(),
+    };
+    // Small override so the test doesn't wait out the real 30s default;
+    // the sender above sends one chunk and then genuinely goes silent
+    // (not a full file, and no FileTransferComplete), so this must elapse
+    // and surface a stall timeout rather than hanging or timing out the
+    // test itself.
+    let (send_result, receive_result) = tokio::join!(
+        send_file_chunk(&mut sender_send, &first_chunk),
+        receive_file_with_timeout(
+            &mut receiver_send,
+            &mut receiver_reader,
+            FILE_HANDLE,
+            6,
+            Duration::from_millis(50),
+        ),
+    );
+    send_result.expect("client sends the one chunk");
+    let outcome =
+        receive_result.expect("server surfaces a FileTransferError, not a transport error");
+    match outcome {
+        ReceiveOutcome::Error(error) => {
+            assert_eq!(error.file_handle, FILE_HANDLE);
+            assert_eq!(error.reason, ReasonCode::TRANSPORT_STREAM_STALL_TIMEOUT);
         }
         ReceiveOutcome::Complete(_) => panic!("expected FileTransferError, got Complete"),
     }

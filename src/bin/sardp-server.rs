@@ -29,10 +29,10 @@ use sardp::file_transfer_session::{self as file_transfer, FileTransferSessionErr
 use sardp::handshake::{ControlChannel, HandshakeError};
 use sardp::messages::{
     self, ChromaFormat, Codec, EncoderConfig, FileTransferAccept, FileTransferDirection,
-    FileTransferRequest, PermissionUpdate, SessionClose,
+    FileTransferReject, FileTransferRequest, PermissionUpdate, SessionClose,
 };
 use sardp::permission_set::bit;
-use sardp::permission_sm::PermissionSm;
+use sardp::permission_sm::{BitState, PermissionSm};
 use sardp::reason_code::ReasonCode;
 use sardp::reconnection::{self, FirstControlMessage};
 use sardp::session_store::{SessionStore, SuspendedSession};
@@ -659,10 +659,16 @@ fn suspend_and_store(
         timeouts::RECONNECT_GRACE_PERIOD
     );
 
+    // expire_if_token_matches, not expire: if this session is reconnected
+    // and then suspended again before this timer fires, a plain
+    // unconditional expire(session_id) would remove that *later* suspend
+    // episode instead of the one this timer was actually armed for.
     let state = state.clone();
     tokio::spawn(async move {
         tokio::time::sleep(timeouts::RECONNECT_GRACE_PERIOD).await;
-        state.sessions.expire(session_id);
+        state
+            .sessions
+            .expire_if_token_matches(session_id, reconnect_token);
     });
     Ok(())
 }
@@ -729,6 +735,34 @@ async fn run_active_session(
                 if type_raw == messages::type_id::FILE_TRANSFER_REQUEST {
                     let request: FileTransferRequest = messages::decode(&payload)
                         .map_err(|_| ConnError::Violation(ReasonCode::PROTOCOL_UNEXPECTED_MESSAGE))?;
+
+                    // Spec 4.5: a new operation needs the relevant bit
+                    // Granted -- NotGranted and Draining (a revoke still
+                    // waiting on in-progress operations to finish) both
+                    // block starting a *new* one, same as the VIEW gate
+                    // below for frame sending.
+                    let required_bit = match request.direction {
+                        FileTransferDirection::Upload => bit::FILE_UP,
+                        FileTransferDirection::Download => bit::FILE_DOWN,
+                    };
+                    if !permission_sm.is_granted(required_bit) {
+                        let reason = if permission_sm.state(required_bit) == BitState::Draining {
+                            ReasonCode::POLICY_PERMISSION_REVOKED
+                        } else {
+                            ReasonCode::POLICY_PERMISSION_DENIED
+                        };
+                        let reject = FileTransferReject {
+                            request_id: request.request_id,
+                            reason,
+                        };
+                        write_envelope(&mut control.send, messages::type_id::FILE_TRANSFER_REJECT, &messages::encode(&reject)).await?;
+                        eprintln!(
+                            "[{peer}] rejected FileTransferRequest ({:?}): permission not granted ({reason:?})",
+                            request.direction
+                        );
+                        continue;
+                    }
+
                     let (file_handle, expiry_ts) = state.file_handles.issue(
                         session_id, user_id.to_string(), request.direction, request.declared_size, FILE_HANDLE_TTL,
                     );

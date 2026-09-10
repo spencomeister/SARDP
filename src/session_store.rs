@@ -98,8 +98,36 @@ impl SessionStore {
     /// `RECONNECT_GRACE_PERIOD` elapsed with no reconnection). A no-op if
     /// it's already gone (e.g. a reconnect already consumed it, or it was
     /// never there).
+    ///
+    /// Callers scheduling this ahead of time for a *specific* suspend
+    /// episode (e.g. a timer armed when `suspend()` is called) almost
+    /// always want [`Self::expire_if_token_matches`] instead: this method
+    /// removes whatever currently sits under `session_id`, which is wrong
+    /// if the session was reconnected and suspended again in the meantime
+    /// (a fresh `reconnect_token`, and so a fresh `RECONNECT_GRACE_PERIOD`)
+    /// before the original timer fired.
     pub fn expire(&self, session_id: [u8; 16]) {
         self.sessions.lock().unwrap().remove(&session_id);
+    }
+
+    /// Like [`Self::expire`], but only removes the entry if it's still the
+    /// same suspend episode identified by `reconnect_token` -- a fresh
+    /// token is issued every time a session is suspended (both the
+    /// original suspend and any later reconnect), so this lets a timer
+    /// armed for one specific suspend episode avoid clobbering a *later*
+    /// one that reused the same `session_id` after an intervening
+    /// reconnect. A no-op if the entry is already gone or belongs to a
+    /// different episode (different token).
+    ///
+    /// Constant-time token comparison for the same reason as
+    /// [`Self::try_reconnect`]: a `reconnect_token` is a bearer credential.
+    pub fn expire_if_token_matches(&self, session_id: [u8; 16], reconnect_token: [u8; 32]) {
+        let mut sessions = self.sessions.lock().unwrap();
+        if let Entry::Occupied(entry) = sessions.entry(session_id)
+            && bool::from(entry.get().reconnect_token.ct_eq(&reconnect_token))
+        {
+            entry.remove();
+        }
     }
 
     /// Whether a session is currently suspended and awaiting reconnection.
@@ -242,6 +270,93 @@ mod tests {
         );
         store.try_reconnect(session_id, [2; 32]).unwrap();
         store.expire(session_id); // must not panic or affect anything else
+        assert!(!store.contains(session_id));
+    }
+
+    #[test]
+    fn expire_if_token_matches_removes_the_matching_episode() {
+        let store = SessionStore::new();
+        let session_id = [1; 16];
+        store.suspend(
+            session_id,
+            SuspendedSession {
+                reconnect_token: [2; 32],
+                user_id: "alice".into(),
+                connection_sm: suspended_sm(),
+                granted_permissions: 0,
+                last_generation: 0,
+            },
+        );
+        store.expire_if_token_matches(session_id, [2; 32]);
+        assert!(!store.contains(session_id));
+    }
+
+    #[test]
+    fn expire_if_token_matches_is_a_no_op_for_a_stale_token() {
+        let store = SessionStore::new();
+        let session_id = [1; 16];
+        store.suspend(
+            session_id,
+            SuspendedSession {
+                reconnect_token: [2; 32],
+                user_id: "alice".into(),
+                connection_sm: suspended_sm(),
+                granted_permissions: 0,
+                last_generation: 0,
+            },
+        );
+        // A timer armed for some other (e.g. long-expired) episode must not
+        // touch the entry currently sitting under this session_id.
+        store.expire_if_token_matches(session_id, [0xFF; 32]);
+        assert!(store.contains(session_id));
+    }
+
+    /// The regression this method exists for: a timer armed when a session
+    /// is first suspended (episode A, token A) must not remove a *later*
+    /// suspension of the same session_id (episode B, token B) reached via
+    /// an intervening reconnect, even though `expire_if_token_matches` for
+    /// episode A fires *after* episode B was stored.
+    #[test]
+    fn a_stale_expiry_timer_does_not_clobber_a_later_suspend_episode() {
+        let store = SessionStore::new();
+        let session_id = [1; 16];
+        let token_a = [0xAA; 32];
+        let token_b = [0xBB; 32];
+
+        // Episode A: original suspend.
+        store.suspend(
+            session_id,
+            SuspendedSession {
+                reconnect_token: token_a,
+                user_id: "alice".into(),
+                connection_sm: suspended_sm(),
+                granted_permissions: 0,
+                last_generation: 0,
+            },
+        );
+        // Reconnected (token A consumed) and later suspended again under a
+        // fresh token -- episode B, still the same session_id.
+        store.try_reconnect(session_id, token_a).unwrap();
+        store.suspend(
+            session_id,
+            SuspendedSession {
+                reconnect_token: token_b,
+                user_id: "alice".into(),
+                connection_sm: suspended_sm(),
+                granted_permissions: 0,
+                last_generation: 1,
+            },
+        );
+
+        // Episode A's timer finally fires. It must not remove episode B.
+        store.expire_if_token_matches(session_id, token_a);
+        assert!(
+            store.contains(session_id),
+            "a stale expiry for episode A must not remove episode B"
+        );
+
+        // Episode B's own timer correctly removes it.
+        store.expire_if_token_matches(session_id, token_b);
         assert!(!store.contains(session_id));
     }
 }
