@@ -88,6 +88,10 @@ pub struct HandshakeOutcome {
     pub session_id: [u8; 16],
     pub reconnect_token: [u8; 32],
     pub granted_permissions: u32,
+    /// `AuthPubkey.user_id`. Needed alongside `session_id` for the
+    /// `file_handle` ownership binding spec 2.6 requires (DR-037; see
+    /// `crate::file_handle_store`).
+    pub user_id: String,
 }
 
 fn check(sm: &ConnectionSm, type_id: u16) -> Result<(), HandshakeError> {
@@ -231,6 +235,7 @@ pub async fn client_handshake_with_timeouts(
                 session_id: auth_result.session_id,
                 reconnect_token: auth_result.reconnect_token,
                 granted_permissions: auth_result.granted_permissions,
+                user_id: user_id.to_string(),
             };
             Ok((outcome, sm, ControlChannel { send, reader }))
         }
@@ -267,59 +272,98 @@ pub async fn server_handshake_with_timeouts(
     handshake_timeout: std::time::Duration,
     auth_timeout: std::time::Duration,
 ) -> Result<(HandshakeOutcome, ConnectionSm, ControlChannel), HandshakeError> {
-    let mut sm = ConnectionSm::new();
-    let (mut send, recv) = connection.accept_bi().await.map_err(HandshakeError::Quic)?;
+    let (send, recv) = connection.accept_bi().await.map_err(HandshakeError::Quic)?;
     let mut reader = EnvelopeReader::new(recv);
 
-    // Spec 4.7 HANDSHAKE_TIMEOUT (10s): bounds the ClientHello/ServerHello
-    // exchange, same phase boundary as the client side.
-    let (client_hello_bytes, server_hello_bytes, auth_challenge) =
-        tokio::time::timeout(handshake_timeout, async {
-            let stream_prologue = reader.read_prologue().await?;
-            if stream_prologue.kind != StreamKind::Control {
-                // Spec 2.2.1: "未認証状態でcontrol以外のストリームが開かれたら即切断".
-                return Err(HandshakeError::ProtocolViolation(
-                    ReasonCode::PROTOCOL_UNEXPECTED_MESSAGE,
-                ));
-            }
-
-            let (type_raw, payload) = reader
-                .read_envelope(StreamKind::Control.max_envelope_length())
-                .await?;
-            check(&sm, type_raw)?;
-            let client_hello: ClientHello =
-                messages::decode(&payload).map_err(HandshakeError::Decode)?;
-            let client_hello_bytes = payload;
-            let _ = client_hello; // only its bytes are needed for the channel binding
-
-            let mut auth_challenge = [0u8; 32];
-            rand::rng().fill_bytes(&mut auth_challenge);
-
-            let server_hello = ServerHello {
-                server_name: server_name.to_string(),
-                server_version: env!("CARGO_PKG_VERSION").to_string(),
-                capabilities: vec![],
-                auth_policy: messages::AuthPolicy {
-                    accepted_combinations: vec![messages::AuthCombination {
-                        methods: vec![AuthMethod::PublicKey],
-                        priority: 0,
-                    }],
-                },
-                auth_challenge,
-            };
-            let server_hello_bytes = messages::encode(&server_hello);
-            check(&sm, messages::type_id::SERVER_HELLO)?;
-            write_envelope(
-                &mut send,
-                messages::type_id::SERVER_HELLO,
-                &server_hello_bytes,
-            )
+    // Spec 4.7 HANDSHAKE_TIMEOUT (10s): bounds waiting for ClientHello,
+    // same phase boundary as the client side.
+    let client_hello_bytes = tokio::time::timeout(handshake_timeout, async {
+        let stream_prologue = reader.read_prologue().await?;
+        if stream_prologue.kind != StreamKind::Control {
+            // Spec 2.2.1: "未認証状態でcontrol以外のストリームが開かれたら即切断".
+            return Err(HandshakeError::ProtocolViolation(
+                ReasonCode::PROTOCOL_UNEXPECTED_MESSAGE,
+            ));
+        }
+        let (type_raw, payload) = reader
+            .read_envelope(StreamKind::Control.max_envelope_length())
             .await?;
+        check(&ConnectionSm::new(), type_raw)?;
+        Ok::<_, HandshakeError>(payload)
+    })
+    .await
+    .map_err(|_elapsed| HandshakeError::HandshakeTimeout)??;
 
-            Ok::<_, HandshakeError>((client_hello_bytes, server_hello_bytes, auth_challenge))
-        })
-        .await
-        .map_err(|_elapsed| HandshakeError::HandshakeTimeout)??;
+    server_handshake_from_client_hello(
+        send,
+        reader,
+        client_hello_bytes,
+        connection,
+        server_name,
+        trusted_public_key,
+        handshake_timeout,
+        auth_timeout,
+    )
+    .await
+}
+
+/// Continues the server handshake once the caller already has an open
+/// `control` stream (past its `StreamPrologue`) and the raw `ClientHello`
+/// bytes off it -- the split point [`crate::reconnection`]'s accept-loop
+/// dispatcher needs, since it must peek the first Envelope's type to tell
+/// a fresh `ClientHello` apart from a `SessionReauthenticate` before
+/// deciding which of the two paths (this one, or
+/// [`crate::reconnection::server_complete_reconnect`]) to hand the stream
+/// to. Sends `ServerHello`, verifies `AuthPubkey`, sends `AuthResult`;
+/// `handshake_timeout`/`auth_timeout` bound the two remaining phases (spec
+/// 4.7) -- note this means the dispatcher's own read of `ClientHello` and
+/// this function's send of `ServerHello` are each bounded by
+/// `handshake_timeout` independently rather than sharing one combined
+/// budget, a minor simplification versus [`server_handshake_with_timeouts`]
+/// calling this directly (which pays the same two separate windows).
+#[allow(clippy::too_many_arguments)]
+pub async fn server_handshake_from_client_hello(
+    mut send: quinn::SendStream,
+    mut reader: EnvelopeReader,
+    client_hello_bytes: Vec<u8>,
+    connection: &quinn::Connection,
+    server_name: &str,
+    trusted_public_key: &VerifyingKey,
+    handshake_timeout: std::time::Duration,
+    auth_timeout: std::time::Duration,
+) -> Result<(HandshakeOutcome, ConnectionSm, ControlChannel), HandshakeError> {
+    let mut sm = ConnectionSm::new();
+    check(&sm, messages::type_id::CLIENT_HELLO)?;
+
+    let (server_hello_bytes, auth_challenge) = tokio::time::timeout(handshake_timeout, async {
+        let mut auth_challenge = [0u8; 32];
+        rand::rng().fill_bytes(&mut auth_challenge);
+
+        let server_hello = ServerHello {
+            server_name: server_name.to_string(),
+            server_version: env!("CARGO_PKG_VERSION").to_string(),
+            capabilities: vec![],
+            auth_policy: messages::AuthPolicy {
+                accepted_combinations: vec![messages::AuthCombination {
+                    methods: vec![AuthMethod::PublicKey],
+                    priority: 0,
+                }],
+            },
+            auth_challenge,
+        };
+        let server_hello_bytes = messages::encode(&server_hello);
+        check(&sm, messages::type_id::SERVER_HELLO)?;
+        write_envelope(
+            &mut send,
+            messages::type_id::SERVER_HELLO,
+            &server_hello_bytes,
+        )
+        .await?;
+
+        Ok::<_, HandshakeError>((server_hello_bytes, auth_challenge))
+    })
+    .await
+    .map_err(|_elapsed| HandshakeError::HandshakeTimeout)??;
 
     sm.complete_handshake()
         .map_err(|v| HandshakeError::ProtocolViolation(v.reason))?;
@@ -378,6 +422,7 @@ pub async fn server_handshake_with_timeouts(
                 session_id,
                 reconnect_token,
                 granted_permissions,
+                user_id: auth_pubkey.user_id.clone(),
             };
             Ok((outcome, sm, ControlChannel { send, reader }))
         }

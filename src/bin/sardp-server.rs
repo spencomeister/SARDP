@@ -24,11 +24,18 @@ use sardp::channel_sm::ChannelState;
 use sardp::connection_sm::defaults as timeouts;
 use sardp::encoder;
 use sardp::feedback_session::FeedbackReceiver;
-use sardp::handshake::{HandshakeError, server_handshake};
-use sardp::messages::{self, ChromaFormat, Codec, EncoderConfig, PermissionUpdate, SessionClose};
+use sardp::file_handle_store::FileHandleStore;
+use sardp::file_transfer_session::{self as file_transfer, FileTransferSessionError};
+use sardp::handshake::HandshakeError;
+use sardp::messages::{
+    self, ChromaFormat, Codec, EncoderConfig, FileTransferAccept, FileTransferDirection,
+    FileTransferRequest, PermissionUpdate, SessionClose,
+};
 use sardp::permission_set::bit;
 use sardp::permission_sm::PermissionSm;
 use sardp::reason_code::ReasonCode;
+use sardp::reconnection::{self, FirstControlMessage};
+use sardp::session_store::SessionStore;
 use sardp::stream_reader::write_envelope;
 use sardp::timecode_frame;
 use sardp::video_channel::VideoChannel;
@@ -47,6 +54,21 @@ struct Args {
     fps: f64,
     server_name: String,
 }
+
+/// State shared across every connection this server handles: `sessions`
+/// (Phase 1) backs reconnection (spec 4.6), `file_handles` (this task)
+/// backs file transfer's `file_handle` issuance and DR-037 ownership
+/// checks (spec 2.6).
+#[derive(Default)]
+struct ServerState {
+    sessions: SessionStore,
+    file_handles: FileHandleStore,
+}
+
+/// How long an issued `file_handle` stays valid if the `file` stream isn't
+/// opened (spec 2.6's `expiry_ts`). Not spec-mandated; a PoC-reasonable
+/// default.
+const FILE_HANDLE_TTL: Duration = Duration::from_secs(300);
 
 fn print_help() {
     println!(
@@ -263,6 +285,7 @@ async fn main() {
 
     let shutdown = Arc::new(Notify::new());
     let permission_command: PermissionCommand = Arc::new(Mutex::new(None));
+    let state = Arc::new(ServerState::default());
 
     // stdin admin command reader (Part 4's minimal live-trigger).
     {
@@ -312,6 +335,7 @@ async fn main() {
                 let (width, height, fps) = (args.width, args.height, args.fps);
                 let shutdown = shutdown.clone();
                 let permission_command = permission_command.clone();
+                let state = state.clone();
                 connections.spawn(async move {
                     let connection = match incoming.await {
                         Ok(c) => c,
@@ -323,7 +347,7 @@ async fn main() {
                     let peer = connection.remote_address();
                     match handle_connection(
                         connection, &server_name, &trusted_pubkey, width, height, fps,
-                        shutdown, permission_command,
+                        shutdown, permission_command, state,
                     ).await {
                         Ok(()) => eprintln!("[{peer}] connection ended cleanly"),
                         Err(e) => eprintln!("[{peer}] connection ended: {e:?}"),
@@ -405,14 +429,87 @@ async fn handle_connection(
     fps: f64,
     shutdown: Arc<Notify>,
     permission_command: PermissionCommand,
+    state: Arc<ServerState>,
 ) -> Result<(), ConnError> {
     let peer = connection.remote_address();
-    let (outcome, mut connection_sm, mut control) =
-        server_handshake(&connection, server_name, trusted_pubkey).await?;
-    eprintln!(
-        "[{peer}] authenticated, session_id={:x?}",
-        outcome.session_id
-    );
+
+    // Spec 4.6: a new connection's first control message is either a fresh
+    // `ClientHello` or a `SessionReauthenticate` resuming a `Suspended`
+    // session -- this is the accept-loop dispatch Phase 1 deferred (see
+    // this task's PR notes: nothing yet calls `state.sessions.suspend()`
+    // on a real disconnect, so a live `SessionReauthenticate` will
+    // correctly, if not yet usefully, be rejected as `NoSuchSession` until
+    // that follow-up is done).
+    let (send, reader, first_message) =
+        reconnection::read_first_control_message(&connection, timeouts::HANDSHAKE_TIMEOUT).await?;
+    let (
+        mut connection_sm,
+        mut control,
+        session_id,
+        user_id,
+        granted_permissions,
+        starting_generation,
+        is_resumed,
+    ) = match first_message {
+        FirstControlMessage::ClientHello(client_hello_bytes) => {
+            let (outcome, connection_sm, control) =
+                sardp::handshake::server_handshake_from_client_hello(
+                    send,
+                    reader,
+                    client_hello_bytes,
+                    &connection,
+                    server_name,
+                    trusted_pubkey,
+                    timeouts::HANDSHAKE_TIMEOUT,
+                    timeouts::AUTH_TIMEOUT,
+                )
+                .await?;
+            eprintln!(
+                "[{peer}] authenticated (fresh handshake), session_id={:x?}, user_id={:?}",
+                outcome.session_id, outcome.user_id
+            );
+            (
+                connection_sm,
+                control,
+                outcome.session_id,
+                outcome.user_id,
+                outcome.granted_permissions,
+                0u64,
+                false,
+            )
+        }
+        FirstControlMessage::SessionReauthenticate(reauth) => {
+            match reconnection::server_complete_reconnect(send, reader, &reauth, &state.sessions)
+                .await
+            {
+                Ok((outcome, connection_sm, control)) => {
+                    eprintln!(
+                        "[{peer}] reconnected, session_id={:x?}, resuming at generation {}",
+                        outcome.session_id, outcome.resumed_generation
+                    );
+                    // Not yet tracked across a suspend/resume cycle
+                    // (SuspendedSession doesn't carry it) -- see the
+                    // comment above. Empty for now; the reconnect path
+                    // can't currently reach the file-transfer handling
+                    // below in a way that matters until suspend-on-
+                    // disconnect is wired up.
+                    (
+                        connection_sm,
+                        control,
+                        outcome.session_id,
+                        String::new(),
+                        outcome.granted_permissions,
+                        outcome.resumed_generation,
+                        true,
+                    )
+                }
+                Err(e) => {
+                    eprintln!("[{peer}] reconnect rejected: {:?}", e.reason_code());
+                    return Ok(());
+                }
+            }
+        }
+    };
 
     sardp::timesync::server_respond_time_sync(&mut control).await?;
 
@@ -429,19 +526,34 @@ async fn handle_connection(
         server_cursor_excludable: false,
     };
 
-    let mut video_channel = VideoChannel::new(0);
+    let mut video_channel = VideoChannel::new(starting_generation);
     let mut video_send = tokio::time::timeout(
         timeouts::SESSION_SETUP_TIMEOUT,
-        open_generation(&connection, 0, 0, encoder_config, width, height),
+        open_generation(
+            &connection,
+            starting_generation,
+            0,
+            encoder_config,
+            width,
+            height,
+        ),
     )
     .await
     .map_err(|_elapsed| ConnError::Violation(ReasonCode::PROTOCOL_SESSION_SETUP_TIMEOUT))??;
     video_channel.mark_instance_streaming()?;
-    connection_sm.on_channel_live()?;
-    eprintln!("[{peer}] video channel Live, connection Active");
+    if !is_resumed {
+        // A resumed connection_sm is already `Active` (spec 4.6:
+        // `resume()` skips straight there); only a fresh handshake needs
+        // this Authenticated -> Active transition.
+        connection_sm.on_channel_live()?;
+    }
+    eprintln!(
+        "[{peer}] video channel Live, connection {:?}",
+        connection_sm.state()
+    );
 
     let mut feedback_receiver = FeedbackReceiver::accept(&connection).await?;
-    let mut permission_sm = PermissionSm::new(outcome.granted_permissions);
+    let mut permission_sm = PermissionSm::new(granted_permissions);
 
     let mut frame_interval = tokio::time::interval(Duration::from_secs_f64(1.0 / fps));
     frame_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -471,6 +583,30 @@ async fn handle_connection(
                     eprintln!("[{peer}] client sent SessionClose (reason {:?}), closing", close.reason);
                     return Ok(());
                 }
+                if type_raw == messages::type_id::FILE_TRANSFER_REQUEST {
+                    let request: FileTransferRequest = messages::decode(&payload)
+                        .map_err(|_| ConnError::Violation(ReasonCode::PROTOCOL_UNEXPECTED_MESSAGE))?;
+                    let (file_handle, expiry_ts) = state.file_handles.issue(
+                        session_id, user_id.clone(), request.direction, request.declared_size, FILE_HANDLE_TTL,
+                    );
+                    let accept = FileTransferAccept {
+                        request_id: request.request_id,
+                        file_handle,
+                        // No real filesystem in this PoC (see
+                        // docs/SARDP_PoC_Brief_for_ClaudeCode.md): the
+                        // declared size is trusted as-is rather than
+                        // resolved against anything real.
+                        resolved_size: request.declared_size,
+                        expiry_ts,
+                    };
+                    write_envelope(&mut control.send, messages::type_id::FILE_TRANSFER_ACCEPT, &messages::encode(&accept)).await?;
+                    eprintln!(
+                        "[{peer}] issued file_handle {file_handle:#x} for {:?} of {:?} ({} bytes)",
+                        request.direction, request.virtual_path, request.declared_size
+                    );
+                    spawn_file_transfer(connection.clone(), state.clone(), session_id, user_id.clone(), request, file_handle, peer);
+                    continue;
+                }
                 // Other control-stream message types aren't produced by
                 // this PoC's client yet; ignore (matches the ignorable-flag
                 // spirit of spec 2.1.1 rather than a hard protocol error,
@@ -483,7 +619,7 @@ async fn handle_connection(
             _ = frame_interval.tick() => {
                 let mut command = permission_command.lock().await;
                 if let Some(grant) = command.take() {
-                    let other_bits = outcome.granted_permissions & !bit::VIEW;
+                    let other_bits = granted_permissions & !bit::VIEW;
                     let view_bit = if grant { bit::VIEW } else { 0 };
                     let update = PermissionUpdate {
                         granted_permissions: view_bit | other_bits,
@@ -538,6 +674,66 @@ async fn handle_connection(
             }
         }
     }
+}
+
+/// Spawns a task that accepts the `file` stream this connection's peer is
+/// expected to open for `file_handle` (spec 2.6: whichever side
+/// `request.direction` names as the sender), verifies its ownership
+/// against `state.file_handles` (DR-037), and drives the (in-memory
+/// pseudo-data) transfer to completion. Runs independently of
+/// `handle_connection`'s own select loop so a slow or stalled transfer
+/// doesn't block keepalives, video frames, or control messages on the same
+/// connection.
+fn spawn_file_transfer(
+    connection: quinn::Connection,
+    state: Arc<ServerState>,
+    session_id: [u8; 16],
+    user_id: String,
+    request: FileTransferRequest,
+    file_handle: u64,
+    peer: SocketAddr,
+) {
+    tokio::spawn(async move {
+        let accepted = file_transfer::accept_file_stream_verified(
+            &connection,
+            &state.file_handles,
+            session_id,
+            &user_id,
+            request.direction,
+        )
+        .await;
+        match accepted {
+            Ok((mut send, mut reader, handle)) => {
+                let result = match request.direction {
+                    FileTransferDirection::Upload => file_transfer::receive_file(
+                        &mut send,
+                        &mut reader,
+                        handle,
+                        request.declared_size,
+                    )
+                    .await
+                    .map(|_outcome| ()),
+                    FileTransferDirection::Download => {
+                        // No real filesystem in this PoC: fixed pseudo
+                        // content, capped so a client-declared huge size
+                        // doesn't allocate unbounded memory.
+                        let pseudo_size = request.declared_size.min(1024 * 1024) as usize;
+                        let pseudo_data = vec![0xABu8; pseudo_size];
+                        file_transfer::send_file_data(&mut send, &pseudo_data, 64 * 1024)
+                            .await
+                            .map_err(FileTransferSessionError::Write)
+                    }
+                };
+                if let Err(e) = result {
+                    eprintln!("[{peer}] file transfer {handle:#x} ended with an error: {e:?}");
+                }
+                state.file_handles.remove(handle);
+            }
+            Err(e) => {
+                eprintln!("[{peer}] file stream for handle {file_handle:#x} rejected: {e:?}");
+            }
+        }
+    });
 }
 
 /// Opens a fresh video Instance at `generation` (spec 2.10/4.3.2): a

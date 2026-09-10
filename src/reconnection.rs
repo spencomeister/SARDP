@@ -50,6 +50,50 @@ pub async fn accept_control_prologue(
     Ok((send, reader))
 }
 
+/// The first Envelope on a newly accepted `control` stream, classified per
+/// spec 4.6.
+pub enum FirstControlMessage {
+    /// Raw `ClientHello` bytes -- decoding is `crate::handshake`'s job
+    /// (`server_handshake_from_client_hello` wants the bytes, not the
+    /// decoded struct, for the channel-binding context).
+    ClientHello(Vec<u8>),
+    SessionReauthenticate(SessionReauthenticate),
+}
+
+/// Accepts a new `control` stream and reads its first Envelope far enough
+/// to tell a fresh `ClientHello` apart from a `SessionReauthenticate`
+/// (spec 4.6), without otherwise driving either the handshake or the
+/// reconnection protocol -- that's the caller's job, using whichever of
+/// [`crate::handshake::server_handshake_from_client_hello`] or
+/// [`server_complete_reconnect`] this result calls for. Bounded by
+/// `handshake_timeout` (spec 4.7), the same phase boundary
+/// `server_handshake_with_timeouts` uses for its own wait on `ClientHello`.
+pub async fn read_first_control_message(
+    connection: &quinn::Connection,
+    handshake_timeout: std::time::Duration,
+) -> Result<(quinn::SendStream, EnvelopeReader, FirstControlMessage), HandshakeError> {
+    let (send, mut reader) = accept_control_prologue(connection).await?;
+    let (type_raw, payload) = tokio::time::timeout(
+        handshake_timeout,
+        reader.read_envelope(StreamKind::Control.max_envelope_length()),
+    )
+    .await
+    .map_err(|_elapsed| HandshakeError::HandshakeTimeout)??;
+
+    let message = if type_raw == messages::type_id::CLIENT_HELLO {
+        FirstControlMessage::ClientHello(payload)
+    } else if type_raw == messages::type_id::SESSION_REAUTHENTICATE {
+        let reauth: SessionReauthenticate =
+            messages::decode(&payload).map_err(HandshakeError::Decode)?;
+        FirstControlMessage::SessionReauthenticate(reauth)
+    } else {
+        return Err(HandshakeError::ProtocolViolation(
+            ReasonCode::PROTOCOL_UNEXPECTED_MESSAGE,
+        ));
+    };
+    Ok((send, reader, message))
+}
+
 /// The outcome of a successful reconnection: same shape as
 /// [`crate::handshake::HandshakeOutcome`], plus the generation the
 /// resumed video Channel's next Instance should open at.

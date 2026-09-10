@@ -15,9 +15,10 @@
 
 use sha2::{Digest, Sha256};
 
+use crate::file_handle_store::{FileHandleError, FileHandleStore};
 use crate::messages::{
-    self, FileChunk, FileTransferAccept, FileTransferComplete, FileTransferError,
-    FileTransferReject, FileTransferRequest,
+    self, FileChunk, FileTransferAccept, FileTransferComplete, FileTransferDirection,
+    FileTransferError, FileTransferReject, FileTransferRequest,
 };
 use crate::prologue;
 use crate::reason_code::ReasonCode;
@@ -40,6 +41,11 @@ pub enum FileTransferSessionError {
         context_id: u64,
         file_handle: u64,
     },
+    /// DR-037: the presented `file_handle` exists, but wasn't issued to
+    /// this connection's own session/user/direction, or has expired. The
+    /// stream is reset (not handed back to the caller) before this is
+    /// returned.
+    OwnershipRejected(FileHandleError),
 }
 
 impl From<StreamReadError> for FileTransferSessionError {
@@ -172,6 +178,48 @@ pub async fn accept_file_stream(
     }
 
     Ok((send, reader))
+}
+
+/// Receiver side, DR-037: accepts the `file` stream, but -- unlike
+/// [`accept_file_stream`], which only checks that the presented
+/// `context_id` matches a handle this side already expects -- looks the
+/// presented `file_handle` up in `store` and verifies it was actually
+/// issued to *this* `session_id`/`user_id`/`direction` and hasn't expired,
+/// before treating the stream as legitimate. This is what stops a
+/// connection that merely learned another session's `file_handle` (by
+/// observing it, or guessing) from having its stream accepted as if it
+/// were that session's own transfer.
+///
+/// On any ownership failure, the stream is reset at the transport level
+/// (spec 2.6 doesn't define a `file`-stream response for "this handle
+/// isn't yours" the way `FileTransferReject` covers the control-stream
+/// request) rather than returned to the caller.
+pub async fn accept_file_stream_verified(
+    connection: &quinn::Connection,
+    store: &FileHandleStore,
+    session_id: [u8; 16],
+    user_id: &str,
+    direction: FileTransferDirection,
+) -> Result<(quinn::SendStream, EnvelopeReader, u64), FileTransferSessionError> {
+    let (mut send, recv) = connection
+        .accept_bi()
+        .await
+        .map_err(FileTransferSessionError::Quic)?;
+    let mut reader = EnvelopeReader::new(recv);
+
+    let stream_prologue = reader.read_prologue().await?;
+    if stream_prologue.kind != StreamKind::File {
+        return Err(FileTransferSessionError::WrongStreamKind);
+    }
+    let file_handle = stream_prologue.context_id;
+
+    match store.validate(file_handle, session_id, user_id, direction) {
+        Ok(_) => Ok((send, reader, file_handle)),
+        Err(ownership_error) => {
+            let _ = send.reset(quinn::VarInt::from_u32(0));
+            Err(FileTransferSessionError::OwnershipRejected(ownership_error))
+        }
+    }
 }
 
 pub async fn send_file_chunk(
