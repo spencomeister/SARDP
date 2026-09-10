@@ -57,6 +57,8 @@ Envelope {
 }
 ```
 
+**`length` は `payload` のみのバイト数を表す(`type` フィールドは含まない、DR-032)**。`type` は常に2バイト固定長で存在するため、`length` に含めると `length < 2` という到達不能なエラー状態を導入するだけで得るものがない。ヘッダ全体(varintのバイト長 + 2)を除いた残りのバイト数が `length` である。この規約はHTTP/2フレームヘッダおよびTLSレコード層の `length` フィールド(いずれも自身のヘッダは含めない)の慣行に倣う。実装は `length` を受信した時点で、後続バイトの到着を待たずに当該ストリームの上限(下表)と比較してよい(SHOULD)。
+
 `type` のビット配置(DR-014):
 
 ```text
@@ -220,7 +222,7 @@ ActiveMonitor { monitor_id : u8 }   // control、client→server
 ## 2.5 権限
 
 ```text
-PermissionSet : bitflags {
+PermissionSet : bitflags(u32) {
     VIEW, INPUT_KEYBOARD, INPUT_MOUSE,
     CLIP_READ, CLIP_WRITE,
     FILE_UP, FILE_DOWN,
@@ -233,6 +235,23 @@ PermissionUpdate {                 // control、server→client
     immediate_revoke     : PermissionSet
 }
 ```
+
+**ビット割り当て(DR-033)**:
+
+| bit | フラグ |
+|---|---|
+| 0 | VIEW |
+| 1 | INPUT_KEYBOARD |
+| 2 | INPUT_MOUSE |
+| 3 | CLIP_READ |
+| 4 | CLIP_WRITE |
+| 5 | FILE_UP |
+| 6 | FILE_DOWN |
+| 7 | AUDIO_PLAYBACK |
+| 8 | AUDIO_CAPTURE |
+| 9 | ADMIN |
+
+bit 10〜31は将来の拡張用に予約する。宣言順=ビット番号順という規約は、今後フラグを追加する際も末尾に足す限り既存ビットと衝突しない。
 
 `granted_permissions` は常に現在の実効許可状態を表す。`immediate_revoke` に含まれる権限は進行中の操作があっても即座に無効化し、含まれない権限(`FILE_*`)は進行中の転送を完了まで許容し以降の新規リクエストのみ拒否する。`CLIP_*` は次回の `ClipboardRequest` から新しい状態を適用する。
 
@@ -312,10 +331,12 @@ ClipboardError { request_id, reason : ReasonCode }
 
 ```text
 ReasonCode {
-    domain : u8    // 1=AUTH, 2=POLICY, 3=TRANSPORT, 4=PROTOCOL, 5=OS
+    domain : u8    // 0=NONE(エラーなし、予約), 1=AUTH, 2=POLICY, 3=TRANSPORT, 4=PROTOCOL, 5=OS
     code   : u16
 }
 ```
+
+**`domain = 0, code = 0` はエラーなしを表す予約値(DR-034)**である。`AuthResult`等、成功時にも `ReasonCode` フィールドを送る必要がある(構造体の必須フィールドである)メッセージでは、`status = OK` の場合MUSTで `ReasonCode{domain: 0, code: 0}` を設定する。個々のドメイン内の具体的な `code` の割り当ては4.8節のReasonCode一覧を参照。
 
 ## 2.9 時刻同期(レビュー指摘#3(前版), #8)
 
@@ -378,6 +399,29 @@ DisplayCapabilities {               // control、client→server。デコード�
     }]
 }
 
+**`VideoFrame` はワイヤ上で2つの連続したEnvelopeに分割する(DR-035)**。DR-021の「メッセージ本体はスキーマ生成コード」「映像・音声・ファイルのペイロードは生バイト列のままゼロコピーで扱う」という2分類は、単一のCBOR構造体にヘッダとペイロードを混在させると両立しない(ペイロードが構造体の一フィールドである以上、デコード時にスキーマ層が確保する新規バッファへコピーされてしまう)。ヘッダとペイロードをそれぞれ独立したEnvelopeとして送ることで、ペイロード側はEnvelope層(2.1.1節)が本来持つ生バイト列の扱いをそのまま利用できる。
+
+```text
+VideoFrameHeader {                 // CBOR。type_id: VIDEO_FRAME_HEADER
+    generation     : varint         // このフレームが属する世代
+    frame_id       : varint         // 世代内で0起点、送信順=デコード順=表示順(Bフレーム禁止のため)
+    config_id      : u64
+    flags          : u8             // bit0: IDR
+    capture_ts     : u64
+    encode_done_ts : u64
+    width, height  : u32            // 解像度変更時のみ必須
+    payload_len    : varint         // 直後に続くVIDEO_FRAME_PAYLOADのEnvelope.lengthと
+                                     // 一致することをMUSTで検証する(PROTOCOL.8参照)
+}
+
+VideoFramePayload {                 // type_id: VIDEO_FRAME_PAYLOAD
+                                     // CBORでラップしない。Envelope.payloadがそのままH.264 Annex-Bバイト列
+}
+```
+
+`VideoFrameHeader` の直後に、同一ストリーム上で `VideoFramePayload` がMUSTで続く(間に他のEnvelopeを挟まない)。受信側はヘッダを読み終えた時点で `payload_len` バイトを期待し、後続Envelopeの `length` と付き合わせて `PROTOCOL.8 FRAME_LENGTH_MISMATCH` を検証する。
+
+```text
 VideoFrame {
     generation     : varint         // このフレームが属する世代
     frame_id       : varint         // 世代内で0起点、送信順=デコード順=表示順(Bフレーム禁止のため)
@@ -390,6 +434,8 @@ VideoFrame {
     payload        : bytes          // H.264 Annex-B
 }
 ```
+
+上記 `VideoFrame` はワイヤ形式ではなく、実装が2つのEnvelope(`VideoFrameHeader` + `VideoFramePayload`)を受信して組み立てる論理ビューとして参照してよい。以降の本書の記述(4.3.2節等)で単に「`VideoFrame`」と言及する箇所は、この論理ビューを指す。
 
 `monitor_id` はいずれのメッセージにも含めない。ストリーム自体がmonitor_idに束縛されている(2.2.1節)ため冗長である。
 
@@ -835,6 +881,69 @@ Suspended
 | MAX_SESSION_DURATION超過 | Connection(Active) | POLICY.4 MAX_SESSION_DURATION_EXCEEDED | `SessionClose`送出、Closing遷移 |
 | 管理者による強制切断 | Connection(Active) | POLICY.3 FORCED_DISCONNECT | `SessionClose`送出、Closing遷移 |
 
+### 4.8.1 ReasonCode 一覧(正式版、DR-034)
+
+上表と4.1/4.6/4.7節で名前のみ参照していたコードを合わせ、`domain.code` の割り当てをここに一元化する。以降、本書内の全参照はこの表を正とする。
+
+**AUTH(domain=1)**
+
+| code | 名前 |
+|---|---|
+| 1 | AUTH_TIMEOUT |
+| 2 | TOO_MANY_ATTEMPTS |
+| 3 | SIGNATURE_INVALID |
+| 4 | CHALLENGE_REUSE |
+| 5 | RECONNECT_TOKEN_INVALID |
+| 6 | RECONNECT_TOKEN_EXPIRED |
+| 7 | RECONNECT_TOKEN_ALREADY_CONSUMED |
+
+**POLICY(domain=2)**
+
+| code | 名前 |
+|---|---|
+| 1 | PERMISSION_DENIED |
+| 2 | PERMISSION_REVOKED |
+| 3 | FORCED_DISCONNECT |
+| 4 | MAX_SESSION_DURATION_EXCEEDED |
+| 5 | FILE_POLICY_REJECTED |
+| 6 | CLIPBOARD_FORMAT_TOO_LARGE |
+
+**TRANSPORT(domain=3)**
+
+| code | 名前 |
+|---|---|
+| 1 | HANDSHAKE_TIMEOUT |
+| 2 | IDLE_TIMEOUT |
+| 3 | RECONNECT_TIMEOUT |
+| 4 | VIDEO_RECOVERY_TIMEOUT |
+| 5 | STREAM_STALL_TIMEOUT |
+
+**PROTOCOL(domain=4)**
+
+| code | 名前 |
+|---|---|
+| 1 | UNEXPECTED_MESSAGE |
+| 2 | UNKNOWN_CORE_MESSAGE |
+| 3 | PROLOGUE_MAGIC_MISMATCH |
+| 4 | UNKNOWN_STREAM_KIND |
+| 5 | WRONG_INITIATOR |
+| 6 | SESSION_SETUP_TIMEOUT |
+| 7 | VIDEO_CONFIGURING_TIMEOUT |
+| 8 | FRAME_LENGTH_MISMATCH |
+| 9 | GENERATION_MISMATCH |
+| 10 | FILE_CHUNK_OVERLAP |
+| 11 | FILE_CHUNK_OUT_OF_RANGE |
+| 12 | FILE_INCOMPLETE_TRANSFER |
+| 13 | FILE_CHECKSUM_MISMATCH |
+
+**OS(domain=5)**
+
+| code | 名前 |
+|---|---|
+| 2 | DECODE_ERROR |
+
+(1, 3の`CAPTURE_FAILURE`/`INPUT_INJECTION_FAILURE`は本文中で未使用のため、必要になった時点で改めて割り当てる。2番から始まる欠番は元の設計メモに合わせたもので、詰め直す実益がないためそのままにしてある。)
+
 ## 4.9 未決定事項(本改訂で残る2件)
 
 前回の改訂で洗い出した10項目のうち、数値的な決定が必要だった8項目はすべて4.7節で確定した(値の根拠・サブエージェントによる妥当性検証はチャット履歴および各節の注記を参照)。数値ではなく挙動そのものが未決定の残り2項目のみ、引き続き未決定事項として一覧化する。
@@ -906,8 +1015,16 @@ USBリダイレクト: デバイスクラス単位の許可制+用途プリセ�
 - Envelopeパーサーは手書きの最小実装とし、MUSTでファジング(cargo-fuzz / libFuzzer相当)対象に含める。
 - メッセージ本体はスキーマ生成コード(FlatBuffers等、実装が選択)で管理する。
 - 測定ハーネスを実装前に用意する: フレーム生成時刻の画面埋め込み、E2E遅延自動計測、`tc netem` によるネットワーク再現。
-- 目標値: LAN glass-to-glass 50ms以下、WAN 150ms以下。
 - 最小プロトタイプ: ダミー映像源→H.264ソフトエンコード→QUIC 1ストリーム(モニター1枚分)→デコード表示。OSキャプチャ・ハードウェアエンコードは後から差し込む。
+
+### 遅延目標(DR-036)
+
+目標値は2つに分けて規定する。
+
+- **`transport_us`(規範。プロトコル自体が満たすべき目標)**: `capture_ts`相当のタイムスタンプ確定後からクライアントが当該データを受信するまでの、QUIC送受信+Envelopeフレーミング+CBORデコードのみに起因する遅延。LAN相当で50ms以下、WAN相当で150ms以下。
+- **`glass_to_glass_us`(参考値。実装依存)**: 実際のキャプチャ完了から画面表示までの全体遅延。エンコーダ・デコーダの実装(ソフトウェア/ハードウェア、プロセス起動方式)に強く依存するため、規範上の目標値をここでは定めない。
+
+この分離が必要になった理由: PoCのM6で、フレームごとに`ffmpeg`を子プロセスとして起動する方式(本Partが認めている初期段階のショートカット)では、エンコード/デコードの起動コストだけで`glass_to_glass_us`がLAN予算を超過することが実測で判明した。一方`transport_us`は実測387μs(既定のLAN/WAN予算に対して実質ゼロコスト)であり、SARDPのワイヤプロトコル自体は目標を満たすと確認された。エンコーダ/デコーダをプロセス起動方式から永続化されたパイプライン(バインディング直呼び出し等)へ置き換えることは、プロトコル設計とは独立した実装課題であり、将来のマイルストーンとして扱う(Appendix B参照)。
 
 ---
 
@@ -948,11 +1065,17 @@ USBリダイレクト: デバイスクラス単位の許可制+用途プリセ�
 | DR-029 | 映像バックプレッシャの閾値を絶対値からベースライン相対のdeltaへ再定義する(2.10節の訂正) | 固定の絶対閾値(高遅延経路で伝搬遅延を輻輳と誤検知する欠陥があった) |
 | DR-030 | VideoChannelのRecovering失敗時は無期限の指数バックオフ再試行とし(上限30秒でキャップ)、恒久的な「諦め」状態を設けない | 再試行回数に上限を設けてDegraded等の終端状態にエスカレーションする |
 | DR-031 | MAX_SESSION_DURATIONは既定24時間・ポリシーで無制限化可能とし、無人セッション向けの運用指針を明記する | 全セッションに一律の強制的な上限を課す |
+| DR-032 | Envelope.lengthはpayloadのみのバイト数とし、typeフィールド(2バイト)は含めない | typeを含めた長さとする(v0.1初期案。length<2という無意味なエラー状態を生むだけで撤回) |
+| DR-033 | PermissionSetのビット位置を宣言順(VIEW=bit0起点)で正式に割り当てる | ビット位置を実装依存のまま放置する(M2実装での自然発生的な採番を追認) |
+| DR-034 | ReasonCode.domain=0を「エラーなし」の予約値とし、4.1/4.6/4.7で名前のみ参照していたコードに正式番号を割り当てる一覧表(4.8.1節)を新設する | 個々の参照箇所に断片的な番号を残したままにする |
+| DR-035 | VideoFrameをVideoFrameHeader(CBOR)+VideoFramePayload(生バイト、ラップなし)の連続する2つのEnvelopeに分割する | ヘッダとペイロードを1つのCBOR構造体に混在させる(M3実装がこれで実装し、payload_lenの冗長性とゼロコピー未達成を指摘して確認を求めた) |
+| DR-036 | Part 8の遅延目標を`transport_us`(規範、プロトコル自体の目標)と`glass_to_glass_us`(参考、実装依存)に分離する | glass-to-glassを単一の規範目標のままにする(M6実測でエンコーダ起動コストとプロトコル自体のコストが混同されると判明したため分離) |
 
 ---
 
 # Appendix B. Rejected Alternatives / 将来課題
 
+- **永続化されたエンコーダ/デコーダパイプライン**: M1〜M6のPoCは`ffmpeg`をフレームごとに子プロセス起動する方式(本Part 8が認めた初期ショートカット)を採用した。M6の実測で、この起動コストだけで`glass_to_glass_us`がLAN予算を超過することが判明した(DR-036)。`transport_us`(SARDPのワイヤプロトコル自体)は実測387μsで目標を満たしている。エンコーダ/デコーダをストリームの生存期間中ウォームに保つ方式(FFIバインディング直呼び出し、またはハードウェアエンコーダAPI)への置き換えは、プロトコル設計とは独立した実装課題として次のマイルストームで扱う。
 - **VVC等新コーデックの即時対応**: 見送り。`codec` enumと `EncoderConfig`/`DisplayCapabilities` を拡張可能に保つ。
 - **USBリダイレクトの全面対応**: 見送り。デバイスクラス許可制+用途プリセットに留める。
 - **監査ログの根拠を壁時計に置く**: 却下。単調シーケンス+ハッシュチェーンを根拠とする。
