@@ -11,16 +11,21 @@
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
+use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
 
+use sardp::audio_session;
+use sardp::clipboard_session;
 use sardp::connection_sm::{ConnectionSm, defaults as timeouts};
 use sardp::decoder;
 use sardp::feedback_session::{self, FrameTimestamps};
 use sardp::handshake::client_handshake;
-use sardp::messages::{self, SessionClose};
+use sardp::messages::{self, AudioCodec, AudioConfig, SessionClose};
+use sardp::permission_set::bit;
 use sardp::reason_code::ReasonCode;
 use sardp::reconnection::client_reconnect;
+use sardp::session_file::{SavedSession, read_saved_session, write_saved_session};
 use sardp::stream_reader::write_envelope;
 use sardp::timecode_frame::extract_timecode;
 use sardp::timesync::client_time_sync;
@@ -157,54 +162,6 @@ fn parse_args() -> Args {
     }
 }
 
-/// Session state persisted across process runs for the `--session-file`
-/// reconnect demo/test (see [`Args::session_file`]). Plain hex/text, not
-/// any format worth a dependency for.
-struct SavedSession {
-    session_id: [u8; 16],
-    reconnect_token: [u8; 32],
-    user_id: String,
-}
-
-fn hex_encode(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-
-fn parse_hex_bytes(s: &str) -> Option<Vec<u8>> {
-    if !s.len().is_multiple_of(2) {
-        return None;
-    }
-    (0..s.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
-        .collect()
-}
-
-fn read_saved_session(path: &std::path::Path) -> Option<SavedSession> {
-    let contents = std::fs::read_to_string(path).ok()?;
-    let mut lines = contents.lines();
-    let session_id: [u8; 16] = parse_hex_bytes(lines.next()?)?.try_into().ok()?;
-    let reconnect_token: [u8; 32] = parse_hex_bytes(lines.next()?)?.try_into().ok()?;
-    let user_id = lines.next()?.to_string();
-    Some(SavedSession {
-        session_id,
-        reconnect_token,
-        user_id,
-    })
-}
-
-fn write_saved_session(path: &std::path::Path, session: &SavedSession) {
-    let contents = format!(
-        "{}\n{}\n{}\n",
-        hex_encode(&session.session_id),
-        hex_encode(&session.reconnect_token),
-        session.user_id
-    );
-    if let Err(e) = std::fs::write(path, contents) {
-        eprintln!("warning: failed to write --session-file {path:?}: {e}");
-    }
-}
-
 #[derive(Debug)]
 #[allow(dead_code)]
 enum AppError {
@@ -218,6 +175,8 @@ enum AppError {
     Decode(sardp::decoder::DecodeError),
     Join(tokio::task::JoinError),
     Violation(ReasonCode),
+    Audio(sardp::audio_session::AudioError),
+    Clipboard(sardp::clipboard_session::ClipboardSessionError),
 }
 
 impl From<quinn::ConnectionError> for AppError {
@@ -263,6 +222,16 @@ impl From<sardp::ProtocolViolation> for AppError {
 impl From<sardp::decoder::DecodeError> for AppError {
     fn from(e: sardp::decoder::DecodeError) -> Self {
         Self::Decode(e)
+    }
+}
+impl From<sardp::audio_session::AudioError> for AppError {
+    fn from(e: sardp::audio_session::AudioError) -> Self {
+        Self::Audio(e)
+    }
+}
+impl From<sardp::clipboard_session::ClipboardSessionError> for AppError {
+    fn from(e: sardp::clipboard_session::ClipboardSessionError) -> Self {
+        Self::Clipboard(e)
     }
 }
 
@@ -334,71 +303,79 @@ async fn close_gracefully(
 async fn run(connection: quinn::Connection, args: &Args) -> Result<(), AppError> {
     let saved_session = args.session_file.as_deref().and_then(read_saved_session);
 
-    let (session_id, reconnect_token, mut connection_sm, mut control, is_resumed) =
-        if let Some(saved) = saved_session {
-            eprintln!(
-                "found --session-file state, reconnecting (session_id={:x?})...",
-                saved.session_id
-            );
-            // A fresh process has no live ConnectionSm from the prior run
-            // to resume -- replay it through the same states that run
-            // actually reached before the connection was lost, so
-            // `client_reconnect`'s internal `resume()` (Suspended ->
-            // Active) has a valid starting point.
-            let mut connection_sm = ConnectionSm::new();
-            connection_sm
-                .complete_handshake()
-                .expect("fresh SM: Handshaking -> Authenticating");
-            connection_sm
-                .complete_authentication()
-                .expect("fresh SM: Authenticating -> Authenticated");
-            connection_sm
-                .on_channel_live()
-                .expect("fresh SM: Authenticated -> Active");
-            connection_sm
-                .suspend()
-                .expect("fresh SM: Active -> Suspended");
+    let (
+        session_id,
+        reconnect_token,
+        granted_permissions,
+        mut connection_sm,
+        mut control,
+        is_resumed,
+    ) = if let Some(saved) = saved_session {
+        eprintln!(
+            "found --session-file state, reconnecting (session_id={:x?})...",
+            saved.session_id
+        );
+        // A fresh process has no live ConnectionSm from the prior run
+        // to resume -- replay it through the same states that run
+        // actually reached before the connection was lost, so
+        // `client_reconnect`'s internal `resume()` (Suspended ->
+        // Active) has a valid starting point.
+        let mut connection_sm = ConnectionSm::new();
+        connection_sm
+            .complete_handshake()
+            .expect("fresh SM: Handshaking -> Authenticating");
+        connection_sm
+            .complete_authentication()
+            .expect("fresh SM: Authenticating -> Authenticated");
+        connection_sm
+            .on_channel_live()
+            .expect("fresh SM: Authenticated -> Active");
+        connection_sm
+            .suspend()
+            .expect("fresh SM: Active -> Suspended");
 
-            let (outcome, control) = client_reconnect(
-                &connection,
-                &mut connection_sm,
-                saved.session_id,
-                saved.reconnect_token,
-                &saved.user_id,
-            )
-            .await?;
-            eprintln!(
-                "reconnected: session_id={:x?} granted_permissions={:#b}",
-                outcome.session_id, outcome.granted_permissions
-            );
-            (
-                outcome.session_id,
-                outcome.reconnect_token,
-                connection_sm,
-                control,
-                true,
-            )
-        } else {
-            let (outcome, connection_sm, control) = client_handshake(
-                &connection,
-                &args.signing_key,
-                &args.client_name,
-                &args.user_id,
-                &args.device_id,
-            )
-            .await?;
-            eprintln!(
-                "authenticated: session_id={:x?} granted_permissions={:#b}",
-                outcome.session_id, outcome.granted_permissions
-            );
-            (
-                outcome.session_id,
-                outcome.reconnect_token,
-                connection_sm,
-                control,
-                false,
-            )
-        };
+        let (outcome, control) = client_reconnect(
+            &connection,
+            &mut connection_sm,
+            saved.session_id,
+            saved.reconnect_token,
+            &saved.user_id,
+        )
+        .await?;
+        eprintln!(
+            "reconnected: session_id={:x?} granted_permissions={:#b}",
+            outcome.session_id, outcome.granted_permissions
+        );
+        (
+            outcome.session_id,
+            outcome.reconnect_token,
+            outcome.granted_permissions,
+            connection_sm,
+            control,
+            true,
+        )
+    } else {
+        let (outcome, connection_sm, control) = client_handshake(
+            &connection,
+            &args.signing_key,
+            &args.client_name,
+            &args.user_id,
+            &args.device_id,
+        )
+        .await?;
+        eprintln!(
+            "authenticated: session_id={:x?} granted_permissions={:#b}",
+            outcome.session_id, outcome.granted_permissions
+        );
+        (
+            outcome.session_id,
+            outcome.reconnect_token,
+            outcome.granted_permissions,
+            connection_sm,
+            control,
+            false,
+        )
+    };
 
     if let Some(path) = &args.session_file {
         write_saved_session(
@@ -453,6 +430,59 @@ async fn run(connection: quinn::Connection, args: &Args) -> Result<(), AppError>
     let mut keepalive_interval = tokio::time::interval(timeouts::KEEPALIVE_INTERVAL);
     let mut last_activity = tokio::time::Instant::now();
 
+    // KNOWN_ISSUES.md #12: audio_capture (client -> server). Only opened
+    // if granted at handshake/reconnect time -- unlike sardp-server's
+    // AUDIO_PLAYBACK, which reacts live to later admin grants, this client
+    // has no interactive control surface to react to a later
+    // PermissionUpdate with, so a grant that arrives after this check
+    // simply won't be acted on (same conservative-by-default situation as
+    // FILE_UP/FILE_DOWN, spec 4.5/handshake.rs).
+    let audio_config = AudioConfig {
+        codec: AudioCodec::Opus,
+        sample_rate: 48_000,
+        channels: 1,
+        frame_duration_ms: 20,
+    };
+    let audio_samples_per_frame = (u64::from(audio_config.sample_rate)
+        * u64::from(audio_config.frame_duration_ms)
+        / 1000) as usize;
+    let mut audio_capture_send = if granted_permissions & bit::AUDIO_CAPTURE != 0 {
+        match audio_session::open_audio_stream(&connection, StreamKind::AudioCapture, &audio_config)
+            .await
+        {
+            Ok(send) => {
+                eprintln!("opened audio_capture stream");
+                Some(send)
+            }
+            Err(e) => {
+                eprintln!("failed to open audio_capture stream: {e:?}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let mut audio_capture_sequence = 0u64;
+    let mut audio_capture_interval = tokio::time::interval(Duration::from_millis(u64::from(
+        audio_config.frame_duration_ms,
+    )));
+    audio_capture_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    // audio_playback (server -> client): always listening, regardless of
+    // this client's own granted_permissions, since sardp-server only
+    // opens its side once AUDIO_PLAYBACK is (possibly later) granted via
+    // its own admin command -- see that binary's matching comment.
+    let mut audio_playback_reader: Option<audio_session::AudioFrameReader> = None;
+
+    // CLIP_WRITE (client -> server announce): like AUDIO_CAPTURE, only
+    // acted on if granted at handshake/reconnect time -- this client has
+    // no interactive control surface to react to a later grant with.
+    // Fire-and-forget: this connection's own `accept_bi()` isn't used for
+    // anything else, so a spawned announce here can't race with anything.
+    if granted_permissions & bit::CLIP_WRITE != 0 {
+        tokio::spawn(clipboard_announce_once(connection.clone()));
+    }
+
     loop {
         let idle_deadline = last_activity + timeouts::IDLE_TIMEOUT;
         tokio::select! {
@@ -492,6 +522,104 @@ async fn run(connection: quinn::Connection, args: &Args) -> Result<(), AppError>
                 last_activity = tokio::time::Instant::now();
                 process_frame(&mut feedback_send, timesync.offset_us, args.target_latency_us, header, payload).await?;
             }
+            _ = audio_capture_interval.tick() => {
+                if let Some(send) = audio_capture_send.as_mut() {
+                    let capture_ts = clock::now_us();
+                    let payload = audio_session::generate_silence_payload(audio_samples_per_frame);
+                    let duration_us = u32::from(audio_config.frame_duration_ms) * 1000;
+                    audio_session::send_audio_frame(send, audio_capture_sequence, capture_ts, duration_us, &payload).await?;
+                    audio_capture_sequence += 1;
+                }
+            }
+            accept_result = audio_session::accept_audio_stream(&connection, StreamKind::AudioPlayback),
+                if audio_playback_reader.is_none() =>
+            {
+                let (config, reader) = accept_result?;
+                eprintln!("accepted audio_playback stream: {config:?}");
+                audio_playback_reader = Some(reader);
+            }
+            frame_result = async { audio_playback_reader.as_mut().unwrap().read_next_frame().await },
+                if audio_playback_reader.is_some() =>
+            {
+                match frame_result {
+                    Ok((header, payload)) => {
+                        last_activity = tokio::time::Instant::now();
+                        eprintln!("audio_playback frame sequence={} bytes={}", header.sequence, payload.len());
+                    }
+                    Err(e) => {
+                        eprintln!("audio_playback stream ended: {e:?}");
+                        audio_playback_reader = None;
+                    }
+                }
+            }
+            accept_result = clipboard_session::accept_clipboard_formats(&connection) => {
+                let (mut send, mut reader, formats) = accept_result?;
+                let request_id = formats.request_id;
+                let Some(first_format) = formats.formats.into_iter().next() else {
+                    eprintln!("received ClipboardFormats with no formats, nothing to request");
+                    continue;
+                };
+                eprintln!(
+                    "received clipboard formats, requesting {:?}/{}",
+                    first_format.namespace, first_format.format_id
+                );
+                tokio::spawn(async move {
+                    let request = messages::ClipboardRequest {
+                        request_id,
+                        namespace: first_format.namespace,
+                        format_id: first_format.format_id,
+                    };
+                    match clipboard_session::request_clipboard_data(&mut send, &mut reader, &request).await {
+                        Ok(Ok(data)) => eprintln!("clipboard data received: {} bytes", data.data.len()),
+                        Ok(Err(error)) => eprintln!("clipboard request rejected: {:?}", error.reason),
+                        Err(e) => eprintln!("clipboard request failed: {e:?}"),
+                    }
+                });
+            }
+        }
+    }
+}
+
+/// CLIP_WRITE (client -> server announce, spec 2.7): announces synthetic
+/// clipboard content once, then responds to a `ClipboardRequest` for it if
+/// one arrives. Mirrors `sardp-server`'s `spawn_clipboard_announce`
+/// (`CLIP_READ` direction) exactly, just from the other side.
+async fn clipboard_announce_once(connection: quinn::Connection) {
+    let formats = messages::ClipboardFormats {
+        request_id: 1,
+        formats: vec![messages::ClipboardFormatEntry {
+            namespace: messages::FormatNamespace::Mime,
+            format_id: "text/plain".to_string(),
+        }],
+    };
+    let (mut send, mut reader) =
+        match clipboard_session::announce_clipboard_formats(&connection, &formats).await {
+            Ok(pair) => pair,
+            Err(e) => {
+                eprintln!("failed to announce clipboard formats: {e:?}");
+                return;
+            }
+        };
+    match clipboard_session::read_clipboard_request(&mut reader).await {
+        Ok(request) => {
+            let pseudo_data = b"hello from sardp-client's synthetic clipboard".to_vec();
+            let request_id = request.request_id;
+            let result = clipboard_session::respond_to_clipboard_request(
+                &mut send,
+                request.request_id,
+                request.namespace,
+                request.format_id,
+                pseudo_data,
+                None,
+            )
+            .await;
+            match result {
+                Ok(()) => eprintln!("responded to ClipboardRequest {request_id}"),
+                Err(e) => eprintln!("failed to respond to ClipboardRequest: {e:?}"),
+            }
+        }
+        Err(e) => {
+            eprintln!("clipboard announce: never received a ClipboardRequest ({e:?})");
         }
     }
 }

@@ -10,7 +10,8 @@ use std::time::Duration;
 
 use sardp::file_handle_store::{FileHandleError, FileHandleStore};
 use sardp::file_transfer_session::{
-    FileTransferSessionError, accept_file_stream_verified, open_file_stream,
+    FileTransferSessionError, accept_file_stream_verified,
+    accept_file_stream_verified_with_timeout, open_file_stream,
 };
 use sardp::messages::FileTransferDirection;
 use sardp::{net, pki};
@@ -80,7 +81,7 @@ async fn a_file_handle_issued_to_one_session_is_rejected_from_a_different_connec
     // Opening succeeds at the transport level -- `open_file_stream` has no
     // way to know the handle isn't client_b's own; the ownership check is
     // entirely the receiver's job.
-    let (_send, _reader) = open_result.expect("client_b can open the stream");
+    let _send = open_result.expect("client_b can open the stream");
 
     match accept_result {
         Err(FileTransferSessionError::OwnershipRejected(FileHandleError::SessionMismatch)) => {}
@@ -116,8 +117,33 @@ async fn the_owning_session_s_own_connection_is_accepted() {
             FileTransferDirection::Upload,
         ),
     );
-    let (_send, _reader) = open_result.expect("client_a opens its own stream");
-    let (_send2, _reader2, accepted_handle) =
+    let _send = open_result.expect("client_a opens its own stream");
+    let (_reader, accepted_handle) =
         accept_result.expect("the owning session's own connection is accepted");
     assert_eq!(accepted_handle, file_handle);
+}
+
+/// KNOWN_ISSUES.md #3: a `FileTransferRequest` was accepted (a `file_handle`
+/// issued) but the peer never actually opens the promised `file` stream --
+/// `accept_file_stream_verified` must give up rather than waiting forever,
+/// so the caller (a `spawn`ed task on the server) can log the failure and
+/// move on instead of leaking a task per stalled client.
+#[tokio::test]
+async fn accept_gives_up_once_the_stream_is_never_opened() {
+    let (_client_a, server_a) = connect_pair().await;
+    let store = FileHandleStore::new();
+
+    let result = accept_file_stream_verified_with_timeout(
+        &server_a,
+        &store,
+        [0xAA; 16],
+        "alice",
+        FileTransferDirection::Upload,
+        Duration::from_millis(50),
+    )
+    .await;
+    assert!(matches!(
+        result,
+        Err(FileTransferSessionError::AcceptTimeout)
+    ));
 }

@@ -269,7 +269,7 @@ FileTransferRequest {              // control、常にクライアントが送�
 
 FileTransferAccept {               // control、server→client
     request_id    : varint
-    file_handle   : bytes(16)      // 不透明ハンドル。セッション・ユーザー・方向・有効期限に束縛
+    file_handle   : u64            // 不透明ハンドル。セッション・ユーザー・方向・有効期限に束縛(DR-037)
     resolved_size : u64
     expiry_ts     : u64            // このfile_handleが有効な期限(単調時計基準)
 }
@@ -277,9 +277,11 @@ FileTransferAccept {               // control、server→client
 FileTransferReject { request_id, reason : ReasonCode }
 ```
 
+**`file_handle` は `bytes(16)` ではなく `u64` とする(DR-037)**。`StreamPrologue.context_id`(2.2節)がvarintである以上、128bitの不透明値を直接運べないという設計上の矛盾がv0.3の当初の記述にあったため、これを解消する。エントロピーの縮小(128bit→64bit)自体は本用途では実害が小さいと判断する。理由は、`file_handle`の不正利用を防いでいるのはエントロピーの大きさそのものではなく、直後に述べるサーバー側の所有権検証だからである。
+
 サーバー側処理パイプライン(MUST): `Request → ポリシーチェック → virtual_pathの正規化 → サンドボックスチェック(symlink/junction/UNC/マウント越境を含む) → file_handle発行 → 転送 → 整合性検証`。
 
-`file_handle` 発行後、`direction` が示す側が `file` ストリームを開く(`StreamPrologue.context_id = file_handle`)。
+**`file`ストリーム開設時、サーバーはMUSTで`file_handle`が要求元と同一の`session_id`/`user_id`/`direction`に束縛されていること、および`expiry_ts`内であることを検証する**(DR-037)。`context_id`(=`file_handle`)の値が構文的に妥当であることは、この所有権検証の代わりにはならない。`file_handle`発行後、`direction` が示す側が `file` ストリームを開く(`StreamPrologue.context_id = file_handle`)。
 
 ```text
 FileChunk {
@@ -295,6 +297,8 @@ FileTransferError {                              // control、いずれの側か
     reason : ReasonCode
 }
 ```
+
+**`file`ストリームはMUSTで単方向のまま維持する(DR-038)**。`FileChunk`/`FileTransferComplete`は`direction`が示す向き(送信側→受信側)のみに流れるため、単方向ストリームで足りる。受信側が異常を検出した場合の`FileTransferError`だけが逆方向の通知になるが、これは`file`ストリームを双方向化せず、**既に双方向で開いている`control`ストリーム上で`request_id`または`file_handle`により相関付けて送る**(2.2.1節表のとおり)。実装が`file`ストリームを双方向(`open_bi`/`accept_bi`)にしてこの逆方向通知を同じストリームに乗せる設計は、単方向が前提の他ストリーム(2.2.1節)との一貫性を崩すだけでなく、QUICの`accept_uni`/`accept_bi`が別キューであることを利用して他の双方向ストリーム種別(例: `clipboard`)との`accept_bi`競合を避けられるという実利も失う。
 
 受信側はMUSTで以下を拒否する: オフセットの重複、`resolved_size` を超える範囲、穴のある状態での `FileTransferComplete` 受理、`checksum` 不一致。いずれの場合も `FileTransferError` を送って転送を中断する。
 
@@ -1070,6 +1074,8 @@ USBリダイレクト: デバイスクラス単位の許可制+用途プリセ�
 | DR-034 | ReasonCode.domain=0を「エラーなし」の予約値とし、4.1/4.6/4.7で名前のみ参照していたコードに正式番号を割り当てる一覧表(4.8.1節)を新設する | 個々の参照箇所に断片的な番号を残したままにする |
 | DR-035 | VideoFrameをVideoFrameHeader(CBOR)+VideoFramePayload(生バイト、ラップなし)の連続する2つのEnvelopeに分割する | ヘッダとペイロードを1つのCBOR構造体に混在させる(M3実装がこれで実装し、payload_lenの冗長性とゼロコピー未達成を指摘して確認を求めた) |
 | DR-036 | Part 8の遅延目標を`transport_us`(規範、プロトコル自体の目標)と`glass_to_glass_us`(参考、実装依存)に分離する | glass-to-glassを単一の規範目標のままにする(M6実測でエンコーダ起動コストとプロトコル自体のコストが混同されると判明したため分離) |
+| DR-037 | file_handleをbytes(16)からu64に変更し、StreamPrologue.context_id(varint)へ直接載せられるようにする。エントロピー削減の代わりに、サーバーによるfile_handleの所有権検証(session_id/user_id/direction/expiry)をMUSTとして明記する | bytes(16)のまま、context_idとは別にfile_handleを運ぶ機構を新設する(実装コストが増える割に、所有権検証がある前提では得られる防御の増分が小さい) |
+| DR-038 | fileストリームは単方向のまま維持し、FileTransferErrorはcontrolストリーム経由で相関付けて送ることを明確化する(2.6節の既存記述の再確認・明文化) | fileストリームを双方向化しFileTransferError/Completeを同一ストリームに乗せる(Phase 2c以来の実装がこれで、CLIP_WRITE追加時のaccept_bi競合の原因になっていたことがStage 1で判明) |
 
 ---
 

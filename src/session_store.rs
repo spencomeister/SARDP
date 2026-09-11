@@ -134,6 +134,50 @@ impl SessionStore {
     pub fn contains(&self, session_id: [u8; 16]) -> bool {
         self.sessions.lock().unwrap().contains_key(&session_id)
     }
+
+    /// Transitions `connection_sm` `Active -> Suspended` (spec 4.1) and
+    /// registers it in `self` (`self` must be `Arc`-held so the spawned
+    /// expiry task below can outlive the caller), so a new connection
+    /// presenting `reconnect_token` can resume it within `grace_period`
+    /// (spec 4.6: `RECONNECT_GRACE_PERIOD`). Spawns a task that expires
+    /// the entry via [`Self::expire_if_token_matches`] if nobody
+    /// reconnects in time -- not [`Self::expire`], since a reconnect
+    /// followed by a second suspension before this timer fires would
+    /// otherwise clobber that *later* suspend episode instead of the one
+    /// this timer was armed for.
+    ///
+    /// Does nothing to `self` if `connection_sm.suspend()` itself fails
+    /// (already not `Active`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn suspend_and_schedule_expiry(
+        self: &std::sync::Arc<Self>,
+        session_id: [u8; 16],
+        user_id: String,
+        mut connection_sm: ConnectionSm,
+        reconnect_token: [u8; 32],
+        granted_permissions: u32,
+        last_generation: u64,
+        grace_period: std::time::Duration,
+    ) -> Result<(), crate::connection_sm::ProtocolViolation> {
+        connection_sm.suspend()?;
+        self.suspend(
+            session_id,
+            SuspendedSession {
+                reconnect_token,
+                connection_sm,
+                granted_permissions,
+                last_generation,
+                user_id,
+            },
+        );
+
+        let store = self.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(grace_period).await;
+            store.expire_if_token_matches(session_id, reconnect_token);
+        });
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -141,11 +185,16 @@ mod tests {
     use super::*;
     use crate::connection_sm::ConnectionState;
 
-    fn suspended_sm() -> ConnectionSm {
+    fn active_sm() -> ConnectionSm {
         let mut sm = ConnectionSm::new();
         sm.complete_handshake().unwrap();
         sm.complete_authentication().unwrap();
         sm.on_channel_live().unwrap();
+        sm
+    }
+
+    fn suspended_sm() -> ConnectionSm {
+        let mut sm = active_sm();
         sm.suspend().unwrap();
         sm
     }
@@ -308,6 +357,105 @@ mod tests {
         // A timer armed for some other (e.g. long-expired) episode must not
         // touch the entry currently sitting under this session_id.
         store.expire_if_token_matches(session_id, [0xFF; 32]);
+        assert!(store.contains(session_id));
+    }
+
+    #[tokio::test]
+    async fn suspend_and_schedule_expiry_stores_a_reconnectable_session() {
+        let store = std::sync::Arc::new(SessionStore::new());
+        let session_id = [1; 16];
+        store
+            .suspend_and_schedule_expiry(
+                session_id,
+                "alice".into(),
+                active_sm(),
+                [2; 32],
+                0b111,
+                3,
+                std::time::Duration::from_secs(300),
+            )
+            .expect("Active connection_sm suspends cleanly");
+        assert!(store.contains(session_id));
+        let resumed = store
+            .try_reconnect(session_id, [2; 32])
+            .expect("matching token succeeds");
+        assert_eq!(resumed.last_generation, 3);
+    }
+
+    #[tokio::test]
+    async fn suspend_and_schedule_expiry_propagates_an_invalid_transition() {
+        let store = std::sync::Arc::new(SessionStore::new());
+        // A fresh ConnectionSm is Handshaking, not Active -- suspend() must
+        // fail, and the store must be left untouched.
+        let err = store
+            .suspend_and_schedule_expiry(
+                [1; 16],
+                "alice".into(),
+                ConnectionSm::new(),
+                [2; 32],
+                0,
+                0,
+                std::time::Duration::from_secs(300),
+            )
+            .unwrap_err();
+        assert_eq!(
+            err.reason,
+            crate::reason_code::ReasonCode::PROTOCOL_UNEXPECTED_MESSAGE
+        );
+        assert!(!store.contains([1; 16]));
+    }
+
+    #[tokio::test]
+    async fn suspend_and_schedule_expiry_expires_the_session_after_the_grace_period() {
+        let store = std::sync::Arc::new(SessionStore::new());
+        let session_id = [1; 16];
+        store
+            .suspend_and_schedule_expiry(
+                session_id,
+                "alice".into(),
+                active_sm(),
+                [2; 32],
+                0,
+                0,
+                std::time::Duration::from_millis(20),
+            )
+            .unwrap();
+        assert!(store.contains(session_id));
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(!store.contains(session_id));
+    }
+
+    #[tokio::test]
+    async fn a_reconnect_before_expiry_survives_the_stale_timer() {
+        let store = std::sync::Arc::new(SessionStore::new());
+        let session_id = [1; 16];
+        store
+            .suspend_and_schedule_expiry(
+                session_id,
+                "alice".into(),
+                active_sm(),
+                [2; 32],
+                0,
+                0,
+                std::time::Duration::from_millis(20),
+            )
+            .unwrap();
+
+        let mut resumed = store.try_reconnect(session_id, [2; 32]).unwrap();
+        resumed.connection_sm.resume().unwrap();
+        resumed.connection_sm.suspend().unwrap();
+        store.suspend(
+            session_id,
+            SuspendedSession {
+                reconnect_token: [9; 32],
+                ..resumed
+            },
+        );
+
+        // The first suspend episode's timer (armed above for token [2; 32])
+        // fires during this sleep; it must not clobber the second episode
+        // (token [9; 32]) suspended just now.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         assert!(store.contains(session_id));
     }
 

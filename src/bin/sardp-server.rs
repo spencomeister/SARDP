@@ -19,29 +19,33 @@ use ed25519_dalek::VerifyingKey;
 use tokio::io::AsyncBufReadExt;
 use tokio::sync::{Mutex, Notify};
 
+use sardp::audio_session;
 use sardp::backpressure::BackpressureDecision;
 use sardp::channel_sm::ChannelState;
-use sardp::connection_sm::{ConnectionSm, defaults as timeouts};
+use sardp::clipboard_session;
+use sardp::conn_error::{ConnError, is_transport_disconnect};
+use sardp::connection_sm::defaults as timeouts;
 use sardp::encoder;
-use sardp::feedback_session::{FeedbackReceiver, ReadFeedbackError};
+use sardp::feedback_session::FeedbackReceiver;
 use sardp::file_handle_store::FileHandleStore;
-use sardp::file_transfer_session::{self as file_transfer, FileTransferSessionError};
-use sardp::handshake::{ControlChannel, HandshakeError};
+use sardp::file_transfer_session::{self as file_transfer};
+use sardp::handshake::ControlChannel;
 use sardp::messages::{
-    self, ChromaFormat, Codec, EncoderConfig, FileTransferAccept, FileTransferDirection,
-    FileTransferReject, FileTransferRequest, PermissionUpdate, SessionClose,
+    self, AudioCodec, AudioConfig, ChromaFormat, ClipboardFormatEntry, ClipboardFormats, Codec,
+    EncoderConfig, FileTransferAccept, FileTransferReject, FileTransferRequest, FormatNamespace,
+    SessionClose,
 };
 use sardp::permission_set::bit;
-use sardp::permission_sm::{BitState, PermissionSm};
+use sardp::permission_sm::{self, PermissionSm};
 use sardp::reason_code::ReasonCode;
-use sardp::reconnection::{self, FirstControlMessage};
-use sardp::session_store::{SessionStore, SuspendedSession};
-use sardp::stream_reader::{StreamReadError, write_envelope};
+use sardp::reconnection::{self, EstablishOutcome};
+use sardp::session_store::SessionStore;
+use sardp::stream_reader::{EnvelopeReader, write_envelope};
 use sardp::timecode_frame;
 use sardp::video_channel::VideoChannel;
-use sardp::video_session::{self, VideoError};
+use sardp::video_session;
 use sardp::video_sm::defaults::VIDEO_CONFIGURING_TIMEOUT;
-use sardp::{clock, dev_identity, net, pki};
+use sardp::{StreamKind, clock, dev_identity, net, pki};
 
 struct Args {
     bind: SocketAddr,
@@ -58,17 +62,33 @@ struct Args {
 /// State shared across every connection this server handles: `sessions`
 /// (Phase 1) backs reconnection (spec 4.6), `file_handles` (this task)
 /// backs file transfer's `file_handle` issuance and DR-037 ownership
-/// checks (spec 2.6).
+/// checks (spec 2.6). Each store is independently `Arc`-wrapped (rather
+/// than the whole struct) so a task that only needs one of them --
+/// [`sardp::session_store::SessionStore::suspend_and_schedule_expiry`]'s
+/// own background expiry task, in particular -- can hold just that.
 #[derive(Default)]
 struct ServerState {
-    sessions: SessionStore,
-    file_handles: FileHandleStore,
+    sessions: Arc<SessionStore>,
+    file_handles: Arc<FileHandleStore>,
 }
 
 /// How long an issued `file_handle` stays valid if the `file` stream isn't
 /// opened (spec 2.6's `expiry_ts`). Not spec-mandated; a PoC-reasonable
 /// default.
 const FILE_HANDLE_TTL: Duration = Duration::from_secs(300);
+
+/// How many `file_handle`s this server allows outstanding (issued but not
+/// yet completed/errored/expired) at once, across all connections.
+/// KNOWN_ISSUES.md #3: without this, a client that keeps sending
+/// `FileTransferRequest` faster than transfers finish can grow
+/// `ServerState::file_handles` without bound. Not spec-mandated; a
+/// PoC-reasonable default.
+const MAX_CONCURRENT_FILE_TRANSFERS: usize = 64;
+
+/// How often the server sweeps `ServerState::file_handles` for handles
+/// whose `expiry_ts` passed without their `file` stream ever being opened
+/// (KNOWN_ISSUES.md #3). Not spec-mandated.
+const FILE_HANDLE_REAP_INTERVAL: Duration = Duration::from_secs(60);
 
 fn print_help() {
     println!(
@@ -87,8 +107,14 @@ OPTIONS:\n\
     --fps <N>               Frame send rate (default 4)\n\
     --server-name <NAME>    Name announced in ServerHello (default sardp-server)\n\
     --help                  Show this message\n\n\
-Once a client is connected, typing `revoke-view` or `grant-view` (Enter)\n\
-toggles its VIEW permission live."
+Once a client is connected, typing one of the following (Enter) toggles\n\
+the corresponding permission live, or triggers a one-shot action:\n\
+    grant-view / revoke-view\n\
+    grant-clip-read / revoke-clip-read\n\
+    grant-audio-playback / revoke-audio-playback\n\
+    grant-audio-capture / revoke-audio-capture\n\
+    send-clipboard   (announces synthetic clipboard content once,\n\
+                      if CLIP_READ is currently granted)"
     );
 }
 
@@ -170,89 +196,28 @@ fn parse_args() -> Args {
     }
 }
 
-// The variant payloads are only ever read via the `Debug` derive (when
-// `main` logs a failed connection's error) -- rustc's dead_code lint
-// doesn't credit that as a "read", hence the blanket allow.
-#[derive(Debug)]
-#[allow(dead_code)]
-enum ConnError {
-    Handshake(HandshakeError),
-    Quic(quinn::ConnectionError),
-    Write(quinn::WriteError),
-    Video(VideoError),
-    Feedback(sardp::feedback_session::ReadFeedbackError),
-    Violation(ReasonCode),
-    Encode(encoder::EncodeError),
-    Join(tokio::task::JoinError),
-    Read(sardp::stream_reader::StreamReadError),
-    TimeSync(sardp::timesync::TimeSyncError),
-    /// Spec 4.1: `IDLE_TIMEOUT` fired (`Active -> Suspended`). Distinct
-    /// from a genuine transport failure so `handle_connection` can tell
-    /// the two apart in logs, even though both are handled the same way
-    /// (see `is_transport_disconnect`).
-    IdleTimeout,
-}
+/// Shared queue of admin commands (stdin, see `permission_sm::AdminCommand`)
+/// for the one connected client this PoC server handles interactively.
+/// Drained by the connection's own loop.
+type PermissionCommand = Arc<Mutex<Vec<permission_sm::AdminCommand>>>;
 
-impl From<sardp::stream_reader::StreamReadError> for ConnError {
-    fn from(e: sardp::stream_reader::StreamReadError) -> Self {
-        Self::Read(e)
-    }
-}
-impl From<sardp::timesync::TimeSyncError> for ConnError {
-    fn from(e: sardp::timesync::TimeSyncError) -> Self {
-        Self::TimeSync(e)
-    }
-}
-impl From<HandshakeError> for ConnError {
-    fn from(e: HandshakeError) -> Self {
-        Self::Handshake(e)
-    }
-}
-impl From<quinn::ConnectionError> for ConnError {
-    fn from(e: quinn::ConnectionError) -> Self {
-        Self::Quic(e)
-    }
-}
-impl From<quinn::WriteError> for ConnError {
-    fn from(e: quinn::WriteError) -> Self {
-        Self::Write(e)
-    }
-}
-impl From<VideoError> for ConnError {
-    fn from(e: VideoError) -> Self {
-        Self::Video(e)
-    }
-}
-impl From<sardp::feedback_session::ReadFeedbackError> for ConnError {
-    fn from(e: sardp::feedback_session::ReadFeedbackError) -> Self {
-        Self::Feedback(e)
-    }
-}
-impl From<sardp::ProtocolViolation> for ConnError {
-    fn from(v: sardp::ProtocolViolation) -> Self {
-        Self::Violation(v.reason)
-    }
-}
-impl From<sardp::video_sm::ProtocolViolation> for ConnError {
-    fn from(v: sardp::video_sm::ProtocolViolation) -> Self {
-        Self::Violation(v.reason)
-    }
-}
-impl From<encoder::EncodeError> for ConnError {
-    fn from(e: encoder::EncodeError) -> Self {
-        Self::Encode(e)
-    }
-}
-impl From<tokio::task::JoinError> for ConnError {
-    fn from(e: tokio::task::JoinError) -> Self {
-        Self::Join(e)
-    }
-}
+/// The `control` stream's send half, shared between `run_active_session`'s
+/// own loop and any task it spawns that needs to write onto `control` too
+/// (e.g. [`spawn_file_transfer`] reporting a `FileTransferError`, DR-038):
+/// `quinn::SendStream` has exactly one owner, so concurrent writers need a
+/// lock rather than each holding their own `&mut` to it. Locked only for
+/// the duration of one `write_envelope` call, never held across an
+/// `.await` that waits on the peer.
+type SharedControlSend = Arc<Mutex<quinn::SendStream>>;
 
-/// Shared, admin-triggered permission command for the one connected
-/// client this PoC server handles interactively (stdin `revoke-view` /
-/// `grant-view`). `None` once consumed by the connection's own loop.
-type PermissionCommand = Arc<Mutex<Option<bool>>>; // Some(true)=grant VIEW, Some(false)=revoke VIEW
+async fn write_control(
+    control_send: &SharedControlSend,
+    type_raw: u16,
+    payload: &[u8],
+) -> Result<(), quinn::WriteError> {
+    let mut send = control_send.lock().await;
+    write_envelope(&mut send, type_raw, payload).await
+}
 
 #[tokio::main]
 async fn main() {
@@ -289,8 +254,13 @@ async fn main() {
     eprintln!("sardp-server listening on {local_addr}");
 
     let shutdown = Arc::new(Notify::new());
-    let permission_command: PermissionCommand = Arc::new(Mutex::new(None));
+    let permission_command: PermissionCommand = Arc::new(Mutex::new(Vec::new()));
     let state = Arc::new(ServerState::default());
+    // KNOWN_ISSUES.md #3: actively reclaims file_handles nobody ever opened
+    // the `file` stream for, rather than relying solely on `validate`'s
+    // passive expiry check. Runs for the server's whole lifetime; nothing
+    // needs to join it.
+    let _reaper = state.file_handles.spawn_reaper(FILE_HANDLE_REAP_INTERVAL);
 
     // stdin admin command reader (Part 4's minimal live-trigger).
     {
@@ -303,18 +273,16 @@ async fn main() {
                     _ = shutdown.notified() => return,
                     line = lines.next_line() => {
                         match line {
-                            Ok(Some(line)) => match line.trim() {
-                                "revoke-view" => {
-                                    *permission_command.lock().await = Some(false);
-                                    eprintln!("(admin) queued: revoke VIEW");
+                            Ok(Some(line)) => {
+                                if line.trim().is_empty() {
+                                    // nothing typed, just Enter
+                                } else if let Some(command) = permission_sm::parse_admin_command(&line) {
+                                    eprintln!("(admin) queued: {command:?}");
+                                    permission_command.lock().await.push(command);
+                                } else {
+                                    eprintln!("(admin) unknown command: {line:?} (--help lists the recognized ones)");
                                 }
-                                "grant-view" => {
-                                    *permission_command.lock().await = Some(true);
-                                    eprintln!("(admin) queued: grant VIEW");
-                                }
-                                "" => {}
-                                other => eprintln!("(admin) unknown command: {other:?} (try revoke-view / grant-view)"),
-                            },
+                            }
                             _ => return,
                         }
                     }
@@ -410,16 +378,19 @@ async fn shutdown_signal() {
 /// an unconditional sleep.
 async fn close_gracefully(
     connection: &quinn::Connection,
-    send: &mut quinn::SendStream,
+    control_send: &SharedControlSend,
     reason: ReasonCode,
 ) {
-    let _ = write_envelope(
-        send,
-        messages::type_id::SESSION_CLOSE,
-        &messages::encode(&SessionClose { reason }),
-    )
-    .await;
-    let _ = send.finish();
+    {
+        let mut send = control_send.lock().await;
+        let _ = write_envelope(
+            &mut send,
+            messages::type_id::SESSION_CLOSE,
+            &messages::encode(&SessionClose { reason }),
+        )
+        .await;
+        let _ = send.finish();
+    }
     tokio::time::sleep(timeouts::CLOSING_GRACE_PERIOD).await;
     connection.close(0u32.into(), b"session closed");
 }
@@ -440,76 +411,37 @@ async fn handle_connection(
 
     // Spec 4.6: a new connection's first control message is either a fresh
     // `ClientHello` or a `SessionReauthenticate` resuming a `Suspended`
-    // session.
-    let (send, reader, first_message) =
-        reconnection::read_first_control_message(&connection, timeouts::HANDSHAKE_TIMEOUT).await?;
-    let (
-        mut connection_sm,
-        mut control,
-        session_id,
-        user_id,
-        reconnect_token,
-        granted_permissions,
-        starting_generation,
-        is_resumed,
-    ) = match first_message {
-        FirstControlMessage::ClientHello(client_hello_bytes) => {
-            let (outcome, connection_sm, control) =
-                sardp::handshake::server_handshake_from_client_hello(
-                    send,
-                    reader,
-                    client_hello_bytes,
-                    &connection,
-                    server_name,
-                    trusted_pubkey,
-                    timeouts::HANDSHAKE_TIMEOUT,
-                    timeouts::AUTH_TIMEOUT,
-                )
-                .await?;
-            eprintln!(
-                "[{peer}] authenticated (fresh handshake), session_id={:x?}, user_id={:?}",
-                outcome.session_id, outcome.user_id
-            );
-            (
-                connection_sm,
-                control,
-                outcome.session_id,
-                outcome.user_id,
-                outcome.reconnect_token,
-                outcome.granted_permissions,
-                0u64,
-                false,
-            )
-        }
-        FirstControlMessage::SessionReauthenticate(reauth) => {
-            match reconnection::server_complete_reconnect(send, reader, &reauth, &state.sessions)
-                .await
-            {
-                Ok((outcome, connection_sm, control)) => {
-                    eprintln!(
-                        "[{peer}] reconnected, session_id={:x?}, user_id={:?}, resuming at generation {}",
-                        outcome.session_id, outcome.user_id, outcome.resumed_generation
-                    );
-                    (
-                        connection_sm,
-                        control,
-                        outcome.session_id,
-                        outcome.user_id,
-                        outcome.reconnect_token,
-                        outcome.granted_permissions,
-                        outcome.resumed_generation,
-                        true,
-                    )
-                }
-                Err(e) => {
-                    eprintln!("[{peer}] reconnect rejected: {:?}", e.reason_code());
-                    return Ok(());
-                }
-            }
+    // session; `establish_connection` dispatches between the two and
+    // drives whichever applies to the Active-state threshold.
+    let outcome = reconnection::establish_connection(
+        &connection,
+        server_name,
+        trusted_pubkey,
+        &state.sessions,
+        timeouts::HANDSHAKE_TIMEOUT,
+        timeouts::AUTH_TIMEOUT,
+    )
+    .await?;
+    let mut ctx = match outcome {
+        EstablishOutcome::Established(ctx) => ctx,
+        EstablishOutcome::ReconnectRejected(reason) => {
+            eprintln!("[{peer}] reconnect rejected: {reason:?}");
+            return Ok(());
         }
     };
+    if ctx.is_resumed {
+        eprintln!(
+            "[{peer}] reconnected, session_id={:x?}, user_id={:?}, resuming at generation {}",
+            ctx.session_id, ctx.user_id, ctx.starting_generation
+        );
+    } else {
+        eprintln!(
+            "[{peer}] authenticated (fresh handshake), session_id={:x?}, user_id={:?}",
+            ctx.session_id, ctx.user_id
+        );
+    }
 
-    sardp::timesync::server_respond_time_sync(&mut control).await?;
+    sardp::timesync::server_respond_time_sync(&mut ctx.control).await?;
 
     let encoder_config = EncoderConfig {
         codec: Codec::H264,
@@ -524,12 +456,12 @@ async fn handle_connection(
         server_cursor_excludable: false,
     };
 
-    let mut video_channel = VideoChannel::new(starting_generation);
+    let mut video_channel = VideoChannel::new(ctx.starting_generation);
     let video_send = tokio::time::timeout(
         timeouts::SESSION_SETUP_TIMEOUT,
         open_generation(
             &connection,
-            starting_generation,
+            ctx.starting_generation,
             0,
             encoder_config,
             width,
@@ -539,23 +471,33 @@ async fn handle_connection(
     .await
     .map_err(|_elapsed| ConnError::Violation(ReasonCode::PROTOCOL_SESSION_SETUP_TIMEOUT))??;
     video_channel.mark_instance_streaming()?;
-    if !is_resumed {
+    if !ctx.is_resumed {
         // A resumed connection_sm is already `Active` (spec 4.6:
         // `resume()` skips straight there); only a fresh handshake needs
         // this Authenticated -> Active transition.
-        connection_sm.on_channel_live()?;
+        ctx.connection_sm.on_channel_live()?;
     }
     eprintln!(
         "[{peer}] video channel Live, connection {:?}",
-        connection_sm.state()
+        ctx.connection_sm.state()
     );
 
     let feedback_receiver = FeedbackReceiver::accept(&connection).await?;
-    let permission_sm = PermissionSm::new(granted_permissions);
+    let permission_sm = PermissionSm::new(ctx.granted_permissions);
+
+    // Split into a shared, lockable send half (spawned per-transfer tasks
+    // need to write FileTransferError onto control too, DR-038) and the
+    // read half this loop keeps exclusively.
+    let ControlChannel {
+        send: control_send,
+        reader: mut control_reader,
+    } = ctx.control;
+    let control_send: SharedControlSend = Arc::new(Mutex::new(control_send));
 
     let result = run_active_session(
         &connection,
-        &mut control,
+        &control_send,
+        &mut control_reader,
         &mut video_channel,
         video_send,
         feedback_receiver,
@@ -567,10 +509,10 @@ async fn handle_connection(
         peer,
         &shutdown,
         &permission_command,
-        granted_permissions,
+        ctx.granted_permissions,
         &state,
-        session_id,
-        &user_id,
+        ctx.session_id,
+        &ctx.user_id,
     )
     .await;
 
@@ -580,11 +522,11 @@ async fn handle_connection(
             eprintln!("[{peer}] connection lost unexpectedly ({e:?}); suspending session");
             suspend_and_store(
                 &state,
-                session_id,
-                user_id,
-                connection_sm,
-                reconnect_token,
-                granted_permissions,
+                ctx.session_id,
+                ctx.user_id,
+                ctx.connection_sm,
+                ctx.reconnect_token,
+                ctx.granted_permissions,
                 video_channel.generation(),
                 peer,
             )
@@ -593,83 +535,34 @@ async fn handle_connection(
     }
 }
 
-/// Whether `error` represents the underlying QUIC transport actually going
-/// away (peer killed, network partition, timed out, ...) rather than a
-/// protocol violation this server itself detected. Spec 4.1's diagram only
-/// lists `IDLE_TIMEOUT` as an explicit `Active -> Suspended` trigger
-/// (`run_active_session` handles that one inline), but a real abrupt
-/// disconnect -- the scenario "kill the client, then reconnect" actually
-/// exercises -- surfaces here as exactly this kind of transport error, in
-/// practice well before `IDLE_TIMEOUT` would otherwise fire. Treating it
-/// the same way (`Suspended`, reconnectable) rather than a hard failure is
-/// what makes reconnection reachable from a real disconnect, matching how
-/// `tests/phase1_reconnection.rs` already frames a "genuinely lost"
-/// connection at the library level.
-fn is_transport_disconnect(error: &ConnError) -> bool {
-    fn is_read_disconnect(e: &StreamReadError) -> bool {
-        matches!(e, StreamReadError::Read(_) | StreamReadError::ClosedEarly)
-    }
-    match error {
-        ConnError::IdleTimeout => true,
-        ConnError::Quic(_) | ConnError::Write(_) => true,
-        ConnError::Read(e) => is_read_disconnect(e),
-        ConnError::Feedback(ReadFeedbackError::Quic(_)) => true,
-        ConnError::Feedback(ReadFeedbackError::Read(e)) => is_read_disconnect(e),
-        // The video stream (frame send, and the backpressure reopen path)
-        // wraps its own transport errors in VideoError rather than
-        // ConnError directly -- caught by manual testing: a real `kill -9`
-        // surfaces here (mid frame-send) well before any control-stream
-        // read notices anything wrong.
-        ConnError::Video(VideoError::Quic(_) | VideoError::Write(_)) => true,
-        ConnError::Video(VideoError::Read(e)) => is_read_disconnect(e),
-        _ => false,
-    }
-}
-
 /// Transitions `connection_sm` `Active -> Suspended` and registers the
 /// session in `state.sessions` so a new connection presenting
 /// `reconnect_token` can resume it within `RECONNECT_GRACE_PERIOD` (spec
-/// 4.6). Spawns a task that expires the entry if nobody reconnects in time
-/// (a no-op if a reconnect already consumed it first --
-/// `SessionStore::expire` is safe to call unconditionally).
+/// 4.6), via [`SessionStore::suspend_and_schedule_expiry`].
 #[allow(clippy::too_many_arguments)]
 fn suspend_and_store(
     state: &Arc<ServerState>,
     session_id: [u8; 16],
     user_id: String,
-    mut connection_sm: ConnectionSm,
+    connection_sm: sardp::ConnectionSm,
     reconnect_token: [u8; 32],
     granted_permissions: u32,
     last_generation: u64,
     peer: SocketAddr,
 ) -> Result<(), ConnError> {
-    connection_sm.suspend()?;
-    state.sessions.suspend(
+    state.sessions.suspend_and_schedule_expiry(
         session_id,
-        SuspendedSession {
-            reconnect_token,
-            connection_sm,
-            granted_permissions,
-            last_generation,
-            user_id,
-        },
-    );
+        user_id,
+        connection_sm,
+        reconnect_token,
+        granted_permissions,
+        last_generation,
+        timeouts::RECONNECT_GRACE_PERIOD,
+    )?;
     eprintln!(
         "[{peer}] session {session_id:x?} suspended, reconnectable for {:?}",
         timeouts::RECONNECT_GRACE_PERIOD
     );
-
-    // expire_if_token_matches, not expire: if this session is reconnected
-    // and then suspended again before this timer fires, a plain
-    // unconditional expire(session_id) would remove that *later* suspend
-    // episode instead of the one this timer was actually armed for.
-    let state = state.clone();
-    tokio::spawn(async move {
-        tokio::time::sleep(timeouts::RECONNECT_GRACE_PERIOD).await;
-        state
-            .sessions
-            .expire_if_token_matches(session_id, reconnect_token);
-    });
     Ok(())
 }
 
@@ -682,7 +575,8 @@ fn suspend_and_store(
 #[allow(clippy::too_many_arguments)]
 async fn run_active_session(
     connection: &quinn::Connection,
-    control: &mut ControlChannel,
+    control_send: &SharedControlSend,
+    control_reader: &mut EnvelopeReader,
     video_channel: &mut VideoChannel,
     mut video_send: quinn::SendStream,
     mut feedback_receiver: FeedbackReceiver,
@@ -705,13 +599,35 @@ async fn run_active_session(
     let mut frame_id = 1u64;
     let mut last_activity = tokio::time::Instant::now();
 
+    // KNOWN_ISSUES.md #12: audio_playback (server -> client), gated live on
+    // AUDIO_PLAYBACK the same way video frame send is gated on VIEW.
+    // Lazily opened on the first tick it's granted, rather than
+    // unconditionally at session start, since a fresh handshake doesn't
+    // grant it by default (see `handshake.rs`'s doc comment on
+    // `granted_permissions`).
+    let audio_config = AudioConfig {
+        codec: AudioCodec::Opus,
+        sample_rate: 48_000,
+        channels: 1,
+        frame_duration_ms: 20,
+    };
+    let audio_samples_per_frame = (u64::from(audio_config.sample_rate)
+        * u64::from(audio_config.frame_duration_ms)
+        / 1000) as usize;
+    let mut audio_interval = tokio::time::interval(Duration::from_millis(u64::from(
+        audio_config.frame_duration_ms,
+    )));
+    audio_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut audio_playback_send: Option<quinn::SendStream> = None;
+    let mut audio_sequence = 0u64;
+
     loop {
         let idle_deadline = last_activity + timeouts::IDLE_TIMEOUT;
         tokio::select! {
             biased;
             () = shutdown.notified() => {
                 eprintln!("[{peer}] server shutting down, closing session");
-                close_gracefully(connection, &mut control.send, ReasonCode::NONE).await;
+                close_gracefully(connection, control_send, ReasonCode::NONE).await;
                 return Ok(());
             }
             () = tokio::time::sleep_until(idle_deadline) => {
@@ -724,7 +640,7 @@ async fn run_active_session(
                 eprintln!("[{peer}] IDLE_TIMEOUT ({:?} since last activity)", timeouts::IDLE_TIMEOUT);
                 return Err(ConnError::IdleTimeout);
             }
-            control_msg = control.reader.read_envelope(sardp::StreamKind::Control.max_envelope_length()) => {
+            control_msg = control_reader.read_envelope(sardp::StreamKind::Control.max_envelope_length()) => {
                 let (type_raw, payload) = control_msg?;
                 last_activity = tokio::time::Instant::now();
                 if type_raw == messages::type_id::SESSION_CLOSE {
@@ -741,21 +657,13 @@ async fn run_active_session(
                     // waiting on in-progress operations to finish) both
                     // block starting a *new* one, same as the VIEW gate
                     // below for frame sending.
-                    let required_bit = match request.direction {
-                        FileTransferDirection::Upload => bit::FILE_UP,
-                        FileTransferDirection::Download => bit::FILE_DOWN,
-                    };
-                    if !permission_sm.is_granted(required_bit) {
-                        let reason = if permission_sm.state(required_bit) == BitState::Draining {
-                            ReasonCode::POLICY_PERMISSION_REVOKED
-                        } else {
-                            ReasonCode::POLICY_PERMISSION_DENIED
-                        };
+                    let required_bit = file_transfer::required_permission_bit(request.direction);
+                    if let Err(reason) = permission_sm.check_gate(required_bit) {
                         let reject = FileTransferReject {
                             request_id: request.request_id,
                             reason,
                         };
-                        write_envelope(&mut control.send, messages::type_id::FILE_TRANSFER_REJECT, &messages::encode(&reject)).await?;
+                        write_control(control_send, messages::type_id::FILE_TRANSFER_REJECT, &messages::encode(&reject)).await?;
                         eprintln!(
                             "[{peer}] rejected FileTransferRequest ({:?}): permission not granted ({reason:?})",
                             request.direction
@@ -763,9 +671,26 @@ async fn run_active_session(
                         continue;
                     }
 
-                    let (file_handle, expiry_ts) = state.file_handles.issue(
-                        session_id, user_id.to_string(), request.direction, request.declared_size, FILE_HANDLE_TTL,
-                    );
+                    let Some((file_handle, expiry_ts)) = state.file_handles.try_issue(
+                        session_id, user_id.to_string(), request.direction, request.declared_size,
+                        FILE_HANDLE_TTL, MAX_CONCURRENT_FILE_TRANSFERS,
+                    ) else {
+                        // KNOWN_ISSUES.md #3: refuse rather than growing
+                        // file_handles without bound. Spec 2.6 has no
+                        // dedicated "server busy" code for file transfer;
+                        // POLICY_FILE_POLICY_REJECTED is the closest fit
+                        // among the defined ReasonCode table (spec 4.8.1).
+                        let reject = FileTransferReject {
+                            request_id: request.request_id,
+                            reason: ReasonCode::POLICY_FILE_POLICY_REJECTED,
+                        };
+                        write_control(control_send, messages::type_id::FILE_TRANSFER_REJECT, &messages::encode(&reject)).await?;
+                        eprintln!(
+                            "[{peer}] rejected FileTransferRequest ({:?}): at the concurrent transfer limit ({MAX_CONCURRENT_FILE_TRANSFERS})",
+                            request.direction
+                        );
+                        continue;
+                    };
                     let accept = FileTransferAccept {
                         request_id: request.request_id,
                         file_handle,
@@ -776,12 +701,12 @@ async fn run_active_session(
                         resolved_size: request.declared_size,
                         expiry_ts,
                     };
-                    write_envelope(&mut control.send, messages::type_id::FILE_TRANSFER_ACCEPT, &messages::encode(&accept)).await?;
+                    write_control(control_send, messages::type_id::FILE_TRANSFER_ACCEPT, &messages::encode(&accept)).await?;
                     eprintln!(
                         "[{peer}] issued file_handle {file_handle:#x} for {:?} of {:?} ({} bytes)",
                         request.direction, request.virtual_path, request.declared_size
                     );
-                    spawn_file_transfer(connection.clone(), state.clone(), session_id, user_id.to_string(), request, file_handle, peer);
+                    spawn_file_transfer(connection.clone(), control_send.clone(), state.clone(), session_id, user_id.to_string(), request, file_handle, peer);
                     continue;
                 }
                 // Other control-stream message types aren't produced by
@@ -791,22 +716,32 @@ async fn run_active_session(
                 // hasn't implemented on purpose).
             }
             _ = keepalive_interval.tick() => {
-                write_envelope(&mut control.send, messages::type_id::KEEP_ALIVE, &messages::encode(&messages::KeepAlive {})).await?;
+                write_control(control_send, messages::type_id::KEEP_ALIVE, &messages::encode(&messages::KeepAlive {})).await?;
             }
             _ = frame_interval.tick() => {
-                let mut command = permission_command.lock().await;
-                if let Some(grant) = command.take() {
-                    let other_bits = granted_permissions & !bit::VIEW;
-                    let view_bit = if grant { bit::VIEW } else { 0 };
-                    let update = PermissionUpdate {
-                        granted_permissions: view_bit | other_bits,
-                        immediate_revoke: if grant { 0 } else { bit::VIEW },
-                    };
-                    permission_sm.apply_update(&update);
-                    write_envelope(&mut control.send, messages::type_id::PERMISSION_UPDATE, &messages::encode(&update)).await?;
-                    eprintln!("[{peer}] VIEW is now {}", if grant { "granted" } else { "revoked" });
+                let mut commands = permission_command.lock().await;
+                for admin_command in commands.drain(..) {
+                    match admin_command {
+                        permission_sm::AdminCommand::TogglePermission { bit: toggled_bit, grant } => {
+                            let update = permission_sm::build_permission_toggle(granted_permissions, toggled_bit, grant);
+                            permission_sm.apply_update(&update);
+                            write_control(control_send, messages::type_id::PERMISSION_UPDATE, &messages::encode(&update)).await?;
+                            eprintln!(
+                                "[{peer}] {} is now {}",
+                                permission_bit_name(toggled_bit),
+                                if grant { "granted" } else { "revoked" }
+                            );
+                        }
+                        permission_sm::AdminCommand::SendClipboard => {
+                            if let Err(reason) = permission_sm.check_gate(bit::CLIP_READ) {
+                                eprintln!("[{peer}] cannot send clipboard: CLIP_READ not granted ({reason:?})");
+                            } else {
+                                spawn_clipboard_announce(connection.clone(), peer);
+                            }
+                        }
+                    }
                 }
-                drop(command);
+                drop(commands);
 
                 if !permission_sm.is_granted(bit::VIEW) {
                     continue;
@@ -849,20 +784,161 @@ async fn run_active_session(
                     }
                 }
             }
+            _ = audio_interval.tick() => {
+                if permission_sm.is_granted(bit::AUDIO_PLAYBACK) {
+                    if audio_playback_send.is_none() {
+                        let send = audio_session::open_audio_stream(connection, StreamKind::AudioPlayback, &audio_config).await?;
+                        eprintln!("[{peer}] opened audio_playback stream");
+                        audio_playback_send = Some(send);
+                    }
+                    let send = audio_playback_send.as_mut().expect("just ensured Some above");
+                    let capture_ts = clock::now_us();
+                    let payload = audio_session::generate_sine_wave_payload(audio_samples_per_frame, audio_config.sample_rate, 440.0);
+                    let duration_us = u32::from(audio_config.frame_duration_ms) * 1000;
+                    audio_session::send_audio_frame(send, audio_sequence, capture_ts, duration_us, &payload).await?;
+                    audio_sequence += 1;
+                }
+            }
+            accept_result = audio_session::accept_audio_capture_gated(connection, permission_sm.is_granted(bit::AUDIO_CAPTURE)) => {
+                match accept_result? {
+                    Some((_config, mut frame_reader)) => {
+                        eprintln!("[{peer}] accepted audio_capture stream");
+                        tokio::spawn(async move {
+                            loop {
+                                match frame_reader.read_next_frame().await {
+                                    Ok((header, payload)) => {
+                                        eprintln!("[{peer}] audio_capture frame sequence={} bytes={}", header.sequence, payload.len());
+                                    }
+                                    Err(e) => {
+                                        eprintln!("[{peer}] audio_capture stream ended: {e:?}");
+                                        return;
+                                    }
+                                }
+                            }
+                        });
+                    }
+                    None => {
+                        eprintln!("[{peer}] refused audio_capture stream: AUDIO_CAPTURE not granted");
+                    }
+                }
+            }
+            accept_result = clipboard_session::accept_clipboard_formats(connection) => {
+                // CLIP_WRITE (client -> server announce): safe to accept
+                // here now that `file` is unidirectional (DR-038) and no
+                // longer touches `accept_bi()` -- this is the only
+                // `accept_bi()` caller left on the server, so there's
+                // nothing left to race with (KNOWN_ISSUES.md).
+                let (mut send, mut reader, formats) = accept_result?;
+                if !permission_sm.is_granted(bit::CLIP_WRITE) {
+                    // Spec 2.7 doesn't define a way to refuse an announce
+                    // outright; simply never requesting anything is
+                    // already a valid response to `ClipboardFormats`.
+                    eprintln!("[{peer}] received clipboard formats but CLIP_WRITE not granted; ignoring");
+                    continue;
+                }
+                let request_id = formats.request_id;
+                let Some(first_format) = formats.formats.into_iter().next() else {
+                    eprintln!("[{peer}] received ClipboardFormats with no formats, nothing to request");
+                    continue;
+                };
+                eprintln!(
+                    "[{peer}] received clipboard formats, requesting {:?}/{}",
+                    first_format.namespace, first_format.format_id
+                );
+                tokio::spawn(async move {
+                    let request = messages::ClipboardRequest {
+                        request_id,
+                        namespace: first_format.namespace,
+                        format_id: first_format.format_id,
+                    };
+                    match clipboard_session::request_clipboard_data(&mut send, &mut reader, &request).await {
+                        Ok(Ok(data)) => eprintln!("[{peer}] clipboard data received: {} bytes", data.data.len()),
+                        Ok(Err(error)) => eprintln!("[{peer}] clipboard request rejected: {:?}", error.reason),
+                        Err(e) => eprintln!("[{peer}] clipboard request failed: {e:?}"),
+                    }
+                });
+            }
         }
     }
 }
 
-/// Spawns a task that accepts the `file` stream this connection's peer is
-/// expected to open for `file_handle` (spec 2.6: whichever side
-/// `request.direction` names as the sender), verifies its ownership
-/// against `state.file_handles` (DR-037), and drives the (in-memory
-/// pseudo-data) transfer to completion. Runs independently of
+/// A human-readable name for one of this server's admin-togglable
+/// `PermissionSet` bits, for the stdin admin log line -- falls back to the
+/// raw bitmask for anything not in that list (there shouldn't be any,
+/// since `permission_sm::parse_admin_command` is the only source of these
+/// values).
+fn permission_bit_name(toggled_bit: u32) -> String {
+    match toggled_bit {
+        b if b == bit::VIEW => "VIEW".to_string(),
+        b if b == bit::CLIP_READ => "CLIP_READ".to_string(),
+        b if b == bit::CLIP_WRITE => "CLIP_WRITE".to_string(),
+        b if b == bit::AUDIO_PLAYBACK => "AUDIO_PLAYBACK".to_string(),
+        b if b == bit::AUDIO_CAPTURE => "AUDIO_CAPTURE".to_string(),
+        other => format!("permission bit {other:#x}"),
+    }
+}
+
+/// Spawns a task that announces synthetic clipboard content (spec 2.7,
+/// KNOWN_ISSUES.md #12) to whichever peer is on `connection` -- triggered
+/// by the `send-clipboard` admin command -- and, if a `ClipboardRequest`
+/// for it arrives, responds with fixed pseudo text. Independent of
+/// `run_active_session`'s own select loop for the same reason
+/// `spawn_file_transfer` is: `read_clipboard_request` blocks until the
+/// peer actually asks, which must not stall video/control/keepalive on
+/// the same connection. This is the `CLIP_READ` (server-announces)
+/// direction; see `run_active_session`'s own `accept_clipboard_formats`
+/// arm for the reverse (`CLIP_WRITE`, client-announces) direction.
+fn spawn_clipboard_announce(connection: quinn::Connection, peer: SocketAddr) {
+    tokio::spawn(async move {
+        let formats = ClipboardFormats {
+            request_id: 1,
+            formats: vec![ClipboardFormatEntry {
+                namespace: FormatNamespace::Mime,
+                format_id: "text/plain".to_string(),
+            }],
+        };
+        let (mut send, mut reader) =
+            match clipboard_session::announce_clipboard_formats(&connection, &formats).await {
+                Ok(pair) => pair,
+                Err(e) => {
+                    eprintln!("[{peer}] failed to announce clipboard formats: {e:?}");
+                    return;
+                }
+            };
+        match clipboard_session::read_clipboard_request(&mut reader).await {
+            Ok(request) => {
+                let pseudo_data = b"hello from sardp-server's synthetic clipboard".to_vec();
+                let request_id = request.request_id;
+                let result = clipboard_session::respond_to_clipboard_request(
+                    &mut send,
+                    request.request_id,
+                    request.namespace,
+                    request.format_id,
+                    pseudo_data,
+                    None,
+                )
+                .await;
+                match result {
+                    Ok(()) => eprintln!("[{peer}] responded to ClipboardRequest {request_id}"),
+                    Err(e) => eprintln!("[{peer}] failed to respond to ClipboardRequest: {e:?}"),
+                }
+            }
+            Err(e) => {
+                eprintln!("[{peer}] clipboard announce: never received a ClipboardRequest ({e:?})");
+            }
+        }
+    });
+}
+
+/// Spawns a task that drives `request`'s transfer via
+/// [`file_transfer::run_file_transfer`] to completion, independently of
 /// `handle_connection`'s own select loop so a slow or stalled transfer
 /// doesn't block keepalives, video frames, or control messages on the same
 /// connection.
+#[allow(clippy::too_many_arguments)]
 fn spawn_file_transfer(
     connection: quinn::Connection,
+    control_send: SharedControlSend,
     state: Arc<ServerState>,
     session_id: [u8; 16],
     user_id: String,
@@ -871,43 +947,40 @@ fn spawn_file_transfer(
     peer: SocketAddr,
 ) {
     tokio::spawn(async move {
-        let accepted = file_transfer::accept_file_stream_verified(
+        match file_transfer::run_file_transfer(
             &connection,
             &state.file_handles,
             session_id,
             &user_id,
-            request.direction,
+            &request,
+            file_handle,
         )
-        .await;
-        match accepted {
-            Ok((mut send, mut reader, handle)) => {
-                let result = match request.direction {
-                    FileTransferDirection::Upload => file_transfer::receive_file(
-                        &mut send,
-                        &mut reader,
-                        handle,
-                        request.declared_size,
-                    )
-                    .await
-                    .map(|_outcome| ()),
-                    FileTransferDirection::Download => {
-                        // No real filesystem in this PoC: fixed pseudo
-                        // content, capped so a client-declared huge size
-                        // doesn't allocate unbounded memory.
-                        let pseudo_size = request.declared_size.min(1024 * 1024) as usize;
-                        let pseudo_data = vec![0xABu8; pseudo_size];
-                        file_transfer::send_file_data(&mut send, &pseudo_data, 64 * 1024)
-                            .await
-                            .map_err(FileTransferSessionError::Write)
+        .await
+        {
+            Ok(file_transfer::FileTransferOutcome::Done) => {
+                eprintln!("[{peer}] file transfer for handle {file_handle:#x} completed");
+            }
+            Ok(file_transfer::FileTransferOutcome::ReportError(error)) => {
+                // DR-038: FileTransferError travels on `control`, not
+                // `file` -- `run_file_transfer` only detected it.
+                let result = write_control(
+                    &control_send,
+                    messages::type_id::FILE_TRANSFER_ERROR,
+                    &messages::encode(&error),
+                )
+                .await;
+                eprintln!(
+                    "[{peer}] file transfer for handle {file_handle:#x} ended with {:?}{}",
+                    error.reason,
+                    if let Err(e) = result {
+                        format!(" (failed to report it on control: {e:?})")
+                    } else {
+                        String::new()
                     }
-                };
-                if let Err(e) = result {
-                    eprintln!("[{peer}] file transfer {handle:#x} ended with an error: {e:?}");
-                }
-                state.file_handles.remove(handle);
+                );
             }
             Err(e) => {
-                eprintln!("[{peer}] file stream for handle {file_handle:#x} rejected: {e:?}");
+                eprintln!("[{peer}] file transfer for handle {file_handle:#x} failed: {e:?}");
             }
         }
     });

@@ -275,9 +275,13 @@ pub async fn server_handshake_with_timeouts(
     let (send, recv) = connection.accept_bi().await.map_err(HandshakeError::Quic)?;
     let mut reader = EnvelopeReader::new(recv);
 
-    // Spec 4.7 HANDSHAKE_TIMEOUT (10s): bounds waiting for ClientHello,
-    // same phase boundary as the client side.
-    let client_hello_bytes = tokio::time::timeout(handshake_timeout, async {
+    // Spec 4.7 HANDSHAKE_TIMEOUT (10s): a single budget for waiting on
+    // ClientHello *and* sending ServerHello together, computed into one
+    // deadline here and shared with `server_handshake_from_client_hello`
+    // below rather than each phase independently getting its own fresh
+    // 10s window (KNOWN_ISSUES.md #6).
+    let handshake_deadline = tokio::time::Instant::now() + handshake_timeout;
+    let client_hello_bytes = tokio::time::timeout_at(handshake_deadline, async {
         let stream_prologue = reader.read_prologue().await?;
         if stream_prologue.kind != StreamKind::Control {
             // Spec 2.2.1: "未認証状態でcontrol以外のストリームが開かれたら即切断".
@@ -301,7 +305,7 @@ pub async fn server_handshake_with_timeouts(
         connection,
         server_name,
         trusted_public_key,
-        handshake_timeout,
+        handshake_deadline,
         auth_timeout,
     )
     .await
@@ -314,13 +318,16 @@ pub async fn server_handshake_with_timeouts(
 /// a fresh `ClientHello` apart from a `SessionReauthenticate` before
 /// deciding which of the two paths (this one, or
 /// [`crate::reconnection::server_complete_reconnect`]) to hand the stream
-/// to. Sends `ServerHello`, verifies `AuthPubkey`, sends `AuthResult`;
-/// `handshake_timeout`/`auth_timeout` bound the two remaining phases (spec
-/// 4.7) -- note this means the dispatcher's own read of `ClientHello` and
-/// this function's send of `ServerHello` are each bounded by
-/// `handshake_timeout` independently rather than sharing one combined
-/// budget, a minor simplification versus [`server_handshake_with_timeouts`]
-/// calling this directly (which pays the same two separate windows).
+/// to. Sends `ServerHello`, verifies `AuthPubkey`, sends `AuthResult`.
+///
+/// `handshake_deadline` is the same spec 4.7 `HANDSHAKE_TIMEOUT` deadline
+/// the caller already bounded its own `ClientHello` wait by (see
+/// [`server_handshake_with_timeouts`] and
+/// [`crate::reconnection::establish_connection`]) -- passed through here
+/// rather than a fresh duration, so the two phases share one combined
+/// budget instead of each independently getting a full window
+/// (KNOWN_ISSUES.md #6). `auth_timeout` bounds the separate
+/// `AuthPubkey`/`AuthResult` round trip as before.
 #[allow(clippy::too_many_arguments)]
 pub async fn server_handshake_from_client_hello(
     mut send: quinn::SendStream,
@@ -329,13 +336,13 @@ pub async fn server_handshake_from_client_hello(
     connection: &quinn::Connection,
     server_name: &str,
     trusted_public_key: &VerifyingKey,
-    handshake_timeout: std::time::Duration,
+    handshake_deadline: tokio::time::Instant,
     auth_timeout: std::time::Duration,
 ) -> Result<(HandshakeOutcome, ConnectionSm, ControlChannel), HandshakeError> {
     let mut sm = ConnectionSm::new();
     check(&sm, messages::type_id::CLIENT_HELLO)?;
 
-    let (server_hello_bytes, auth_challenge) = tokio::time::timeout(handshake_timeout, async {
+    let (server_hello_bytes, auth_challenge) = tokio::time::timeout_at(handshake_deadline, async {
         let mut auth_challenge = [0u8; 32];
         rand::rng().fill_bytes(&mut auth_challenge);
 

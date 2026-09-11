@@ -13,11 +13,12 @@ use std::time::Duration;
 use ed25519_dalek::SigningKey;
 use sha2::{Digest, Sha256};
 
+use sardp::file_handle_store::FileHandleStore;
 use sardp::file_transfer_session::{
-    FileReassembly, FileTransferDecision, ReceiveOutcome, accept_file_stream, open_file_stream,
-    read_file_transfer_decision, read_file_transfer_request, receive_file_with_timeout,
-    send_file_chunk, send_file_data, send_file_transfer_accept, send_file_transfer_complete,
-    send_file_transfer_request,
+    FileReassembly, FileTransferDecision, FileTransferOutcome, ReceiveOutcome, accept_file_stream,
+    open_file_stream, read_file_transfer_decision, read_file_transfer_request,
+    receive_file_with_timeout, run_file_transfer, send_file_chunk, send_file_data,
+    send_file_transfer_accept, send_file_transfer_complete, send_file_transfer_request,
 };
 use sardp::handshake::{client_handshake, server_handshake};
 use sardp::messages::{
@@ -127,18 +128,12 @@ async fn upload_round_trips_end_to_end_with_checksum_verified() {
         open_file_stream(&client_connection, FILE_HANDLE),
         accept_file_stream(&server_connection, FILE_HANDLE),
     );
-    let (mut sender_send, _sender_reader) = open_result.expect("client opens file stream");
-    let (mut receiver_send, mut receiver_reader) =
-        accept_stream_result.expect("server accepts file stream");
+    let mut sender_send = open_result.expect("client opens file stream");
+    let mut receiver_reader = accept_stream_result.expect("server accepts file stream");
 
     let (send_result, receive_result) = tokio::join!(
         send_file_data(&mut sender_send, &data, 4),
-        sardp::file_transfer_session::receive_file(
-            &mut receiver_send,
-            &mut receiver_reader,
-            FILE_HANDLE,
-            11,
-        ),
+        sardp::file_transfer_session::receive_file(&mut receiver_reader, FILE_HANDLE, 11),
     );
     send_result.expect("client sends all chunks + FileTransferComplete");
     let outcome = receive_result.expect("server receives without a transport error");
@@ -152,27 +147,21 @@ async fn upload_round_trips_end_to_end_with_checksum_verified() {
 /// open under `FILE_HANDLE`, skipping the control-stream negotiation (it is
 /// already covered by the happy-path test above) so each error-path test can
 /// focus on the chunk sequence under test.
-async fn open_file_stream_pair() -> (
-    quinn::SendStream,
-    sardp::stream_reader::EnvelopeReader,
-    quinn::SendStream,
-    sardp::stream_reader::EnvelopeReader,
-) {
+async fn open_file_stream_pair() -> (quinn::SendStream, sardp::stream_reader::EnvelopeReader) {
     let (client_connection, _client_control, server_connection, _server_control) =
         handshake_pair().await;
     let (open_result, accept_result) = tokio::join!(
         open_file_stream(&client_connection, FILE_HANDLE),
         accept_file_stream(&server_connection, FILE_HANDLE),
     );
-    let (sender_send, sender_reader) = open_result.unwrap();
-    let (receiver_send, receiver_reader) = accept_result.unwrap();
-    (sender_send, sender_reader, receiver_send, receiver_reader)
+    let sender_send = open_result.unwrap();
+    let receiver_reader = accept_result.unwrap();
+    (sender_send, receiver_reader)
 }
 
 #[tokio::test]
 async fn overlapping_chunk_offsets_yield_file_chunk_overlap_error() {
-    let (mut sender_send, _sender_reader, mut receiver_send, mut receiver_reader) =
-        open_file_stream_pair().await;
+    let (mut sender_send, mut receiver_reader) = open_file_stream_pair().await;
 
     let (send_result, receive_result) = tokio::join!(
         async {
@@ -196,12 +185,7 @@ async fn overlapping_chunk_offsets_yield_file_chunk_overlap_error() {
             )
             .await
         },
-        sardp::file_transfer_session::receive_file(
-            &mut receiver_send,
-            &mut receiver_reader,
-            FILE_HANDLE,
-            6,
-        ),
+        sardp::file_transfer_session::receive_file(&mut receiver_reader, FILE_HANDLE, 6),
     );
     send_result.expect("client sends both chunks");
     let outcome =
@@ -217,8 +201,7 @@ async fn overlapping_chunk_offsets_yield_file_chunk_overlap_error() {
 
 #[tokio::test]
 async fn chunk_beyond_resolved_size_yields_file_chunk_out_of_range_error() {
-    let (mut sender_send, _sender_reader, mut receiver_send, mut receiver_reader) =
-        open_file_stream_pair().await;
+    let (mut sender_send, mut receiver_reader) = open_file_stream_pair().await;
 
     let oversized_chunk = FileChunk {
         offset: 2,
@@ -227,12 +210,7 @@ async fn chunk_beyond_resolved_size_yields_file_chunk_out_of_range_error() {
     };
     let (send_result, receive_result) = tokio::join!(
         send_file_chunk(&mut sender_send, &oversized_chunk),
-        sardp::file_transfer_session::receive_file(
-            &mut receiver_send,
-            &mut receiver_reader,
-            FILE_HANDLE,
-            4,
-        ),
+        sardp::file_transfer_session::receive_file(&mut receiver_reader, FILE_HANDLE, 4),
     );
     send_result.expect("client sends the oversized chunk");
     let outcome =
@@ -248,8 +226,7 @@ async fn chunk_beyond_resolved_size_yields_file_chunk_out_of_range_error() {
 
 #[tokio::test]
 async fn complete_with_a_gap_still_outstanding_yields_file_incomplete_transfer_error() {
-    let (mut sender_send, _sender_reader, mut receiver_send, mut receiver_reader) =
-        open_file_stream_pair().await;
+    let (mut sender_send, mut receiver_reader) = open_file_stream_pair().await;
 
     let (send_result, receive_result) = tokio::join!(
         async {
@@ -273,12 +250,7 @@ async fn complete_with_a_gap_still_outstanding_yields_file_incomplete_transfer_e
             )
             .await
         },
-        sardp::file_transfer_session::receive_file(
-            &mut receiver_send,
-            &mut receiver_reader,
-            FILE_HANDLE,
-            6,
-        ),
+        sardp::file_transfer_session::receive_file(&mut receiver_reader, FILE_HANDLE, 6),
     );
     send_result.expect("client sends the partial chunk + Complete");
     let outcome =
@@ -294,8 +266,7 @@ async fn complete_with_a_gap_still_outstanding_yields_file_incomplete_transfer_e
 
 #[tokio::test]
 async fn wrong_checksum_yields_file_checksum_mismatch_error() {
-    let (mut sender_send, _sender_reader, mut receiver_send, mut receiver_reader) =
-        open_file_stream_pair().await;
+    let (mut sender_send, mut receiver_reader) = open_file_stream_pair().await;
 
     let (send_result, receive_result) = tokio::join!(
         async {
@@ -316,12 +287,7 @@ async fn wrong_checksum_yields_file_checksum_mismatch_error() {
             )
             .await
         },
-        sardp::file_transfer_session::receive_file(
-            &mut receiver_send,
-            &mut receiver_reader,
-            FILE_HANDLE,
-            6,
-        ),
+        sardp::file_transfer_session::receive_file(&mut receiver_reader, FILE_HANDLE, 6),
     );
     send_result.expect("client sends the full chunk + a wrong-checksum Complete");
     let outcome =
@@ -340,8 +306,7 @@ async fn wrong_checksum_yields_file_checksum_mismatch_error() {
 /// last message, the receiver treats the stream as stalled.
 #[tokio::test]
 async fn no_further_chunks_within_the_stall_timeout_yields_stall_timeout_error() {
-    let (mut sender_send, _sender_reader, mut receiver_send, mut receiver_reader) =
-        open_file_stream_pair().await;
+    let (mut sender_send, mut receiver_reader) = open_file_stream_pair().await;
 
     let first_chunk = FileChunk {
         offset: 0,
@@ -356,11 +321,10 @@ async fn no_further_chunks_within_the_stall_timeout_yields_stall_timeout_error()
     let (send_result, receive_result) = tokio::join!(
         send_file_chunk(&mut sender_send, &first_chunk),
         receive_file_with_timeout(
-            &mut receiver_send,
             &mut receiver_reader,
             FILE_HANDLE,
             6,
-            Duration::from_millis(50),
+            Duration::from_millis(50)
         ),
     );
     send_result.expect("client sends the one chunk");
@@ -372,6 +336,119 @@ async fn no_further_chunks_within_the_stall_timeout_yields_stall_timeout_error()
             assert_eq!(error.reason, ReasonCode::TRANSPORT_STREAM_STALL_TIMEOUT);
         }
         ReceiveOutcome::Complete(_) => panic!("expected FileTransferError, got Complete"),
+    }
+}
+
+/// DR-038: for a Download, the *sender* (here, the server) must open the
+/// `file` stream itself rather than accept one -- unlike the old
+/// bidirectional design, a unidirectional stream only lets its opener
+/// write, so an implementation that still had the server merely `accept`
+/// (as if the client always opened, regardless of direction) could never
+/// actually send the client anything.
+#[tokio::test]
+async fn run_file_transfer_download_direction_has_the_sender_open_the_stream() {
+    let (client_connection, server_connection) = connect_pair().await;
+    let store = FileHandleStore::new();
+    let session_id = [0x11; 16];
+    let (file_handle, _expiry_ts) = store.issue(
+        session_id,
+        "alice".into(),
+        FileTransferDirection::Download,
+        11,
+        Duration::from_secs(60),
+    );
+    let request = FileTransferRequest {
+        request_id: 1,
+        direction: FileTransferDirection::Download,
+        virtual_path: "/downloads/report.pdf".into(),
+        declared_size: 11,
+    };
+
+    let (server_result, client_result) = tokio::join!(
+        run_file_transfer(
+            &server_connection,
+            &store,
+            session_id,
+            "alice",
+            &request,
+            file_handle,
+        ),
+        async {
+            let mut reader = accept_file_stream(&client_connection, file_handle)
+                .await
+                .expect("client accepts the server-opened file stream");
+            sardp::file_transfer_session::receive_file(&mut reader, file_handle, 11).await
+        },
+    );
+    assert!(matches!(server_result, Ok(FileTransferOutcome::Done)));
+    match client_result.expect("client receives without a transport error") {
+        ReceiveOutcome::Complete(_) => {}
+        ReceiveOutcome::Error(error) => panic!("unexpected FileTransferError: {error:?}"),
+    }
+}
+
+/// DR-038: `run_file_transfer` no longer writes `FileTransferError` onto
+/// any stream itself (it has no `SendStream` for `file`, which is now
+/// unidirectional, and no access to `control` either) -- it surfaces a
+/// receiver-detected error as `FileTransferOutcome::ReportError` data,
+/// leaving the actual `control`-stream report to its caller.
+#[tokio::test]
+async fn run_file_transfer_upload_reports_a_receiver_detected_error_as_data() {
+    let (client_connection, server_connection) = connect_pair().await;
+    let store = FileHandleStore::new();
+    let session_id = [0x22; 16];
+    let (file_handle, _expiry_ts) = store.issue(
+        session_id,
+        "alice".into(),
+        FileTransferDirection::Upload,
+        6,
+        Duration::from_secs(60),
+    );
+    let request = FileTransferRequest {
+        request_id: 1,
+        direction: FileTransferDirection::Upload,
+        virtual_path: "/uploads/report.pdf".into(),
+        declared_size: 6,
+    };
+
+    let (server_result, client_result) = tokio::join!(
+        run_file_transfer(
+            &server_connection,
+            &store,
+            session_id,
+            "alice",
+            &request,
+            file_handle,
+        ),
+        async {
+            let mut send = open_file_stream(&client_connection, file_handle)
+                .await
+                .expect("client opens the file stream");
+            send_file_chunk(
+                &mut send,
+                &FileChunk {
+                    offset: 0,
+                    length: 6,
+                    data: b"abcdef".to_vec(),
+                },
+            )
+            .await?;
+            send_file_transfer_complete(
+                &mut send,
+                &FileTransferComplete {
+                    checksum: vec![0u8; 32], // deliberately wrong
+                },
+            )
+            .await
+        },
+    );
+    client_result.expect("client sends the chunk + a wrong-checksum Complete");
+    match server_result.expect("run_file_transfer itself doesn't error") {
+        FileTransferOutcome::ReportError(error) => {
+            assert_eq!(error.file_handle, file_handle);
+            assert_eq!(error.reason, ReasonCode::PROTOCOL_FILE_CHECKSUM_MISMATCH);
+        }
+        FileTransferOutcome::Done => panic!("expected ReportError, got Done"),
     }
 }
 

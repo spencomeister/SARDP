@@ -137,6 +137,68 @@ pub async fn accept_audio_stream(
     ))
 }
 
+/// Server-side, spec 2.13 + KNOWN_ISSUES.md #12: accepts the incoming
+/// `audio_capture` stream (client -> server), but only hands it back if
+/// `audio_capture_granted`. Otherwise, stops the stream
+/// ([`EnvelopeReader::stop`]) once its `kind` is confirmed and returns
+/// `Ok(None)` -- the same "refuse rather than silently accept" shape as
+/// DR-037's file-handle ownership check, applied here to a permission
+/// check instead.
+pub async fn accept_audio_capture_gated(
+    connection: &quinn::Connection,
+    audio_capture_granted: bool,
+) -> Result<Option<(AudioConfig, AudioFrameReader)>, AudioError> {
+    let recv = connection.accept_uni().await.map_err(AudioError::Quic)?;
+    let mut reader = EnvelopeReader::new(recv);
+
+    let stream_prologue = reader.read_prologue().await?;
+    if stream_prologue.kind != StreamKind::AudioCapture {
+        return Err(AudioError::WrongStreamKind);
+    }
+    if !audio_capture_granted {
+        reader.stop(quinn::VarInt::from_u32(0));
+        return Ok(None);
+    }
+
+    let max_len = StreamKind::AudioCapture.max_envelope_length();
+    let (type_raw, payload) = reader.read_envelope(max_len).await?;
+    if type_raw != messages::type_id::AUDIO_CONFIG {
+        return Err(AudioError::ProtocolViolation(
+            ReasonCode::PROTOCOL_UNEXPECTED_MESSAGE,
+        ));
+    }
+    let config: AudioConfig = messages::decode(&payload).map_err(AudioError::Decode)?;
+
+    Ok(Some((
+        config,
+        AudioFrameReader {
+            reader,
+            kind: StreamKind::AudioCapture,
+        },
+    )))
+}
+
+/// A synthetic 16-bit PCM tone standing in for a real Opus payload (this
+/// PoC has no real audio device or encoder, per scope): `frequency_hz` Hz,
+/// half amplitude, at `sample_rate` samples/sec.
+pub fn generate_sine_wave_payload(samples: usize, sample_rate: u32, frequency_hz: f64) -> Vec<u8> {
+    (0..samples)
+        .flat_map(|i| {
+            let t = i as f64 / f64::from(sample_rate);
+            let sample =
+                (f64::from(i16::MAX) * 0.5 * (2.0 * std::f64::consts::PI * frequency_hz * t).sin())
+                    as i16;
+            sample.to_le_bytes()
+        })
+        .collect()
+}
+
+/// A synthetic silent 16-bit PCM buffer, standing in for a real captured
+/// (but currently quiet) microphone input.
+pub fn generate_silence_payload(samples: usize) -> Vec<u8> {
+    vec![0u8; samples * 2]
+}
+
 /// Reads an audio stream's `AudioFrame`s one after another, after
 /// `AudioConfig`. Constructed via [`accept_audio_stream`].
 pub struct AudioFrameReader {
@@ -170,5 +232,38 @@ impl AudioFrameReader {
         }
 
         Ok((header, frame_payload))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sine_wave_payload_has_two_bytes_per_sample() {
+        let payload = generate_sine_wave_payload(960, 48_000, 440.0);
+        assert_eq!(payload.len(), 960 * 2);
+    }
+
+    #[test]
+    fn sine_wave_payload_starts_at_zero_crossing() {
+        // sin(2*pi*f*0) == 0 regardless of frequency/sample_rate.
+        let payload = generate_sine_wave_payload(4, 48_000, 440.0);
+        let first_sample = i16::from_le_bytes([payload[0], payload[1]]);
+        assert_eq!(first_sample, 0);
+    }
+
+    #[test]
+    fn sine_wave_payload_is_deterministic() {
+        let a = generate_sine_wave_payload(100, 48_000, 440.0);
+        let b = generate_sine_wave_payload(100, 48_000, 440.0);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn silence_payload_is_all_zero_bytes_of_the_right_length() {
+        let payload = generate_silence_payload(960);
+        assert_eq!(payload.len(), 960 * 2);
+        assert!(payload.iter().all(|&b| b == 0));
     }
 }

@@ -82,6 +82,17 @@ impl EnvelopeReader {
             }
         }
     }
+
+    /// Signals the peer to stop sending on this stream
+    /// (`RecvStream::stop`) -- the receive-side equivalent of a
+    /// `SendStream::reset`, for a uni-directional stream this side decides
+    /// to refuse after reading enough of its `StreamPrologue` to classify
+    /// it (e.g. a permission check that only applies once `kind` is
+    /// known). Best-effort: an error here just means the stream was
+    /// already gone, nothing this caller needs to react to.
+    pub fn stop(&mut self, error_code: quinn::VarInt) {
+        let _ = self.recv.stop(error_code);
+    }
 }
 
 /// Encodes and writes one Envelope to `send`.

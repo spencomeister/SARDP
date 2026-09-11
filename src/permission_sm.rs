@@ -15,6 +15,7 @@ use std::collections::HashMap;
 
 use crate::messages::PermissionUpdate;
 use crate::permission_set::bit;
+use crate::reason_code::ReasonCode;
 
 /// All `PermissionSet` bits this FSM tracks (spec 2.5, DR-033).
 const ALL_BITS: [u32; 10] = [
@@ -105,6 +106,72 @@ impl PermissionSm {
         if self.state(bit) == BitState::Draining {
             self.states.insert(bit, BitState::NotGranted);
         }
+    }
+
+    /// Whether starting a *new* operation gated by `bit` is allowed right
+    /// now, and if not, the `ReasonCode` spec 4.5's table calls for:
+    /// `Draining` (a revoke already in progress, still waiting on
+    /// in-progress operations to finish) is `POLICY_PERMISSION_REVOKED`,
+    /// while plain `NotGranted` is `POLICY_PERMISSION_DENIED`.
+    pub fn check_gate(&self, bit: u32) -> Result<(), ReasonCode> {
+        if self.is_granted(bit) {
+            return Ok(());
+        }
+        Err(if self.state(bit) == BitState::Draining {
+            ReasonCode::POLICY_PERMISSION_REVOKED
+        } else {
+            ReasonCode::POLICY_PERMISSION_DENIED
+        })
+    }
+}
+
+/// Builds the `PermissionUpdate` for an admin grant/revoke toggle of one
+/// `bit` (Part 4's minimal live-trigger, wired to `sardp-server`'s
+/// `grant-*`/`revoke-*` stdin commands): flips only `bit`, using
+/// `immediate_revoke` on a revoke (spec 4.5 -- none of this PoC's
+/// admin-togglable bits have an in-progress operation worth draining, so
+/// there's no reason to stage any of them). `current_granted` is the
+/// bitmask to preserve every other bit from.
+pub fn build_permission_toggle(current_granted: u32, bit: u32, grant: bool) -> PermissionUpdate {
+    let other_bits = current_granted & !bit;
+    let this_bit = if grant { bit } else { 0 };
+    PermissionUpdate {
+        granted_permissions: this_bit | other_bits,
+        immediate_revoke: if grant { 0 } else { bit },
+    }
+}
+
+/// One of `sardp-server`'s stdin admin commands (Part 4's minimal
+/// live-trigger, extended by KNOWN_ISSUES.md #12's clipboard/audio
+/// wiring).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdminCommand {
+    /// `grant-<name>`/`revoke-<name>`: toggle one `PermissionSet` bit live.
+    TogglePermission { bit: u32, grant: bool },
+    /// `send-clipboard`: announce synthetic clipboard content once, if
+    /// `CLIP_READ` is currently granted.
+    SendClipboard,
+}
+
+/// Parses one line of `sardp-server`'s stdin admin input. `None` for a
+/// blank line or anything unrecognized -- the caller decides which of
+/// those is worth a warning (a blank line from just pressing Enter is
+/// common and not a mistake).
+pub fn parse_admin_command(line: &str) -> Option<AdminCommand> {
+    let toggle = |bit: u32, grant: bool| Some(AdminCommand::TogglePermission { bit, grant });
+    match line.trim() {
+        "grant-view" => toggle(bit::VIEW, true),
+        "revoke-view" => toggle(bit::VIEW, false),
+        "grant-clip-read" => toggle(bit::CLIP_READ, true),
+        "revoke-clip-read" => toggle(bit::CLIP_READ, false),
+        "grant-clip-write" => toggle(bit::CLIP_WRITE, true),
+        "revoke-clip-write" => toggle(bit::CLIP_WRITE, false),
+        "grant-audio-playback" => toggle(bit::AUDIO_PLAYBACK, true),
+        "revoke-audio-playback" => toggle(bit::AUDIO_PLAYBACK, false),
+        "grant-audio-capture" => toggle(bit::AUDIO_CAPTURE, true),
+        "revoke-audio-capture" => toggle(bit::AUDIO_CAPTURE, false),
+        "send-clipboard" => Some(AdminCommand::SendClipboard),
+        _ => None,
     }
 }
 
@@ -202,5 +269,124 @@ mod tests {
         });
         assert_eq!(sm.state(bit::VIEW), BitState::NotGranted);
         assert_eq!(sm.state(bit::INPUT_KEYBOARD), BitState::Granted);
+    }
+
+    #[test]
+    fn check_gate_allows_a_granted_bit() {
+        let sm = PermissionSm::new(bit::FILE_UP);
+        assert_eq!(sm.check_gate(bit::FILE_UP), Ok(()));
+    }
+
+    #[test]
+    fn check_gate_denies_a_bit_that_was_never_granted() {
+        let sm = PermissionSm::new(0);
+        assert_eq!(
+            sm.check_gate(bit::FILE_DOWN),
+            Err(ReasonCode::POLICY_PERMISSION_DENIED)
+        );
+    }
+
+    #[test]
+    fn check_gate_reports_revoked_while_draining() {
+        let mut sm = PermissionSm::new(bit::FILE_UP);
+        sm.apply_update(&PermissionUpdate {
+            granted_permissions: 0,
+            immediate_revoke: 0, // staged revoke -> Draining
+        });
+        assert_eq!(
+            sm.check_gate(bit::FILE_UP),
+            Err(ReasonCode::POLICY_PERMISSION_REVOKED)
+        );
+    }
+
+    #[test]
+    fn build_permission_toggle_grant_sets_the_bit_without_immediate_revoke() {
+        let update = build_permission_toggle(bit::INPUT_KEYBOARD, bit::VIEW, true);
+        assert_eq!(update.granted_permissions, bit::VIEW | bit::INPUT_KEYBOARD);
+        assert_eq!(update.immediate_revoke, 0);
+    }
+
+    #[test]
+    fn build_permission_toggle_revoke_drops_the_bit_and_sets_immediate_revoke() {
+        let update = build_permission_toggle(bit::VIEW | bit::INPUT_KEYBOARD, bit::VIEW, false);
+        assert_eq!(update.granted_permissions, bit::INPUT_KEYBOARD);
+        assert_eq!(update.immediate_revoke, bit::VIEW);
+    }
+
+    #[test]
+    fn build_permission_toggle_works_for_any_bit_not_just_view() {
+        let update = build_permission_toggle(bit::VIEW, bit::AUDIO_PLAYBACK, true);
+        assert_eq!(update.granted_permissions, bit::VIEW | bit::AUDIO_PLAYBACK);
+        assert_eq!(update.immediate_revoke, 0);
+
+        let update =
+            build_permission_toggle(bit::VIEW | bit::AUDIO_PLAYBACK, bit::AUDIO_PLAYBACK, false);
+        assert_eq!(update.granted_permissions, bit::VIEW);
+        assert_eq!(update.immediate_revoke, bit::AUDIO_PLAYBACK);
+    }
+
+    #[test]
+    fn parse_admin_command_recognizes_every_grant_revoke_pair() {
+        assert_eq!(
+            parse_admin_command("grant-view"),
+            Some(AdminCommand::TogglePermission {
+                bit: bit::VIEW,
+                grant: true
+            })
+        );
+        assert_eq!(
+            parse_admin_command("revoke-view"),
+            Some(AdminCommand::TogglePermission {
+                bit: bit::VIEW,
+                grant: false
+            })
+        );
+        assert_eq!(
+            parse_admin_command("grant-clip-read"),
+            Some(AdminCommand::TogglePermission {
+                bit: bit::CLIP_READ,
+                grant: true
+            })
+        );
+        assert_eq!(
+            parse_admin_command("grant-audio-playback"),
+            Some(AdminCommand::TogglePermission {
+                bit: bit::AUDIO_PLAYBACK,
+                grant: true
+            })
+        );
+        assert_eq!(
+            parse_admin_command("revoke-audio-capture"),
+            Some(AdminCommand::TogglePermission {
+                bit: bit::AUDIO_CAPTURE,
+                grant: false
+            })
+        );
+    }
+
+    #[test]
+    fn parse_admin_command_recognizes_send_clipboard() {
+        assert_eq!(
+            parse_admin_command("send-clipboard"),
+            Some(AdminCommand::SendClipboard)
+        );
+    }
+
+    #[test]
+    fn parse_admin_command_trims_whitespace() {
+        assert_eq!(
+            parse_admin_command("  grant-view  \n"),
+            Some(AdminCommand::TogglePermission {
+                bit: bit::VIEW,
+                grant: true
+            })
+        );
+    }
+
+    #[test]
+    fn parse_admin_command_rejects_blank_and_unknown_input() {
+        assert_eq!(parse_admin_command(""), None);
+        assert_eq!(parse_admin_command("   "), None);
+        assert_eq!(parse_admin_command("not-a-real-command"), None);
     }
 }
