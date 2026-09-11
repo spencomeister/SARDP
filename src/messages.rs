@@ -75,6 +75,14 @@ pub mod type_id {
     pub const AUDIO_FRAME_PAYLOAD: u16 = 0x001D;
     /// `feedback` stream (not `control`).
     pub const AUDIO_SYNC_FEEDBACK: u16 = 0x001E;
+    /// `input` stream (client->server, spec 2.12).
+    pub const KEY_EVENT: u16 = 0x001F;
+    pub const TEXT_INPUT: u16 = 0x0020;
+    pub const IME_COMPOSITION: u16 = 0x0021;
+    pub const MOUSE_MOVE: u16 = 0x0022;
+    pub const MOUSE_BUTTON: u16 = 0x0023;
+    pub const WHEEL: u16 = 0x0024;
+    pub const IME_MODE_CHANGE: u16 = 0x0025;
 }
 
 /// `AuthMethod` enum (spec 2.3).
@@ -497,6 +505,114 @@ pub struct AudioSyncFeedback {
     /// moment was submitted for display.
     pub video_displayed_ts: u64,
     pub drift_ppm: i32,
+}
+
+/// `MouseButton.button` values. Spec 2.12 leaves the numbering to the
+/// implementation; this one is shared by `sardp-client`, `sardp-server`
+/// and `sardp-win` (which mirrors it, see `sardp_win::input::button`).
+pub mod mouse_button {
+    pub const LEFT: u8 = 1;
+    pub const RIGHT: u8 = 2;
+    pub const MIDDLE: u8 = 3;
+    pub const X1: u8 = 4;
+    pub const X2: u8 = 5;
+}
+
+/// `KeyEvent.modifiers` bits (implementation-defined, same sharing as
+/// [`mouse_button`]). `META` is the Windows/Command key.
+pub mod key_modifier {
+    pub const SHIFT: u16 = 1 << 0;
+    pub const CTRL: u16 = 1 << 1;
+    pub const ALT: u16 = 1 << 2;
+    pub const META: u16 = 1 << 3;
+}
+
+/// `InputHeader` (spec 2.12, `input` stream, client->server).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InputHeader {
+    pub event_id: u64,
+    pub client_ts: u64,
+}
+
+/// `KeyEvent` (spec 2.12, `input` stream, client->server). Physical key
+/// identity is determined by `scancode` (USB HID Usage ID); character
+/// generation MUST come from `TextInput`, never synthesized from
+/// `logical_key` (spec 2.12).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeyEvent {
+    pub header: InputHeader,
+    pub down: bool,
+    pub scancode: u32,
+    /// Layout-interpreted logical key; 0 = unknown.
+    pub logical_key: u32,
+    pub modifiers: u16,
+}
+
+/// `TextInput` (spec 2.12, `input` stream, client->server): the MUST
+/// source of committed text (spec 2.12, spec 4.4.1 DR-025). Sent while the
+/// IME mode is `CLIENT_SIDE` (composition happens on the client); raw
+/// `KeyEvent`s belonging to an in-progress composition MUST NOT also be
+/// sent (DR-025, avoids double input).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TextInput {
+    pub header: InputHeader,
+    pub text: String,
+}
+
+/// `ImeComposition` (spec 2.12, `input` stream, client->server):
+/// in-progress (not yet committed) IME composition text and caret
+/// position. Same `CLIENT_SIDE`-only applicability as `TextInput`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImeComposition {
+    pub header: InputHeader,
+    pub text: String,
+    pub caret: u16,
+}
+
+/// `MouseMove` (spec 2.12, `input` stream, client->server).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MouseMove {
+    pub header: InputHeader,
+    pub x: i32,
+    pub y: i32,
+}
+
+/// `MouseButton` (spec 2.12, `input` stream, client->server).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MouseButton {
+    pub header: InputHeader,
+    pub button: u8,
+    pub down: bool,
+    pub x: i32,
+    pub y: i32,
+}
+
+/// `Wheel` (spec 2.12, `input` stream, client->server).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Wheel {
+    pub header: InputHeader,
+    pub dx: i16,
+    pub dy: i16,
+    pub is_precise: bool,
+}
+
+/// `ImeModeChange.mode` (spec 2.12, 4.4.1). `CLIENT_SIDE` is the default
+/// (spec 4.4.1): composition happens on the client, which sends
+/// `TextInput`/`ImeComposition` and withholds the raw `KeyEvent`s involved
+/// in an in-progress composition. Under `REMOTE_SIDE`, the client sends
+/// only raw `KeyEvent`s and MUST NOT send `TextInput`/`ImeComposition`
+/// (protocol violation if it does).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ImeMode {
+    ClientSide,
+    RemoteSide,
+}
+
+/// `ImeModeChange` (spec 2.12, `input` stream, client->server).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImeModeChange {
+    pub mode: ImeMode,
+    pub effective_after_event_id: u64,
 }
 
 /// CBOR-encodes `msg` (the DR-021 message-body scheme for this
@@ -924,6 +1040,100 @@ mod tests {
         };
         let bytes = encode(&msg);
         let decoded: AudioSyncFeedback = decode(&bytes).unwrap();
+        assert_eq!(decoded, msg);
+    }
+
+    fn input_header() -> InputHeader {
+        InputHeader {
+            event_id: 42,
+            client_ts: 1_000_000,
+        }
+    }
+
+    #[test]
+    fn key_event_round_trips() {
+        let msg = KeyEvent {
+            header: input_header(),
+            down: true,
+            scancode: 0x0004, // USB HID Usage ID for 'A'
+            logical_key: 0x61,
+            modifiers: 0,
+        };
+        let bytes = encode(&msg);
+        let decoded: KeyEvent = decode(&bytes).unwrap();
+        assert_eq!(decoded, msg);
+    }
+
+    #[test]
+    fn text_input_round_trips() {
+        let msg = TextInput {
+            header: input_header(),
+            text: "こんにちは".into(),
+        };
+        let bytes = encode(&msg);
+        let decoded: TextInput = decode(&bytes).unwrap();
+        assert_eq!(decoded, msg);
+    }
+
+    #[test]
+    fn ime_composition_round_trips() {
+        let msg = ImeComposition {
+            header: input_header(),
+            text: "こんにち".into(),
+            caret: 4,
+        };
+        let bytes = encode(&msg);
+        let decoded: ImeComposition = decode(&bytes).unwrap();
+        assert_eq!(decoded, msg);
+    }
+
+    #[test]
+    fn mouse_move_round_trips() {
+        let msg = MouseMove {
+            header: input_header(),
+            x: 640,
+            y: 360,
+        };
+        let bytes = encode(&msg);
+        let decoded: MouseMove = decode(&bytes).unwrap();
+        assert_eq!(decoded, msg);
+    }
+
+    #[test]
+    fn mouse_button_round_trips() {
+        let msg = MouseButton {
+            header: input_header(),
+            button: 0,
+            down: true,
+            x: 640,
+            y: 360,
+        };
+        let bytes = encode(&msg);
+        let decoded: MouseButton = decode(&bytes).unwrap();
+        assert_eq!(decoded, msg);
+    }
+
+    #[test]
+    fn wheel_round_trips() {
+        let msg = Wheel {
+            header: input_header(),
+            dx: 0,
+            dy: -120,
+            is_precise: false,
+        };
+        let bytes = encode(&msg);
+        let decoded: Wheel = decode(&bytes).unwrap();
+        assert_eq!(decoded, msg);
+    }
+
+    #[test]
+    fn ime_mode_change_round_trips() {
+        let msg = ImeModeChange {
+            mode: ImeMode::RemoteSide,
+            effective_after_event_id: 99,
+        };
+        let bytes = encode(&msg);
+        let decoded: ImeModeChange = decode(&bytes).unwrap();
         assert_eq!(decoded, msg);
     }
 

@@ -34,6 +34,10 @@ pub enum ConnError {
     TimeSync(TimeSyncError),
     Audio(AudioError),
     Clipboard(ClipboardSessionError),
+    /// The real desktop capture/encode source (Stage 3, `sardp-win`)
+    /// failed or went away. Carried as a string so this crate doesn't
+    /// depend on the Windows-only crate; never a transport disconnect.
+    Capture(String),
     /// Spec 4.1: `IDLE_TIMEOUT` fired (`Active -> Suspended`). Distinct
     /// from a genuine transport failure so `handle_connection` can tell
     /// the two apart in logs, even though both are handled the same way

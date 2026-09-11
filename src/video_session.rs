@@ -285,7 +285,7 @@ pub async fn accept_video_instance(
     connection: &quinn::Connection,
 ) -> Result<(VideoInstanceIntro, VideoFrameReader), VideoError> {
     let (intro, reader) = accept_intro(connection).await?;
-    Ok((intro, VideoFrameReader { reader }))
+    Ok((intro, VideoFrameReader { reader, pending_header: None }))
 }
 
 /// Reads an Instance's `VideoFrame`s (spec 4.3.2 Streaming/Congested row)
@@ -293,24 +293,42 @@ pub async fn accept_video_instance(
 /// [`accept_video_instance`].
 pub struct VideoFrameReader {
     reader: EnvelopeReader,
+    /// A `VideoFrameHeader` already read whose payload hasn't been yet.
+    /// Makes [`Self::read_next_frame`] cancellation-safe: a `select!` that
+    /// drops the future between the two envelope reads resumes at the
+    /// payload instead of misreading it as the next header (which showed
+    /// up as `PROTOCOL_UNEXPECTED_MESSAGE` in `sardp-client` once it had
+    /// a second frequently-firing arm).
+    pending_header: Option<VideoFrameHeader>,
 }
 
 impl VideoFrameReader {
     /// Reads the next `VideoFrameHeader` + `VideoFramePayload` pair,
     /// enforcing the same "payload immediately follows header" and
     /// length-match rules (spec 2.10, DR-035) as the intro's first frame.
+    ///
+    /// Cancellation-safe (`EnvelopeReader::read_envelope` is, and the
+    /// header is parked in `self` between the two reads).
     pub async fn read_next_frame(&mut self) -> Result<(VideoFrameHeader, Vec<u8>), VideoError> {
         let max_len = StreamKind::Video.max_envelope_length();
 
-        let (type_raw, payload) = self.reader.read_envelope(max_len).await?;
-        if type_raw != messages::type_id::VIDEO_FRAME_HEADER {
-            return Err(VideoError::ProtocolViolation(
-                ReasonCode::PROTOCOL_UNEXPECTED_MESSAGE,
-            ));
-        }
-        let header: VideoFrameHeader = messages::decode(&payload).map_err(VideoError::Decode)?;
-
+        let header = match self.pending_header.take() {
+            Some(header) => header,
+            None => {
+                let (type_raw, payload) = self.reader.read_envelope(max_len).await?;
+                if type_raw != messages::type_id::VIDEO_FRAME_HEADER {
+                    return Err(VideoError::ProtocolViolation(
+                        ReasonCode::PROTOCOL_UNEXPECTED_MESSAGE,
+                    ));
+                }
+                messages::decode(&payload).map_err(VideoError::Decode)?
+            }
+        };
+        // Park it until the payload has been read, in case we're cancelled
+        // while waiting for it.
+        self.pending_header = Some(header);
         let (type_raw, frame_payload) = self.reader.read_envelope(max_len).await?;
+        let header = self.pending_header.take().expect("parked just above");
         if type_raw != messages::type_id::VIDEO_FRAME_PAYLOAD {
             return Err(VideoError::ProtocolViolation(
                 ReasonCode::PROTOCOL_UNEXPECTED_MESSAGE,

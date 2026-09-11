@@ -1,14 +1,25 @@
 //! SARDP PoC reference client (Phase 1: "実バイナリ化"). Connects to
 //! `sardp-server`, completes the handshake and TimeSync, receives the
-//! single-monitor video Instance, and decodes each frame via ffmpeg.
-//! Real window/screen display is out of scope for this sandbox (cannot be
-//! verified here); instead every decoded frame's embedded timecode is
-//! logged, proving the wire protocol end-to-end the same way M4-M6's
-//! tests did. Sends real `TransportFeedback` after every frame (spec
-//! 2.14), which is what actually lets `sardp-server`'s backpressure
-//! mechanism (spec 2.10, DR-029) do anything when the two binaries run
-//! against each other.
+//! single-monitor video Instance and every generation that follows it,
+//! and hands each frame to one of two sinks (`--display`):
+//!
+//! - `log` (default, every platform): decodes each frame via a fresh
+//!   ffmpeg process and logs the decoded frame's embedded timecode,
+//!   proving the wire protocol end-to-end the same way M4-M6's tests did.
+//!   Only self-contained frames decode this way (`sardp-server --all-idr`
+//!   for desktop capture).
+//! - `window` (Windows, Stage 3 3W-1-d-3): a persistent hardware H.264
+//!   decoder behind an on-screen window (`sardp_win::H264DisplayWindow`),
+//!   so P-frame streams display at the server's frame rate.
+//!
+//! Either way a real `TransportFeedback` is sent for every frame (spec
+//! 2.14), which is what lets `sardp-server`'s backpressure mechanism
+//! (spec 2.10, DR-029) do anything when the two binaries run against
+//! each other -- including resetting the stream, which this client
+//! recovers from by accepting the next generation's Instance.
 
+#[cfg(windows)]
+use std::collections::VecDeque;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -16,21 +27,34 @@ use std::time::Duration;
 use ed25519_dalek::SigningKey;
 
 use sardp::audio_session;
+use sardp::client_display::{ClientDisplay, SubmitOutcome};
 use sardp::clipboard_session;
 use sardp::connection_sm::{ConnectionSm, defaults as timeouts};
 use sardp::decoder;
 use sardp::feedback_session::{self, FrameTimestamps};
 use sardp::handshake::client_handshake;
-use sardp::messages::{self, AudioCodec, AudioConfig, SessionClose};
+use sardp::input_session;
+use sardp::input_state::{PressedInputs, Release};
+use sardp::messages::{
+    self, AudioCodec, AudioConfig, ImeComposition, InputHeader, KeyEvent, MouseButton, MouseMove,
+    SessionClose, TextInput, VideoFrameHeader, Wheel,
+};
 use sardp::permission_set::bit;
 use sardp::reason_code::ReasonCode;
 use sardp::reconnection::client_reconnect;
 use sardp::session_file::{SavedSession, read_saved_session, write_saved_session};
-use sardp::stream_reader::write_envelope;
+use sardp::stream_reader::{StreamReadError, write_envelope};
 use sardp::timecode_frame::extract_timecode;
 use sardp::timesync::client_time_sync;
-use sardp::video_session::accept_video_instance;
+use sardp::video_session::{VideoError, VideoFrameReader, accept_video_instance};
 use sardp::{StreamKind, clock, dev_identity, net, pki};
+
+/// `--display`: where decoded frames go.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DisplayMode {
+    Log,
+    Window,
+}
 
 struct Args {
     server: SocketAddr,
@@ -50,6 +74,15 @@ struct Args {
     /// since a real always-up client would auto-reconnect in-process
     /// instead (out of scope for this PoC).
     session_file: Option<PathBuf>,
+    display: DisplayMode,
+    /// `--display window` only: client-area size of the window.
+    window_size: (u32, u32),
+    /// Write the first few frames of generation 0 as raw Annex-B files
+    /// here (diagnostics: what did the server's first IDR actually contain?).
+    dump_frames: Option<PathBuf>,
+    /// `--display window` only: forward the window's keyboard/mouse input
+    /// to the server over the `input` stream (spec 2.12).
+    input: bool,
 }
 
 fn print_help() {
@@ -72,6 +105,17 @@ OPTIONS:\n\
                               file already exists on startup, reconnect\n\
                               (SessionReauthenticate, spec 4.6) instead of a\n\
                               fresh handshake (demo/test use only)\n\
+    --display <log|window>    log: decode each frame with ffmpeg and log its\n\
+                              timecode (default, any platform; needs\n\
+                              self-contained frames). window: Windows only,\n\
+                              persistent hardware decoder + on-screen window\n\
+    --window-size <WxH>       Window client size for --display window\n\
+                              (default 1280x720; frames are scaled to fit)\n\
+    --dump-frames <DIR>       Save generation 0's first 3 frames as Annex-B\n\
+                              .h264 files in DIR (diagnostics)\n\
+    --input <on|off>          With --display window: forward the window's\n\
+                              keyboard/mouse to the server (default on; needs\n\
+                              INPUT_KEYBOARD/INPUT_MOUSE granted)\n\
     --help                    Show this message"
     );
 }
@@ -86,6 +130,10 @@ fn parse_args() -> Args {
     let mut client_name = "sardp-client".to_string();
     let mut target_latency_us = 50_000u32;
     let mut session_file: Option<PathBuf> = None;
+    let mut display = DisplayMode::Log;
+    let mut window_size = (1280u32, 720u32);
+    let mut dump_frames: Option<PathBuf> = None;
+    let mut input = true;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -126,6 +174,50 @@ fn parse_args() -> Args {
                     args.next().expect("--session-file requires a value"),
                 ))
             }
+            "--display" => {
+                let value = args.next().expect("--display requires a value");
+                display = match value.as_str() {
+                    "log" => DisplayMode::Log,
+                    "window" => {
+                        if !cfg!(windows) {
+                            eprintln!("--display window is only available on Windows");
+                            std::process::exit(2);
+                        }
+                        DisplayMode::Window
+                    }
+                    other => {
+                        eprintln!("invalid --display {other:?} (expected log or window)");
+                        std::process::exit(2);
+                    }
+                };
+            }
+            "--window-size" => {
+                let value = args.next().expect("--window-size requires a value");
+                let parsed = value
+                    .split_once('x')
+                    .and_then(|(w, h)| Some((w.parse::<u32>().ok()?, h.parse::<u32>().ok()?)))
+                    .filter(|(w, h)| *w > 0 && *h > 0);
+                let Some(parsed) = parsed else {
+                    eprintln!("invalid --window-size {value:?} (expected WxH, e.g. 1280x720)");
+                    std::process::exit(2);
+                };
+                window_size = parsed;
+            }
+            "--dump-frames" => {
+                dump_frames = Some(PathBuf::from(
+                    args.next().expect("--dump-frames requires a value"),
+                ))
+            }
+            "--input" => {
+                input = match args.next().expect("--input requires a value").as_str() {
+                    "on" => true,
+                    "off" => false,
+                    other => {
+                        eprintln!("invalid --input {other:?} (expected on or off)");
+                        std::process::exit(2);
+                    }
+                };
+            }
             "--help" | "-h" => {
                 print_help();
                 std::process::exit(0);
@@ -159,7 +251,46 @@ fn parse_args() -> Args {
         client_name,
         target_latency_us,
         session_file,
+        display,
+        window_size,
+        dump_frames,
+        input,
     }
+}
+
+/// `--dump-frames`: generation 0's first three frames, each as its own
+/// Annex-B file plus one cumulative file (a P-frame only decodes behind
+/// its references, so `ffmpeg -i gen0_first3.h264` is the way to look at
+/// frames 1 and 2).
+const DUMP_FRAME_COUNT: u64 = 3;
+
+fn dump_frame(dir: &std::path::Path, header: &VideoFrameHeader, payload: &[u8]) {
+    if header.generation != 0 || header.frame_id >= DUMP_FRAME_COUNT {
+        return;
+    }
+    if let Err(e) = std::fs::create_dir_all(dir) {
+        eprintln!("--dump-frames: cannot create {dir:?}: {e}");
+        return;
+    }
+    let single = dir.join(format!("gen0_frame{}.h264", header.frame_id));
+    if let Err(e) = std::fs::write(&single, payload) {
+        eprintln!("--dump-frames: cannot write {single:?}: {e}");
+    }
+    let cumulative = dir.join("gen0_first3.h264");
+    let appended = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&cumulative)
+        .and_then(|mut f| std::io::Write::write_all(&mut f, payload));
+    if let Err(e) = appended {
+        eprintln!("--dump-frames: cannot append to {cumulative:?}: {e}");
+    }
+    eprintln!(
+        "--dump-frames: wrote generation 0 frame {} ({} bytes, idr={}) to {single:?}",
+        header.frame_id,
+        payload.len(),
+        header.is_idr()
+    );
 }
 
 #[derive(Debug)]
@@ -177,6 +308,9 @@ enum AppError {
     Violation(ReasonCode),
     Audio(sardp::audio_session::AudioError),
     Clipboard(sardp::clipboard_session::ClipboardSessionError),
+    /// `--display window` could not be set up (no decoder MFT, no D3D11
+    /// device, ...). Not a transport error.
+    Display(String),
 }
 
 impl From<quinn::ConnectionError> for AppError {
@@ -418,12 +552,55 @@ async fn run(connection: quinn::Connection, args: &Args) -> Result<(), AppError>
 
     let mut feedback_send = feedback_session::open_feedback_stream(&connection).await?;
 
+    let mut sink = VideoSink::open(args, &intro.encoder_config)?;
+    let mut display: ClientDisplay<DisplayedFrame> = ClientDisplay::new();
+    let mut stats = FrameStats::default();
+
+    // Input forwarding (spec 2.12): only a window can produce input, only
+    // if asked to, and only if the server granted at least one of the two
+    // input permissions at handshake/reconnect time (a later grant isn't
+    // reacted to -- same PoC limitation as AUDIO_CAPTURE above).
+    let stream_size = (intro.encoder_config.width, intro.encoder_config.height);
+    let mut window_input = sink.take_input_receiver();
+    let input_granted = granted_permissions & (bit::INPUT_KEYBOARD | bit::INPUT_MOUSE);
+    let mut input_forwarder = if window_input.is_some() && args.input && input_granted != 0 {
+        let send = input_session::open_input_stream(&connection).await?;
+        eprintln!(
+            "opened input stream (keyboard={}, mouse={}); window {}x{} -> stream {}x{}",
+            granted_permissions & bit::INPUT_KEYBOARD != 0,
+            granted_permissions & bit::INPUT_MOUSE != 0,
+            args.window_size.0,
+            args.window_size.1,
+            stream_size.0,
+            stream_size.1
+        );
+        Some(InputForwarder::new(send, granted_permissions, stream_size, args.window_size))
+    } else {
+        if window_input.is_some() {
+            eprintln!(
+                "input forwarding off ({})",
+                if args.input { "no input permission granted" } else { "--input off" }
+            );
+            window_input = None;
+        }
+        None
+    };
+
+    if let Some(dir) = &args.dump_frames {
+        // Fresh cumulative file per run.
+        let _ = std::fs::remove_file(dir.join("gen0_first3.h264"));
+    }
+
     process_frame(
+        &mut sink,
+        &mut display,
+        &mut stats,
         &mut feedback_send,
         timesync.offset_us,
         args.target_latency_us,
         intro.first_frame_header,
         intro.first_frame_payload,
+        args.dump_frames.as_deref(),
     )
     .await?;
 
@@ -489,11 +666,16 @@ async fn run(connection: quinn::Connection, args: &Args) -> Result<(), AppError>
             biased;
             () = shutdown_signal() => {
                 eprintln!("shutting down, closing session");
+                stats.print_summary();
+                if let Some(forwarder) = input_forwarder.as_mut() {
+                    let _ = forwarder.release_all().await;
+                }
                 close_gracefully(&connection, &mut control.send, ReasonCode::NONE).await;
                 return Ok(());
             }
             () = tokio::time::sleep_until(idle_deadline) => {
                 eprintln!("IDLE_TIMEOUT ({:?} since last activity)", timeouts::IDLE_TIMEOUT);
+                stats.print_summary();
                 close_gracefully(&connection, &mut control.send, ReasonCode::TRANSPORT_IDLE_TIMEOUT).await;
                 return Ok(());
             }
@@ -507,6 +689,7 @@ async fn run(connection: quinn::Connection, args: &Args) -> Result<(), AppError>
                     t if t == messages::type_id::SESSION_CLOSE => {
                         let close: SessionClose = messages::decode(&payload).unwrap_or(SessionClose { reason: ReasonCode::NONE });
                         eprintln!("server sent SessionClose (reason {:?}), closing", close.reason);
+                        stats.print_summary();
                         return Ok(());
                     }
                     t if t == messages::type_id::PERMISSION_UPDATE => {
@@ -518,9 +701,61 @@ async fn run(connection: quinn::Connection, args: &Args) -> Result<(), AppError>
                 }
             }
             frame = frame_reader.read_next_frame() => {
-                let (header, payload) = frame?;
+                let (header, payload) = match frame {
+                    Ok(frame) => frame,
+                    Err(VideoError::Read(StreamReadError::Read(quinn::ReadError::Reset(code)))) => {
+                        // Spec 2.10 / 4.3.1: the server reset the video
+                        // stream (backpressure) and opens a new Instance
+                        // with generation+1; accept it and carry on.
+                        // The generation gate (`display`) discards
+                        // anything older that could still show up.
+                        eprintln!(
+                            "video stream reset by server (code {code}) after generation {:?}; waiting for the next Instance",
+                            display.current_generation()
+                        );
+                        stats.resets += 1;
+                        let (intro, reader) = accept_next_generation(&connection).await?;
+                        frame_reader = reader;
+                        last_activity = tokio::time::Instant::now();
+                        eprintln!(
+                            "new video Instance: generation {} ({}x{})",
+                            intro.first_frame_header.generation,
+                            intro.encoder_config.width,
+                            intro.encoder_config.height
+                        );
+                        process_frame(
+                            &mut sink, &mut display, &mut stats, &mut feedback_send,
+                            timesync.offset_us, args.target_latency_us,
+                            intro.first_frame_header, intro.first_frame_payload,
+                            args.dump_frames.as_deref(),
+                        ).await?;
+                        continue;
+                    }
+                    Err(e) => return Err(e.into()),
+                };
                 last_activity = tokio::time::Instant::now();
-                process_frame(&mut feedback_send, timesync.offset_us, args.target_latency_us, header, payload).await?;
+                process_frame(
+                    &mut sink, &mut display, &mut stats, &mut feedback_send,
+                    timesync.offset_us, args.target_latency_us, header, payload,
+                    args.dump_frames.as_deref(),
+                ).await?;
+            }
+            timing = sink.next_window_timing() => {
+                let Some(timing) = timing else {
+                    eprintln!("display window closed by the user, closing session");
+                    stats.print_summary();
+                    if let Some(forwarder) = input_forwarder.as_mut() {
+                        let _ = forwarder.release_all().await;
+                    }
+                    close_gracefully(&connection, &mut control.send, ReasonCode::NONE).await;
+                    return Ok(());
+                };
+                sink.on_window_timing(timing, &mut stats, &mut feedback_send, timesync.offset_us, args.target_latency_us).await?;
+            }
+            event = next_window_input(&mut window_input) => {
+                if let Some(forwarder) = input_forwarder.as_mut() {
+                    forwarder.forward(event).await?;
+                }
             }
             _ = audio_capture_interval.tick() => {
                 if let Some(send) = audio_capture_send.as_mut() {
@@ -624,45 +859,618 @@ async fn clipboard_announce_once(connection: quinn::Connection) {
     }
 }
 
+/// Accepts the video Instance the server opens after resetting the
+/// previous one. Spec 4.3.1 gives the server `VIDEO_RECOVERY_TIMEOUT`
+/// (5s) per attempt with backoff between attempts; the client-side wait
+/// here is bounded by the (longer) session-setup timeout, and by the
+/// control stream's `IDLE_TIMEOUT` beyond that -- a server that gives up
+/// on recovery closes the session, which surfaces here as a read error.
+async fn accept_next_generation(
+    connection: &quinn::Connection,
+) -> Result<(sardp::video_session::VideoInstanceIntro, VideoFrameReader), AppError> {
+    let deadline = tokio::time::Instant::now() + timeouts::SESSION_SETUP_TIMEOUT;
+    loop {
+        match tokio::time::timeout_at(deadline, accept_video_instance(connection)).await {
+            Ok(Ok(accepted)) => return Ok(accepted),
+            // The server can reset the *new* Instance too, before its intro
+            // has been fully read (a slow decoder keeps the backpressure
+            // tripping); that just means yet another generation follows.
+            Ok(Err(VideoError::Read(StreamReadError::Read(quinn::ReadError::Reset(code))))) => {
+                eprintln!("new video Instance was reset (code {code}) before it started; waiting for the next one");
+                continue;
+            }
+            Ok(Err(e)) => return Err(e.into()),
+            Err(_elapsed) => {
+                eprintln!(
+                    "no new video Instance within {:?} after the reset",
+                    timeouts::SESSION_SETUP_TIMEOUT
+                );
+                return Err(AppError::Violation(ReasonCode::PROTOCOL_VIDEO_CONFIGURING_TIMEOUT));
+            }
+        }
+    }
+}
+
+/// What `ClientDisplay` tracks per displayed frame. In `log` mode the
+/// decoded pixels' embedded timecode; in `window` mode nothing beyond the
+/// identity `ClientDisplay` itself records (the pixels live on the GPU).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DisplayedFrame {
+    timecode_us: Option<u64>,
+}
+
+/// A frame handed to the window whose decode/present timing hasn't come
+/// back yet (`window` mode only).
+#[cfg(windows)]
+struct PendingFeedback {
+    header: VideoFrameHeader,
+    payload_len: usize,
+}
+
+enum VideoSink {
+    Log,
+    #[cfg(windows)]
+    Window {
+        window: sardp_win::H264DisplayWindow,
+        pending: VecDeque<PendingFeedback>,
+    },
+}
+
+impl VideoSink {
+    fn open(args: &Args, encoder_config: &messages::EncoderConfig) -> Result<Self, AppError> {
+        match args.display {
+            DisplayMode::Log => {
+                eprintln!("display: log (per-frame ffmpeg decode)");
+                Ok(Self::Log)
+            }
+            #[cfg(windows)]
+            DisplayMode::Window => {
+                let config = sardp_win::DisplayConfig {
+                    title: format!(
+                        "SARDP {} ({}x{})",
+                        args.server, encoder_config.width, encoder_config.height
+                    ),
+                    width: args.window_size.0,
+                    height: args.window_size.1,
+                };
+                let window = sardp_win::H264DisplayWindow::open(config, std::sync::Arc::new(clock::now_us))
+                    .map_err(|e| AppError::Display(e.to_string()))?;
+                eprintln!(
+                    "display: window {}x{} (hardware H.264 decode, stream {}x{})",
+                    args.window_size.0, args.window_size.1, encoder_config.width, encoder_config.height
+                );
+                Ok(Self::Window {
+                    window,
+                    pending: VecDeque::new(),
+                })
+            }
+            #[cfg(not(windows))]
+            DisplayMode::Window => {
+                let _ = encoder_config;
+                unreachable!("--display window is rejected at argument parsing off Windows")
+            }
+        }
+    }
+
+    /// The window's input events (window mode, once); `None` in log mode.
+    fn take_input_receiver(&mut self) -> Option<WindowInputRx> {
+        match self {
+            Self::Log => None,
+            #[cfg(windows)]
+            Self::Window { window, .. } => window.take_input_receiver(),
+        }
+    }
+
+    /// `select!` arm: the window's next decode/present timing report.
+    /// Never completes in `log` mode; `Some(None)` once the window is gone.
+    async fn next_window_timing(&mut self) -> Option<WindowTiming> {
+        match self {
+            Self::Log => std::future::pending().await,
+            #[cfg(windows)]
+            Self::Window { window, .. } => window.next_timing().await.map(|t| WindowTiming {
+                generation: t.generation,
+                frame_id: t.frame_id,
+                receive_ts: t.receive_ts,
+                dequeue_ts: t.dequeue_ts,
+                decode_done_ts: t.decode_done_ts,
+                display_ts: t.display_ts,
+                presented: t.presented,
+            }),
+        }
+    }
+
+    /// Turns a window timing report into the frame's `TransportFeedback`.
+    async fn on_window_timing(
+        &mut self,
+        timing: WindowTiming,
+        stats: &mut FrameStats,
+        feedback_send: &mut quinn::SendStream,
+        offset_us: i64,
+        target_latency_us: u32,
+    ) -> Result<(), AppError> {
+        #[cfg(windows)]
+        if let Self::Window { pending, .. } = self {
+            // Frames complete in submission order; anything ahead of the
+            // reported one in the queue never produced output (the decoder
+            // needed more input, or it was dropped inside the window) and
+            // gets no feedback.
+            let position = pending
+                .iter()
+                .position(|p| p.header.generation == timing.generation && p.header.frame_id == timing.frame_id);
+            let Some(position) = position else {
+                eprintln!(
+                    "timing for unknown frame generation={} frame_id={}",
+                    timing.generation, timing.frame_id
+                );
+                return Ok(());
+            };
+            let skipped = pending.drain(..position).count();
+            stats.no_output += skipped as u64;
+            let entry = pending.pop_front().expect("position is in range");
+            let timestamps = FrameTimestamps {
+                receive_ts: timing.receive_ts,
+                decode_done_ts: timing.decode_done_ts,
+                display_ts: timing.display_ts,
+            };
+            stats.record_displayed(
+                &entry.header,
+                entry.payload_len,
+                &timestamps,
+                Some(timing.dequeue_ts),
+                timing.presented,
+            );
+            let feedback = feedback_session::build_transport_feedback(
+                &entry.header,
+                entry.payload_len,
+                &timestamps,
+                offset_us,
+                target_latency_us,
+            );
+            feedback_session::send_transport_feedback(feedback_send, &feedback).await?;
+        }
+        let _ = (&timing, &*stats, &*feedback_send, offset_us, target_latency_us);
+        Ok(())
+    }
+}
+
+/// The window's input event type, per platform (only Windows has a
+/// window; elsewhere the receiver is always `None` and the arm never
+/// fires).
+#[cfg(windows)]
+type WindowInputEvent = sardp_win::WindowInput;
+#[cfg(not(windows))]
+type WindowInputEvent = std::convert::Infallible;
+type WindowInputRx = tokio::sync::mpsc::UnboundedReceiver<WindowInputEvent>;
+
+/// `select!` arm: the next input event from the window. Pends forever
+/// without a window (or once its event channel has closed -- the timing
+/// arm is what notices the window going away).
+async fn next_window_input(rx: &mut Option<WindowInputRx>) -> WindowInputEvent {
+    match rx {
+        Some(receiver) => match receiver.recv().await {
+            Some(event) => event,
+            None => {
+                *rx = None;
+                std::future::pending().await
+            }
+        },
+        None => std::future::pending().await,
+    }
+}
+
+/// Turns window input into spec 2.12 messages on the `input` stream:
+/// event ids, client timestamps, window -> stream coordinate mapping,
+/// per-permission filtering, and the spec 4.4.2 pressed-set so focus loss
+/// or shutdown releases whatever this client reported as down.
+struct InputForwarder {
+    send: quinn::SendStream,
+    next_event_id: u64,
+    pressed: PressedInputs,
+    keyboard: bool,
+    mouse: bool,
+    stream_size: (u32, u32),
+    window_size: (u32, u32),
+    sent: u64,
+    mouse_moves: u64,
+}
+
+impl InputForwarder {
+    fn new(
+        send: quinn::SendStream,
+        granted_permissions: u32,
+        stream_size: (u32, u32),
+        window_size: (u32, u32),
+    ) -> Self {
+        Self {
+            send,
+            next_event_id: 1,
+            pressed: PressedInputs::new(),
+            keyboard: granted_permissions & bit::INPUT_KEYBOARD != 0,
+            mouse: granted_permissions & bit::INPUT_MOUSE != 0,
+            stream_size,
+            window_size,
+            sent: 0,
+            mouse_moves: 0,
+        }
+    }
+
+    fn header(&mut self) -> InputHeader {
+        let event_id = self.next_event_id;
+        self.next_event_id += 1;
+        self.sent += 1;
+        InputHeader {
+            event_id,
+            client_ts: clock::now_us(),
+        }
+    }
+
+    /// Window client-area pixels -> stream (captured desktop) pixels.
+    fn map(&self, x: i32, y: i32) -> (i32, i32) {
+        let scale = |v: i32, from: u32, to: u32| -> i32 {
+            let mapped = i64::from(v) * i64::from(to) / i64::from(from.max(1));
+            mapped.clamp(0, i64::from(to.saturating_sub(1))) as i32
+        };
+        (
+            scale(x, self.window_size.0, self.stream_size.0),
+            scale(y, self.window_size.1, self.stream_size.1),
+        )
+    }
+
+    #[cfg(windows)]
+    async fn forward(&mut self, event: WindowInputEvent) -> Result<(), AppError> {
+        use sardp_win::WindowInput;
+        match event {
+            WindowInput::Key {
+                down,
+                hid_usage,
+                virtual_key,
+                modifiers,
+            } => {
+                if !self.keyboard {
+                    return Ok(());
+                }
+                self.pressed.on_key(hid_usage, down);
+                let key = KeyEvent {
+                    header: self.header(),
+                    down,
+                    scancode: hid_usage,
+                    logical_key: virtual_key,
+                    modifiers,
+                };
+                eprintln!(
+                    "input: key event {} hid={hid_usage:#04x} vk={virtual_key:#04x} down={down} modifiers={modifiers:#06b}",
+                    key.header.event_id
+                );
+                input_session::send_key_event(&mut self.send, &key).await?;
+            }
+            WindowInput::Text(text) => {
+                if !self.keyboard {
+                    return Ok(());
+                }
+                let event = TextInput {
+                    header: self.header(),
+                    text,
+                };
+                eprintln!("input: text event {} {:?}", event.header.event_id, event.text);
+                input_session::send_text_input(&mut self.send, &event).await?;
+            }
+            WindowInput::ImeComposition { text, caret } => {
+                if !self.keyboard {
+                    return Ok(());
+                }
+                let event = ImeComposition {
+                    header: self.header(),
+                    text,
+                    caret,
+                };
+                eprintln!(
+                    "input: ime composition event {} {:?} caret={}",
+                    event.header.event_id, event.text, event.caret
+                );
+                input_session::send_ime_composition(&mut self.send, &event).await?;
+            }
+            WindowInput::MouseMove { x, y } => {
+                if !self.mouse {
+                    return Ok(());
+                }
+                let (x, y) = self.map(x, y);
+                let event = MouseMove {
+                    header: self.header(),
+                    x,
+                    y,
+                };
+                self.mouse_moves += 1;
+                if self.mouse_moves <= 3 || self.mouse_moves.is_multiple_of(100) {
+                    eprintln!("input: mouse move event {} -> ({x}, {y})", event.header.event_id);
+                }
+                input_session::send_mouse_move(&mut self.send, &event).await?;
+            }
+            WindowInput::MouseButton { button, down, x, y } => {
+                if !self.mouse {
+                    return Ok(());
+                }
+                let (x, y) = self.map(x, y);
+                self.pressed.on_button(button, down);
+                let event = MouseButton {
+                    header: self.header(),
+                    button,
+                    down,
+                    x,
+                    y,
+                };
+                eprintln!(
+                    "input: mouse button event {} button={button} down={down} -> ({x}, {y})",
+                    event.header.event_id
+                );
+                input_session::send_mouse_button(&mut self.send, &event).await?;
+            }
+            WindowInput::Wheel { dx, dy } => {
+                if !self.mouse {
+                    return Ok(());
+                }
+                let event = Wheel {
+                    header: self.header(),
+                    dx,
+                    dy,
+                    is_precise: false,
+                };
+                eprintln!("input: wheel event {} dx={dx} dy={dy}", event.header.event_id);
+                input_session::send_wheel(&mut self.send, &event).await?;
+            }
+            WindowInput::FocusLost => {
+                if !self.pressed.is_empty() {
+                    eprintln!("input: window lost focus, releasing pressed keys/buttons");
+                    self.release_all().await?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(not(windows))]
+    async fn forward(&mut self, event: WindowInputEvent) -> Result<(), AppError> {
+        match event {}
+    }
+
+    /// Spec 4.4.2 from the client side: send a release for everything
+    /// this client reported as pressed.
+    async fn release_all(&mut self) -> Result<(), AppError> {
+        for release in self.pressed.take_releases() {
+            match release {
+                Release::Key(hid_usage) => {
+                    let key = KeyEvent {
+                        header: self.header(),
+                        down: false,
+                        scancode: hid_usage,
+                        logical_key: 0,
+                        modifiers: 0,
+                    };
+                    input_session::send_key_event(&mut self.send, &key).await?;
+                }
+                Release::Button(button) => {
+                    let event = MouseButton {
+                        header: self.header(),
+                        button,
+                        down: false,
+                        x: 0,
+                        y: 0,
+                    };
+                    input_session::send_mouse_button(&mut self.send, &event).await?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Window-mode decode/present timestamps, mirrored from `sardp_win` so the
+/// `select!` arm has a type on every platform.
+#[derive(Debug, Clone, Copy)]
+struct WindowTiming {
+    generation: u64,
+    frame_id: u64,
+    receive_ts: u64,
+    dequeue_ts: u64,
+    decode_done_ts: u64,
+    display_ts: u64,
+    presented: bool,
+}
+
+/// Running counters printed on shutdown (and every 300 displayed frames),
+/// so a long run leaves a one-line verdict in the log.
+#[derive(Default)]
+struct FrameStats {
+    received: u64,
+    displayed: u64,
+    stale_generation: u64,
+    /// Window mode: frames handed to the display thread that never
+    /// produced a decode/present timing -- skipped as a stale generation
+    /// there, or absorbed by the decoder without output.
+    no_output: u64,
+    /// Window mode: decoded but not shown (swap chain still busy with the
+    /// previous frame -- the decoder got ahead of the display refresh).
+    not_presented: u64,
+    resets: u64,
+    bytes: u64,
+    /// receive -> decode done (what `TransportFeedback` reports as the
+    /// decode delay; includes queueing in window mode).
+    decode_us_total: u64,
+    /// Window mode: receive -> picked up by the display thread.
+    queue_us_total: u64,
+    display_us_total: u64,
+    max_decode_us: u64,
+    idr: u64,
+}
+
+impl FrameStats {
+    fn record_displayed(
+        &mut self,
+        header: &VideoFrameHeader,
+        payload_len: usize,
+        t: &FrameTimestamps,
+        dequeue_ts: Option<u64>,
+        presented: bool,
+    ) {
+        self.displayed += 1;
+        self.bytes += payload_len as u64;
+        if header.is_idr() {
+            self.idr += 1;
+        }
+        if !presented {
+            self.not_presented += 1;
+        }
+        let decode_us = t.decode_done_ts.saturating_sub(t.receive_ts);
+        let queue_us = dequeue_ts.map(|d| d.saturating_sub(t.receive_ts));
+        let display_us = t.display_ts.saturating_sub(t.decode_done_ts);
+        self.decode_us_total += decode_us;
+        self.queue_us_total += queue_us.unwrap_or(0);
+        self.display_us_total += display_us;
+        self.max_decode_us = self.max_decode_us.max(decode_us);
+        match queue_us {
+            Some(queue_us) => println!(
+                "frame generation={} frame_id={} idr={} bytes={} capture_ts={} queue_us={} decode_us={} present_us={} presented={}",
+                header.generation, header.frame_id, header.is_idr(), payload_len, header.capture_ts,
+                queue_us, decode_us - queue_us, display_us, presented
+            ),
+            None => println!(
+                "frame generation={} frame_id={} idr={} bytes={} capture_ts={} decode_us={} present_us={}",
+                header.generation, header.frame_id, header.is_idr(), payload_len, header.capture_ts, decode_us, display_us
+            ),
+        }
+        if self.displayed.is_multiple_of(300) {
+            self.print_summary();
+        }
+    }
+
+    fn print_summary(&self) {
+        let avg = |total: u64| total.checked_div(self.displayed).unwrap_or(0);
+        eprintln!(
+            "stats: received={} displayed={} (idr={}, not_presented={}) stale_generation={} no_output={} resets={} bytes={} avg_queue_us={} avg_decode_us={} max_decode_us={} avg_present_us={}",
+            self.received,
+            self.displayed,
+            self.idr,
+            self.not_presented,
+            self.stale_generation,
+            self.no_output,
+            self.resets,
+            self.bytes,
+            avg(self.queue_us_total),
+            avg(self.decode_us_total),
+            self.max_decode_us,
+            avg(self.display_us_total),
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn process_frame(
+    sink: &mut VideoSink,
+    display: &mut ClientDisplay<DisplayedFrame>,
+    stats: &mut FrameStats,
     feedback_send: &mut quinn::SendStream,
     offset_us: i64,
     target_latency_us: u32,
-    header: messages::VideoFrameHeader,
+    header: VideoFrameHeader,
     payload: Vec<u8>,
+    dump_dir: Option<&std::path::Path>,
 ) -> Result<(), AppError> {
     let receive_ts = clock::now_us();
-    let payload_len = payload.len();
-    let (width, height) = (header.width, header.height);
-    let decoded =
-        tokio::task::spawn_blocking(move || decoder::decode_single_frame(&payload, width, height))
+    stats.received += 1;
+    if let Some(dir) = dump_dir {
+        dump_frame(dir, &header, &payload);
+    }
+
+    // Spec 2.10 client MUST: frames of a generation older than the one on
+    // screen are discarded (without decoding).
+    if !display.would_display(&header) {
+        stats.stale_generation += 1;
+        eprintln!(
+            "discarding frame of stale generation {} (frame_id {}), displaying generation {:?}",
+            header.generation,
+            header.frame_id,
+            display.current_generation()
+        );
+        return Ok(());
+    }
+
+    match sink {
+        VideoSink::Log => {
+            let payload_len = payload.len();
+            let (width, height) = (header.width, header.height);
+            let decoded = tokio::task::spawn_blocking(move || {
+                decoder::decode_single_frame(&payload, width, height)
+            })
             .await??;
-    let decode_done_ts = clock::now_us();
+            let decode_done_ts = clock::now_us();
 
-    let timecode = extract_timecode(&decoded);
-    let display_ts = clock::now_us();
-
-    println!(
-        "frame generation={} frame_id={} idr={} timecode_us={} capture_ts={} bytes={}",
-        header.generation,
-        header.frame_id,
-        header.is_idr(),
-        timecode,
-        header.capture_ts,
-        payload_len
-    );
-
-    let feedback = feedback_session::build_transport_feedback(
-        &header,
-        payload_len,
-        &FrameTimestamps {
-            receive_ts,
-            decode_done_ts,
-            display_ts,
-        },
-        offset_us,
-        target_latency_us,
-    );
-    feedback_session::send_transport_feedback(feedback_send, &feedback).await?;
+            let timecode = extract_timecode(&decoded);
+            let outcome = display.submit_frame(
+                &header,
+                DisplayedFrame {
+                    timecode_us: Some(timecode),
+                },
+            );
+            debug_assert_eq!(outcome, SubmitOutcome::Displayed, "gated by would_display above");
+            let display_ts = clock::now_us();
+            println!(
+                "frame generation={} frame_id={} idr={} timecode_us={} capture_ts={} bytes={}",
+                header.generation,
+                header.frame_id,
+                header.is_idr(),
+                timecode,
+                header.capture_ts,
+                payload_len
+            );
+            let timestamps = FrameTimestamps {
+                receive_ts,
+                decode_done_ts,
+                display_ts,
+            };
+            stats.record_displayed(&header, payload_len, &timestamps, None, true);
+            let feedback = feedback_session::build_transport_feedback(
+                &header,
+                payload_len,
+                &timestamps,
+                offset_us,
+                target_latency_us,
+            );
+            feedback_session::send_transport_feedback(feedback_send, &feedback).await?;
+        }
+        #[cfg(windows)]
+        VideoSink::Window { window, pending } => {
+            if window.is_closed() {
+                // The user closed the window; the timing arm ends the
+                // session on its next poll. Don't turn the race into an
+                // error here.
+                return Ok(());
+            }
+            let payload_len = payload.len();
+            window
+                .submit(sardp_win::SubmittedFrame {
+                    generation: header.generation,
+                    frame_id: header.frame_id,
+                    is_idr: header.is_idr(),
+                    width: header.width,
+                    height: header.height,
+                    annex_b: payload,
+                    receive_ts,
+                })
+                .map_err(|e| AppError::Display(e.to_string()))?;
+            // "Submitted for display" is the point the generation gate
+            // tracks; decode/present timing arrives via
+            // `next_window_timing` and is what the feedback reports.
+            let outcome = display.submit_frame(&header, DisplayedFrame { timecode_us: None });
+            debug_assert_eq!(outcome, SubmitOutcome::Displayed, "gated by would_display above");
+            pending.push_back(PendingFeedback { header, payload_len });
+            if pending.len() > 64 && pending.len().is_power_of_two() {
+                eprintln!(
+                    "window decoder behind: {} frames queued (newest generation={} frame_id={})",
+                    pending.len(),
+                    header.generation,
+                    header.frame_id
+                );
+            }
+        }
+    }
     Ok(())
 }

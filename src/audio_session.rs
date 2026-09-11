@@ -155,6 +155,19 @@ pub async fn accept_audio_capture_gated(
     if stream_prologue.kind != StreamKind::AudioCapture {
         return Err(AudioError::WrongStreamKind);
     }
+    accept_audio_capture_from_reader(reader, audio_capture_granted).await
+}
+
+/// The part of [`accept_audio_capture_gated`] after the `StreamPrologue`,
+/// for a caller that accepts every incoming unidirectional stream in one
+/// place and dispatches on `kind` (a server that also accepts `input`
+/// streams can't have two `accept_uni()` callers racing for the same
+/// stream). `reader` must be positioned just past an `audio_capture`
+/// prologue.
+pub async fn accept_audio_capture_from_reader(
+    mut reader: EnvelopeReader,
+    audio_capture_granted: bool,
+) -> Result<Option<(AudioConfig, AudioFrameReader)>, AudioError> {
     if !audio_capture_granted {
         reader.stop(quinn::VarInt::from_u32(0));
         return Ok(None);
