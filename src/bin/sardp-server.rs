@@ -30,6 +30,8 @@ use sardp::feedback_session::FeedbackReceiver;
 use sardp::file_handle_store::FileHandleStore;
 use sardp::file_transfer_session::{self as file_transfer};
 use sardp::handshake::ControlChannel;
+use sardp::input_session::{InputMessage, InputReceiver};
+use sardp::input_state::{ImeModeSm, PressedInputs, Release, should_inject_key};
 use sardp::messages::{
     self, AudioCodec, AudioConfig, ChromaFormat, ClipboardFormatEntry, ClipboardFormats, Codec,
     EncoderConfig, FileTransferAccept, FileTransferReject, FileTransferRequest, FormatNamespace,
@@ -63,13 +65,17 @@ struct Args {
     /// kept for debugging and for the ffmpeg-per-frame `--display log`
     /// client path, which can only decode self-contained frames.
     all_idr: bool,
+    /// Pause between characters of injected `TextInput` (Windows desktop
+    /// capture only; KNOWN_ISSUES.md #13).
+    text_char_delay_ms: u64,
 }
 
-/// Per-connection copy of the capture-related arguments.
+/// Per-connection copy of the capture/injection-related arguments.
 #[derive(Debug, Clone, Copy)]
 struct CaptureSettings {
     mode: CaptureMode,
     all_idr: bool,
+    text_char_delay_ms: u64,
 }
 
 /// Where video frames come from (`--capture`).
@@ -240,11 +246,17 @@ OPTIONS:\n\
                             --width/--height/--fps are then taken from the display)\n\
     --all-idr               With --capture desktop: encode every frame as an IDR\n\
                             (needed for a client running --display log; default off)\n\
+    --text-char-delay-ms <N> With --capture desktop: pause between characters of\n\
+                            injected TextInput (default 50; KNOWN_ISSUES #13)\n\
     --server-name <NAME>    Name announced in ServerHello (default sardp-server)\n\
     --help                  Show this message\n\n\
+With --capture desktop, the client's input stream (spec 2.12) is injected\n\
+into this desktop via SendInput; with synthetic capture it is only logged.\n\n\
 Once a client is connected, typing one of the following (Enter) toggles\n\
 the corresponding permission live, or triggers a one-shot action:\n\
     grant-view / revoke-view\n\
+    grant-keyboard / revoke-keyboard\n\
+    grant-mouse / revoke-mouse\n\
     grant-clip-read / revoke-clip-read\n\
     grant-audio-playback / revoke-audio-playback\n\
     grant-audio-capture / revoke-audio-capture\n\
@@ -265,6 +277,7 @@ fn parse_args() -> Args {
     let mut server_name = "sardp-server".to_string();
     let mut capture = CaptureMode::Synthetic;
     let mut all_idr = false;
+    let mut text_char_delay_ms = 50u64;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -326,6 +339,13 @@ fn parse_args() -> Args {
                 }
             }
             "--all-idr" => all_idr = true,
+            "--text-char-delay-ms" => {
+                text_char_delay_ms = args
+                    .next()
+                    .expect("--text-char-delay-ms requires a value")
+                    .parse()
+                    .expect("invalid --text-char-delay-ms")
+            }
             "--help" | "-h" => {
                 print_help();
                 std::process::exit(0);
@@ -349,6 +369,7 @@ fn parse_args() -> Args {
         server_name,
         capture,
         all_idr,
+        text_char_delay_ms,
     }
 }
 
@@ -462,7 +483,11 @@ async fn main() {
                 let trusted_pubkey = args.trusted_pubkey;
                 let server_name = args.server_name.clone();
                 let (width, height, fps) = (args.width, args.height, args.fps);
-                let capture = CaptureSettings { mode: args.capture, all_idr: args.all_idr };
+                let capture = CaptureSettings {
+                    mode: args.capture,
+                    all_idr: args.all_idr,
+                    text_char_delay_ms: args.text_char_delay_ms,
+                };
                 let shutdown = shutdown.clone();
                 let permission_command = permission_command.clone();
                 let state = state.clone();
@@ -630,6 +655,30 @@ async fn handle_connection(
         CaptureMode::Desktop => unreachable!("--capture desktop is rejected at argument parsing off Windows"),
     };
 
+    // Input injection (spec 2.12, 3W-1-d-4) goes to the real desktop only
+    // when the video comes from it; a synthetic-video session logs the
+    // events instead, so a dev machine running the synthetic server never
+    // gets its keyboard/mouse driven by a test client.
+    let input_sink = match &frame_source {
+        #[cfg(windows)]
+        FrameSource::Desktop(source) => {
+            let info = source.info();
+            eprintln!(
+                "[{peer}] input injection: SendInput, output origin ({}, {}), text char delay {}ms",
+                info.origin_x, info.origin_y, capture.text_char_delay_ms
+            );
+            InputSink::Windows(sardp_win::InputInjector::start(sardp_win::InjectorConfig {
+                text_unit_delay: Duration::from_millis(capture.text_char_delay_ms),
+                output_origin: (info.origin_x, info.origin_y),
+            }))
+        }
+        _ => {
+            eprintln!("[{peer}] input injection: log only (synthetic capture)");
+            InputSink::Log
+        }
+    };
+    let mut input_injection = InputInjection::new(input_sink, peer);
+
     let encoder_config = EncoderConfig {
         codec: Codec::H264,
         profile,
@@ -690,6 +739,7 @@ async fn handle_connection(
         permission_sm,
         encoder_config,
         &mut frame_source,
+        &mut input_injection,
         fps,
         peer,
         &shutdown,
@@ -700,6 +750,9 @@ async fn handle_connection(
         &ctx.user_id,
     )
     .await;
+    // Spec 4.4.2: whatever the session left pressed is released now,
+    // whichever way the session ended.
+    input_injection.release_all();
 
     match result {
         Ok(()) => Ok(()),
@@ -768,6 +821,7 @@ async fn run_active_session(
     mut permission_sm: PermissionSm,
     encoder_config: EncoderConfig,
     frame_source: &mut FrameSource,
+    input_injection: &mut InputInjection,
     fps: f64,
     peer: SocketAddr,
     shutdown: &Arc<Notify>,
@@ -778,6 +832,8 @@ async fn run_active_session(
     user_id: &str,
 ) -> Result<(), ConnError> {
     let (width, height) = (encoder_config.width, encoder_config.height);
+    // The client's `input` stream (spec 2.12), once it opens one.
+    let mut input_receiver: Option<InputReceiver> = None;
     // For the synthetic source this paces frame generation; for the
     // desktop source frames arrive on their own arm and this tick only
     // services admin commands.
@@ -1001,26 +1057,65 @@ async fn run_active_session(
                     audio_sequence += 1;
                 }
             }
-            accept_result = audio_session::accept_audio_capture_gated(connection, permission_sm.is_granted(bit::AUDIO_CAPTURE)) => {
-                match accept_result? {
-                    Some((_config, mut frame_reader)) => {
-                        eprintln!("[{peer}] accepted audio_capture stream");
-                        tokio::spawn(async move {
-                            loop {
-                                match frame_reader.read_next_frame().await {
-                                    Ok((header, payload)) => {
-                                        eprintln!("[{peer}] audio_capture frame sequence={} bytes={}", header.sequence, payload.len());
+            // Every client-initiated unidirectional stream (audio_capture,
+            // input) is accepted here and dispatched on its prologue's
+            // `kind`: two `accept_uni()` arms would race for the same
+            // stream and each reject the other's kind.
+            accepted = accept_incoming_uni(connection) => {
+                let (kind, mut reader) = accepted?;
+                match kind {
+                    StreamKind::AudioCapture => {
+                        match audio_session::accept_audio_capture_from_reader(reader, permission_sm.is_granted(bit::AUDIO_CAPTURE)).await? {
+                            Some((_config, mut frame_reader)) => {
+                                eprintln!("[{peer}] accepted audio_capture stream");
+                                tokio::spawn(async move {
+                                    loop {
+                                        match frame_reader.read_next_frame().await {
+                                            Ok((header, payload)) => {
+                                                eprintln!("[{peer}] audio_capture frame sequence={} bytes={}", header.sequence, payload.len());
+                                            }
+                                            Err(e) => {
+                                                eprintln!("[{peer}] audio_capture stream ended: {e:?}");
+                                                return;
+                                            }
+                                        }
                                     }
-                                    Err(e) => {
-                                        eprintln!("[{peer}] audio_capture stream ended: {e:?}");
-                                        return;
-                                    }
-                                }
+                                });
                             }
-                        });
+                            None => {
+                                eprintln!("[{peer}] refused audio_capture stream: AUDIO_CAPTURE not granted");
+                            }
+                        }
                     }
-                    None => {
-                        eprintln!("[{peer}] refused audio_capture stream: AUDIO_CAPTURE not granted");
+                    StreamKind::Input => {
+                        if input_receiver.is_some() {
+                            eprintln!("[{peer}] refused a second input stream");
+                            reader.stop(quinn::VarInt::from_u32(0));
+                        } else {
+                            eprintln!("[{peer}] accepted input stream");
+                            input_receiver = Some(InputReceiver::from_reader(reader));
+                        }
+                    }
+                    other => {
+                        eprintln!("[{peer}] refused unexpected client-initiated stream kind {other:?}");
+                        reader.stop(quinn::VarInt::from_u32(0));
+                    }
+                }
+            }
+            input = async { input_receiver.as_mut().expect("guarded by the arm precondition").read_message().await },
+                if input_receiver.is_some() =>
+            {
+                match input {
+                    Ok(message) => {
+                        last_activity = tokio::time::Instant::now();
+                        input_injection.handle(message, &permission_sm)?;
+                    }
+                    Err(e) => {
+                        // Spec 4.4.2: the stream closing releases whatever
+                        // it left pressed. The client may open a new one.
+                        eprintln!("[{peer}] input stream ended: {e:?}");
+                        input_injection.release_all();
+                        input_receiver = None;
                     }
                 }
             }
@@ -1064,6 +1159,222 @@ async fn run_active_session(
     }
 }
 
+/// Accepts the next client-initiated unidirectional stream and reads its
+/// `StreamPrologue`, leaving the dispatch on `kind` to the caller.
+async fn accept_incoming_uni(
+    connection: &quinn::Connection,
+) -> Result<(StreamKind, EnvelopeReader), ConnError> {
+    let recv = connection.accept_uni().await?;
+    let mut reader = EnvelopeReader::new(recv);
+    let prologue = reader.read_prologue().await?;
+    Ok((prologue.kind, reader))
+}
+
+/// Where a session's input events go (spec 2.12 -> OS).
+enum InputSink {
+    /// Log only (synthetic video: nothing to drive).
+    Log,
+    #[cfg(windows)]
+    Windows(sardp_win::InputInjector),
+}
+
+/// Per-session input state (spec 4.4): IME mode SM, the pressed-key
+/// invariant, permission gating, and the sink events are delivered to.
+struct InputInjection {
+    sink: InputSink,
+    ime: ImeModeSm,
+    pressed: PressedInputs,
+    peer: SocketAddr,
+    /// Counters for the log.
+    injected: u64,
+    dropped_not_granted: u64,
+    skipped_character_keys: u64,
+    mouse_moves: u64,
+}
+
+impl InputInjection {
+    fn new(sink: InputSink, peer: SocketAddr) -> Self {
+        Self {
+            sink,
+            ime: ImeModeSm::new(),
+            pressed: PressedInputs::new(),
+            peer,
+            injected: 0,
+            dropped_not_granted: 0,
+            skipped_character_keys: 0,
+            mouse_moves: 0,
+        }
+    }
+
+    /// Applies one `input` stream message. Permission checks use the live
+    /// `PermissionSm` (a revoke drops events from that moment on, spec
+    /// 4.5); `Err` only for protocol violations (spec 4.4.1's forbidden
+    /// messages), which end the session.
+    fn handle(&mut self, message: InputMessage, permission_sm: &PermissionSm) -> Result<(), ConnError> {
+        let peer = self.peer;
+        let keyboard = permission_sm.is_granted(bit::INPUT_KEYBOARD);
+        let mouse = permission_sm.is_granted(bit::INPUT_MOUSE);
+        let mut not_granted = |what: &str, id: u64| {
+            self.dropped_not_granted += 1;
+            if self.dropped_not_granted.is_power_of_two() {
+                eprintln!("[{peer}] dropped {what} event {id}: permission not granted ({} so far)", self.dropped_not_granted);
+            }
+        };
+        match message {
+            InputMessage::ImeModeChange(change) => {
+                eprintln!(
+                    "[{peer}] IME mode -> {:?} after event {}",
+                    change.mode, change.effective_after_event_id
+                );
+                self.ime.on_mode_change(&change);
+            }
+            InputMessage::Key(key) => {
+                let mode = self.ime.mode_for(key.header.event_id);
+                if !keyboard {
+                    not_granted("key", key.header.event_id);
+                    return Ok(());
+                }
+                if !should_inject_key(mode, key.scancode, key.modifiers) {
+                    // Spec 2.12: the character comes via TextInput.
+                    self.skipped_character_keys += 1;
+                    return Ok(());
+                }
+                self.pressed.on_key(key.scancode, key.down);
+                eprintln!(
+                    "[{peer}] key event {}: hid={:#04x} down={} modifiers={:#06b}",
+                    key.header.event_id, key.scancode, key.down, key.modifiers
+                );
+                self.emit(SinkEvent::Key {
+                    hid_usage: key.scancode,
+                    down: key.down,
+                });
+            }
+            InputMessage::Text(text) => {
+                let mode = self.ime.mode_for(text.header.event_id);
+                ImeModeSm::check_text_allowed(mode).map_err(ConnError::Violation)?;
+                if !keyboard {
+                    not_granted("text", text.header.event_id);
+                    return Ok(());
+                }
+                eprintln!("[{peer}] text event {}: {:?}", text.header.event_id, text.text);
+                self.emit(SinkEvent::Text(text.text));
+            }
+            InputMessage::ImeComposition(composition) => {
+                let mode = self.ime.mode_for(composition.header.event_id);
+                ImeModeSm::check_text_allowed(mode).map_err(ConnError::Violation)?;
+                if !keyboard {
+                    not_granted("ime composition", composition.header.event_id);
+                    return Ok(());
+                }
+                // Nothing to inject: the committed text follows as
+                // TextInput. Logged so the client-side IME path is visible.
+                eprintln!(
+                    "[{peer}] ime composition event {}: {:?} caret={}",
+                    composition.header.event_id, composition.text, composition.caret
+                );
+            }
+            InputMessage::MouseMove(m) => {
+                if !mouse {
+                    not_granted("mouse move", m.header.event_id);
+                    return Ok(());
+                }
+                self.mouse_moves += 1;
+                if self.mouse_moves <= 3 || self.mouse_moves.is_multiple_of(100) {
+                    eprintln!("[{peer}] mouse move event {}: ({}, {})", m.header.event_id, m.x, m.y);
+                }
+                self.emit(SinkEvent::MouseMove { x: m.x, y: m.y });
+            }
+            InputMessage::MouseButton(b) => {
+                if !mouse {
+                    not_granted("mouse button", b.header.event_id);
+                    return Ok(());
+                }
+                self.pressed.on_button(b.button, b.down);
+                eprintln!(
+                    "[{peer}] mouse button event {}: button={} down={} at ({}, {})",
+                    b.header.event_id, b.button, b.down, b.x, b.y
+                );
+                // Position first, so the click lands where the client saw it.
+                self.emit(SinkEvent::MouseMove { x: b.x, y: b.y });
+                self.emit(SinkEvent::MouseButton {
+                    button: b.button,
+                    down: b.down,
+                });
+            }
+            InputMessage::Wheel(w) => {
+                if !mouse {
+                    not_granted("wheel", w.header.event_id);
+                    return Ok(());
+                }
+                eprintln!("[{peer}] wheel event {}: dx={} dy={}", w.header.event_id, w.dx, w.dy);
+                self.emit(SinkEvent::Wheel { dx: w.dx, dy: w.dy });
+            }
+        }
+        Ok(())
+    }
+
+    /// Spec 4.4.2: synthesize releases for everything still pressed.
+    fn release_all(&mut self) {
+        let releases = self.pressed.take_releases();
+        if releases.is_empty() {
+            return;
+        }
+        eprintln!("[{}] releasing {} pressed key(s)/button(s)", self.peer, releases.len());
+        for release in releases {
+            match release {
+                Release::Key(hid_usage) => self.emit(SinkEvent::Key { hid_usage, down: false }),
+                Release::Button(button) => self.emit(SinkEvent::MouseButton { button, down: false }),
+            }
+        }
+    }
+
+    fn emit(&mut self, event: SinkEvent) {
+        self.injected += 1;
+        match &self.sink {
+            InputSink::Log => {
+                if !matches!(event, SinkEvent::MouseMove { .. }) || self.mouse_moves <= 3 {
+                    eprintln!("[{}] (log-only sink) {event:?}", self.peer);
+                }
+            }
+            #[cfg(windows)]
+            InputSink::Windows(injector) => {
+                let command = match event {
+                    SinkEvent::Key { hid_usage, down } => sardp_win::InjectCommand::Key { hid_usage, down },
+                    SinkEvent::Text(text) => sardp_win::InjectCommand::Text(text),
+                    SinkEvent::MouseMove { x, y } => sardp_win::InjectCommand::MouseMove { x, y },
+                    SinkEvent::MouseButton { button, down } => {
+                        sardp_win::InjectCommand::MouseButton { button, down }
+                    }
+                    SinkEvent::Wheel { dx, dy } => sardp_win::InjectCommand::Wheel { dx, dy },
+                };
+                if let Err(e) = injector.inject(command) {
+                    eprintln!("[{}] input injection failed: {e}", self.peer);
+                }
+            }
+        }
+    }
+}
+
+impl Drop for InputInjection {
+    fn drop(&mut self) {
+        self.release_all();
+        eprintln!(
+            "[{}] input summary: injected={} skipped_character_keys={} dropped_not_granted={} mouse_moves={}",
+            self.peer, self.injected, self.skipped_character_keys, self.dropped_not_granted, self.mouse_moves
+        );
+    }
+}
+
+/// Sink-level event, after permission/IME/character-key decisions.
+#[derive(Debug)]
+enum SinkEvent {
+    Key { hid_usage: u32, down: bool },
+    Text(String),
+    MouseMove { x: i32, y: i32 },
+    MouseButton { button: u8, down: bool },
+    Wheel { dx: i16, dy: i16 },
+}
+
 /// A human-readable name for one of this server's admin-togglable
 /// `PermissionSet` bits, for the stdin admin log line -- falls back to the
 /// raw bitmask for anything not in that list (there shouldn't be any,
@@ -1072,6 +1383,8 @@ async fn run_active_session(
 fn permission_bit_name(toggled_bit: u32) -> String {
     match toggled_bit {
         b if b == bit::VIEW => "VIEW".to_string(),
+        b if b == bit::INPUT_KEYBOARD => "INPUT_KEYBOARD".to_string(),
+        b if b == bit::INPUT_MOUSE => "INPUT_MOUSE".to_string(),
         b if b == bit::CLIP_READ => "CLIP_READ".to_string(),
         b if b == bit::CLIP_WRITE => "CLIP_WRITE".to_string(),
         b if b == bit::AUDIO_PLAYBACK => "AUDIO_PLAYBACK".to_string(),

@@ -61,7 +61,8 @@ use windows::Win32::System::Com::{CoInitializeEx, CoTaskMemFree, CoUninitialize,
 use windows::Win32::System::Variant::VARIANT;
 
 use dxgi_capture_poc::capture::{
-    create_d3d11_device, create_output_duplication, primary_display_refresh_interval, FrameGuard,
+    create_d3d11_device, create_output_duplication, duplicated_output_desktop_rect,
+    primary_display_refresh_interval, FrameGuard,
 };
 
 /// Monotonic microsecond clock supplied by the caller, so the frames'
@@ -100,6 +101,11 @@ pub struct SourceInfo {
     pub height: u32,
     /// Display refresh rate, rounded; also the encoder's nominal frame rate.
     pub fps: u32,
+    /// Top-left of the captured output in virtual-desktop coordinates:
+    /// input positions relative to the captured image are offset by this
+    /// before injection.
+    pub origin_x: i32,
+    pub origin_y: i32,
 }
 
 /// One encoded frame: an Annex-B H.264 access unit. When `is_idr`, the
@@ -269,6 +275,13 @@ fn run_worker(
 
     let device_manager = create_device_manager(&device).map_err(|err| e("device manager", err))?;
     let duplication = create_output_duplication(&device).map_err(|err| e("DuplicateOutput", err))?;
+    let origin = match duplicated_output_desktop_rect(&device) {
+        Ok(rect) => (rect.left, rect.top),
+        Err(err) => {
+            eprintln!("[sardp-win] output desktop rect unavailable ({err}); assuming origin (0,0)");
+            (0, 0)
+        }
+    };
 
     let refresh = primary_display_refresh_interval();
     let fps = (1.0 / refresh.as_secs_f64()).round().max(1.0) as u32;
@@ -379,6 +392,8 @@ fn run_worker(
                     width: desc.Width,
                     height: desc.Height,
                     fps,
+                    origin_x: origin.0,
+                    origin_y: origin.1,
                 }));
             }
         }

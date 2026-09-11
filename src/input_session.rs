@@ -135,6 +135,14 @@ impl InputReceiver {
         Ok(Self { reader })
     }
 
+    /// For a caller that accepted the stream and validated its `input`
+    /// prologue itself (a server dispatching every incoming
+    /// unidirectional stream on `kind`, see
+    /// `audio_session::accept_audio_capture_from_reader`).
+    pub fn from_reader(reader: EnvelopeReader) -> Self {
+        Self { reader }
+    }
+
     /// Reads the next Envelope on this stream and decodes it as whichever
     /// spec 2.12 message type it carries.
     pub async fn read_message(&mut self) -> Result<InputMessage, ReadInputError> {

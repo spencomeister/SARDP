@@ -27,6 +27,14 @@
   自前で作った古典的なWin32 EDITコントロールに対し、複数の文字間隔(0/1/5/15/50ms)で
   `SendInput`して読み返しが一致するかを確認する。`send_input_poc`が踏んだ文字化けが
   「Windows全般の制約」か「対象コントロール固有の問題」かの切り分けに使った。
+- **`input_e2e_driver`**(3W-1-d-4、`src/bin/input_e2e_driver.rs`): 同一機で
+  `sardp-server --capture desktop`と`sardp-client --display window --input on`を動かした
+  状態で、クライアントウィンドウ(クラス`SardpDisplayWindow`)へ`PostMessage`でマウス・
+  キー入力を届け、SARDP経由で注入された結果(メモ帳へのクリックでのフォーカス移動、
+  実カーソル位置、打ち込まれた文字列と改行)を読み返して判定する。`SendInput`ではなく
+  `PostMessage`を使うのは、同一機では`SendInput`が前面ウィンドウ(=注入先のメモ帳)へ
+  直接届いてしまうため。メモ帳が前面にあることを確認できない場合は一切文字を送らず中断する
+  (3W-1-cの教訓)。
 
 ## ビルド・実行
 

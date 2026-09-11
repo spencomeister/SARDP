@@ -33,7 +33,12 @@ use sardp::connection_sm::{ConnectionSm, defaults as timeouts};
 use sardp::decoder;
 use sardp::feedback_session::{self, FrameTimestamps};
 use sardp::handshake::client_handshake;
-use sardp::messages::{self, AudioCodec, AudioConfig, SessionClose, VideoFrameHeader};
+use sardp::input_session;
+use sardp::input_state::{PressedInputs, Release};
+use sardp::messages::{
+    self, AudioCodec, AudioConfig, ImeComposition, InputHeader, KeyEvent, MouseButton, MouseMove,
+    SessionClose, TextInput, VideoFrameHeader, Wheel,
+};
 use sardp::permission_set::bit;
 use sardp::reason_code::ReasonCode;
 use sardp::reconnection::client_reconnect;
@@ -75,6 +80,9 @@ struct Args {
     /// Write the first few frames of generation 0 as raw Annex-B files
     /// here (diagnostics: what did the server's first IDR actually contain?).
     dump_frames: Option<PathBuf>,
+    /// `--display window` only: forward the window's keyboard/mouse input
+    /// to the server over the `input` stream (spec 2.12).
+    input: bool,
 }
 
 fn print_help() {
@@ -105,6 +113,9 @@ OPTIONS:\n\
                               (default 1280x720; frames are scaled to fit)\n\
     --dump-frames <DIR>       Save generation 0's first 3 frames as Annex-B\n\
                               .h264 files in DIR (diagnostics)\n\
+    --input <on|off>          With --display window: forward the window's\n\
+                              keyboard/mouse to the server (default on; needs\n\
+                              INPUT_KEYBOARD/INPUT_MOUSE granted)\n\
     --help                    Show this message"
     );
 }
@@ -122,6 +133,7 @@ fn parse_args() -> Args {
     let mut display = DisplayMode::Log;
     let mut window_size = (1280u32, 720u32);
     let mut dump_frames: Option<PathBuf> = None;
+    let mut input = true;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -196,6 +208,16 @@ fn parse_args() -> Args {
                     args.next().expect("--dump-frames requires a value"),
                 ))
             }
+            "--input" => {
+                input = match args.next().expect("--input requires a value").as_str() {
+                    "on" => true,
+                    "off" => false,
+                    other => {
+                        eprintln!("invalid --input {other:?} (expected on or off)");
+                        std::process::exit(2);
+                    }
+                };
+            }
             "--help" | "-h" => {
                 print_help();
                 std::process::exit(0);
@@ -232,6 +254,7 @@ fn parse_args() -> Args {
         display,
         window_size,
         dump_frames,
+        input,
     }
 }
 
@@ -532,6 +555,37 @@ async fn run(connection: quinn::Connection, args: &Args) -> Result<(), AppError>
     let mut sink = VideoSink::open(args, &intro.encoder_config)?;
     let mut display: ClientDisplay<DisplayedFrame> = ClientDisplay::new();
     let mut stats = FrameStats::default();
+
+    // Input forwarding (spec 2.12): only a window can produce input, only
+    // if asked to, and only if the server granted at least one of the two
+    // input permissions at handshake/reconnect time (a later grant isn't
+    // reacted to -- same PoC limitation as AUDIO_CAPTURE above).
+    let stream_size = (intro.encoder_config.width, intro.encoder_config.height);
+    let mut window_input = sink.take_input_receiver();
+    let input_granted = granted_permissions & (bit::INPUT_KEYBOARD | bit::INPUT_MOUSE);
+    let mut input_forwarder = if window_input.is_some() && args.input && input_granted != 0 {
+        let send = input_session::open_input_stream(&connection).await?;
+        eprintln!(
+            "opened input stream (keyboard={}, mouse={}); window {}x{} -> stream {}x{}",
+            granted_permissions & bit::INPUT_KEYBOARD != 0,
+            granted_permissions & bit::INPUT_MOUSE != 0,
+            args.window_size.0,
+            args.window_size.1,
+            stream_size.0,
+            stream_size.1
+        );
+        Some(InputForwarder::new(send, granted_permissions, stream_size, args.window_size))
+    } else {
+        if window_input.is_some() {
+            eprintln!(
+                "input forwarding off ({})",
+                if args.input { "no input permission granted" } else { "--input off" }
+            );
+            window_input = None;
+        }
+        None
+    };
+
     if let Some(dir) = &args.dump_frames {
         // Fresh cumulative file per run.
         let _ = std::fs::remove_file(dir.join("gen0_first3.h264"));
@@ -613,6 +667,9 @@ async fn run(connection: quinn::Connection, args: &Args) -> Result<(), AppError>
             () = shutdown_signal() => {
                 eprintln!("shutting down, closing session");
                 stats.print_summary();
+                if let Some(forwarder) = input_forwarder.as_mut() {
+                    let _ = forwarder.release_all().await;
+                }
                 close_gracefully(&connection, &mut control.send, ReasonCode::NONE).await;
                 return Ok(());
             }
@@ -687,10 +744,18 @@ async fn run(connection: quinn::Connection, args: &Args) -> Result<(), AppError>
                 let Some(timing) = timing else {
                     eprintln!("display window closed by the user, closing session");
                     stats.print_summary();
+                    if let Some(forwarder) = input_forwarder.as_mut() {
+                        let _ = forwarder.release_all().await;
+                    }
                     close_gracefully(&connection, &mut control.send, ReasonCode::NONE).await;
                     return Ok(());
                 };
                 sink.on_window_timing(timing, &mut stats, &mut feedback_send, timesync.offset_us, args.target_latency_us).await?;
+            }
+            event = next_window_input(&mut window_input) => {
+                if let Some(forwarder) = input_forwarder.as_mut() {
+                    forwarder.forward(event).await?;
+                }
             }
             _ = audio_capture_interval.tick() => {
                 if let Some(send) = audio_capture_send.as_mut() {
@@ -887,6 +952,15 @@ impl VideoSink {
         }
     }
 
+    /// The window's input events (window mode, once); `None` in log mode.
+    fn take_input_receiver(&mut self) -> Option<WindowInputRx> {
+        match self {
+            Self::Log => None,
+            #[cfg(windows)]
+            Self::Window { window, .. } => window.take_input_receiver(),
+        }
+    }
+
     /// `select!` arm: the window's next decode/present timing report.
     /// Never completes in `log` mode; `Some(None)` once the window is gone.
     async fn next_window_timing(&mut self) -> Option<WindowTiming> {
@@ -955,6 +1029,236 @@ impl VideoSink {
             feedback_session::send_transport_feedback(feedback_send, &feedback).await?;
         }
         let _ = (&timing, &*stats, &*feedback_send, offset_us, target_latency_us);
+        Ok(())
+    }
+}
+
+/// The window's input event type, per platform (only Windows has a
+/// window; elsewhere the receiver is always `None` and the arm never
+/// fires).
+#[cfg(windows)]
+type WindowInputEvent = sardp_win::WindowInput;
+#[cfg(not(windows))]
+type WindowInputEvent = std::convert::Infallible;
+type WindowInputRx = tokio::sync::mpsc::UnboundedReceiver<WindowInputEvent>;
+
+/// `select!` arm: the next input event from the window. Pends forever
+/// without a window (or once its event channel has closed -- the timing
+/// arm is what notices the window going away).
+async fn next_window_input(rx: &mut Option<WindowInputRx>) -> WindowInputEvent {
+    match rx {
+        Some(receiver) => match receiver.recv().await {
+            Some(event) => event,
+            None => {
+                *rx = None;
+                std::future::pending().await
+            }
+        },
+        None => std::future::pending().await,
+    }
+}
+
+/// Turns window input into spec 2.12 messages on the `input` stream:
+/// event ids, client timestamps, window -> stream coordinate mapping,
+/// per-permission filtering, and the spec 4.4.2 pressed-set so focus loss
+/// or shutdown releases whatever this client reported as down.
+struct InputForwarder {
+    send: quinn::SendStream,
+    next_event_id: u64,
+    pressed: PressedInputs,
+    keyboard: bool,
+    mouse: bool,
+    stream_size: (u32, u32),
+    window_size: (u32, u32),
+    sent: u64,
+    mouse_moves: u64,
+}
+
+impl InputForwarder {
+    fn new(
+        send: quinn::SendStream,
+        granted_permissions: u32,
+        stream_size: (u32, u32),
+        window_size: (u32, u32),
+    ) -> Self {
+        Self {
+            send,
+            next_event_id: 1,
+            pressed: PressedInputs::new(),
+            keyboard: granted_permissions & bit::INPUT_KEYBOARD != 0,
+            mouse: granted_permissions & bit::INPUT_MOUSE != 0,
+            stream_size,
+            window_size,
+            sent: 0,
+            mouse_moves: 0,
+        }
+    }
+
+    fn header(&mut self) -> InputHeader {
+        let event_id = self.next_event_id;
+        self.next_event_id += 1;
+        self.sent += 1;
+        InputHeader {
+            event_id,
+            client_ts: clock::now_us(),
+        }
+    }
+
+    /// Window client-area pixels -> stream (captured desktop) pixels.
+    fn map(&self, x: i32, y: i32) -> (i32, i32) {
+        let scale = |v: i32, from: u32, to: u32| -> i32 {
+            let mapped = i64::from(v) * i64::from(to) / i64::from(from.max(1));
+            mapped.clamp(0, i64::from(to.saturating_sub(1))) as i32
+        };
+        (
+            scale(x, self.window_size.0, self.stream_size.0),
+            scale(y, self.window_size.1, self.stream_size.1),
+        )
+    }
+
+    #[cfg(windows)]
+    async fn forward(&mut self, event: WindowInputEvent) -> Result<(), AppError> {
+        use sardp_win::WindowInput;
+        match event {
+            WindowInput::Key {
+                down,
+                hid_usage,
+                virtual_key,
+                modifiers,
+            } => {
+                if !self.keyboard {
+                    return Ok(());
+                }
+                self.pressed.on_key(hid_usage, down);
+                let key = KeyEvent {
+                    header: self.header(),
+                    down,
+                    scancode: hid_usage,
+                    logical_key: virtual_key,
+                    modifiers,
+                };
+                eprintln!(
+                    "input: key event {} hid={hid_usage:#04x} vk={virtual_key:#04x} down={down} modifiers={modifiers:#06b}",
+                    key.header.event_id
+                );
+                input_session::send_key_event(&mut self.send, &key).await?;
+            }
+            WindowInput::Text(text) => {
+                if !self.keyboard {
+                    return Ok(());
+                }
+                let event = TextInput {
+                    header: self.header(),
+                    text,
+                };
+                eprintln!("input: text event {} {:?}", event.header.event_id, event.text);
+                input_session::send_text_input(&mut self.send, &event).await?;
+            }
+            WindowInput::ImeComposition { text, caret } => {
+                if !self.keyboard {
+                    return Ok(());
+                }
+                let event = ImeComposition {
+                    header: self.header(),
+                    text,
+                    caret,
+                };
+                eprintln!(
+                    "input: ime composition event {} {:?} caret={}",
+                    event.header.event_id, event.text, event.caret
+                );
+                input_session::send_ime_composition(&mut self.send, &event).await?;
+            }
+            WindowInput::MouseMove { x, y } => {
+                if !self.mouse {
+                    return Ok(());
+                }
+                let (x, y) = self.map(x, y);
+                let event = MouseMove {
+                    header: self.header(),
+                    x,
+                    y,
+                };
+                self.mouse_moves += 1;
+                if self.mouse_moves <= 3 || self.mouse_moves.is_multiple_of(100) {
+                    eprintln!("input: mouse move event {} -> ({x}, {y})", event.header.event_id);
+                }
+                input_session::send_mouse_move(&mut self.send, &event).await?;
+            }
+            WindowInput::MouseButton { button, down, x, y } => {
+                if !self.mouse {
+                    return Ok(());
+                }
+                let (x, y) = self.map(x, y);
+                self.pressed.on_button(button, down);
+                let event = MouseButton {
+                    header: self.header(),
+                    button,
+                    down,
+                    x,
+                    y,
+                };
+                eprintln!(
+                    "input: mouse button event {} button={button} down={down} -> ({x}, {y})",
+                    event.header.event_id
+                );
+                input_session::send_mouse_button(&mut self.send, &event).await?;
+            }
+            WindowInput::Wheel { dx, dy } => {
+                if !self.mouse {
+                    return Ok(());
+                }
+                let event = Wheel {
+                    header: self.header(),
+                    dx,
+                    dy,
+                    is_precise: false,
+                };
+                eprintln!("input: wheel event {} dx={dx} dy={dy}", event.header.event_id);
+                input_session::send_wheel(&mut self.send, &event).await?;
+            }
+            WindowInput::FocusLost => {
+                if !self.pressed.is_empty() {
+                    eprintln!("input: window lost focus, releasing pressed keys/buttons");
+                    self.release_all().await?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(not(windows))]
+    async fn forward(&mut self, event: WindowInputEvent) -> Result<(), AppError> {
+        match event {}
+    }
+
+    /// Spec 4.4.2 from the client side: send a release for everything
+    /// this client reported as pressed.
+    async fn release_all(&mut self) -> Result<(), AppError> {
+        for release in self.pressed.take_releases() {
+            match release {
+                Release::Key(hid_usage) => {
+                    let key = KeyEvent {
+                        header: self.header(),
+                        down: false,
+                        scancode: hid_usage,
+                        logical_key: 0,
+                        modifiers: 0,
+                    };
+                    input_session::send_key_event(&mut self.send, &key).await?;
+                }
+                Release::Button(button) => {
+                    let event = MouseButton {
+                        header: self.header(),
+                        button,
+                        down: false,
+                        x: 0,
+                        y: 0,
+                    };
+                    input_session::send_mouse_button(&mut self.send, &event).await?;
+                }
+            }
+        }
         Ok(())
     }
 }
@@ -1134,6 +1438,12 @@ async fn process_frame(
         }
         #[cfg(windows)]
         VideoSink::Window { window, pending } => {
+            if window.is_closed() {
+                // The user closed the window; the timing arm ends the
+                // session on its next poll. Don't turn the race into an
+                // error here.
+                return Ok(());
+            }
             let payload_len = payload.len();
             window
                 .submit(sardp_win::SubmittedFrame {

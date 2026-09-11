@@ -21,6 +21,7 @@ pub mod file_transfer_session;
 pub mod h264;
 pub mod handshake;
 pub mod input_session;
+pub mod input_state;
 pub mod measurement;
 pub mod messages;
 pub mod monitor_manager;

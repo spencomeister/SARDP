@@ -507,6 +507,26 @@ pub struct AudioSyncFeedback {
     pub drift_ppm: i32,
 }
 
+/// `MouseButton.button` values. Spec 2.12 leaves the numbering to the
+/// implementation; this one is shared by `sardp-client`, `sardp-server`
+/// and `sardp-win` (which mirrors it, see `sardp_win::input::button`).
+pub mod mouse_button {
+    pub const LEFT: u8 = 1;
+    pub const RIGHT: u8 = 2;
+    pub const MIDDLE: u8 = 3;
+    pub const X1: u8 = 4;
+    pub const X2: u8 = 5;
+}
+
+/// `KeyEvent.modifiers` bits (implementation-defined, same sharing as
+/// [`mouse_button`]). `META` is the Windows/Command key.
+pub mod key_modifier {
+    pub const SHIFT: u16 = 1 << 0;
+    pub const CTRL: u16 = 1 << 1;
+    pub const ALT: u16 = 1 << 2;
+    pub const META: u16 = 1 << 3;
+}
+
 /// `InputHeader` (spec 2.12, `input` stream, client->server).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InputHeader {

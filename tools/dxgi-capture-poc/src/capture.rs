@@ -75,6 +75,21 @@ pub fn create_output_duplication(
     unsafe { output1.DuplicateOutput(device) }
 }
 
+/// Desktop-coordinate rectangle of the output [`create_output_duplication`]
+/// duplicates (output 0 of the device's adapter), i.e. where the captured
+/// image sits in the virtual desktop -- what input coordinates relative
+/// to the captured image must be offset by before injection.
+pub fn duplicated_output_desktop_rect(device: &ID3D11Device) -> windows::core::Result<RECT> {
+    let adapter: IDXGIAdapter = unsafe {
+        device
+            .cast::<windows::Win32::Graphics::Dxgi::IDXGIDevice>()?
+            .GetAdapter()?
+    };
+    let output: IDXGIOutput = unsafe { adapter.EnumOutputs(0) }?;
+    let desc = unsafe { output.GetDesc()? };
+    Ok(desc.DesktopCoordinates)
+}
+
 pub fn read_dirty_rects(
     duplication: &IDXGIOutputDuplication,
     frame_info: &DXGI_OUTDUPL_FRAME_INFO,

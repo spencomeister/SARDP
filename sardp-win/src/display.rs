@@ -59,16 +59,86 @@ use windows::Win32::Media::MediaFoundation::{
 use windows::Win32::System::Com::{CoInitializeEx, CoTaskMemFree, CoUninitialize, COINIT_MULTITHREADED};
 use windows::Win32::System::Variant::VARIANT;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::Input::Ime::{
+    GCS_COMPSTR, GCS_CURSORPOS, HIMC, ImmGetCompositionStringW, ImmGetContext, ImmReleaseContext,
+};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetKeyState, ReleaseCapture, SetCapture, VK_CONTROL, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRect, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-    PeekMessageW, PostQuitMessage, RegisterClassW, ShowWindow, TranslateMessage, CS_HREDRAW,
-    CS_VREDRAW, CW_USEDEFAULT, MSG, PM_REMOVE, SW_SHOW, WM_CLOSE, WM_DESTROY, WM_QUIT, WNDCLASSW,
-    WS_CAPTION, WS_EX_LEFT, WS_MINIMIZEBOX, WS_OVERLAPPED, WS_SYSMENU, WS_VISIBLE,
+    GetMessageExtraInfo, GetWindowLongPtrW, PeekMessageW, PostQuitMessage, RegisterClassW,
+    SetWindowLongPtrW, ShowWindow, TranslateMessage, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT,
+    GWLP_USERDATA, MSG, PM_REMOVE, SW_SHOW, WM_CHAR, WM_CLOSE, WM_DESTROY, WM_IME_COMPOSITION,
+    WM_IME_ENDCOMPOSITION, WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE,
+    WM_MOUSEWHEEL, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSCHAR, WM_SYSKEYDOWN, WM_SYSKEYUP,
+    WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW, WS_CAPTION, WS_EX_LEFT, WS_MINIMIZEBOX,
+    WS_OVERLAPPED, WS_SYSMENU, WS_VISIBLE,
 };
 
 use dxgi_capture_poc::capture::create_d3d11_device;
 
 use crate::desktop_h264::Clock;
+use crate::inject::{button, modifier, INJECTED_EXTRA_INFO};
+use crate::keymap;
+
+/// Input the user gave the window (3W-1-d-4), in window client-area
+/// pixels; the client maps positions to the stream's pixel space and
+/// turns these into spec 2.12 messages.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WindowInput {
+    /// A physical key. `hid_usage` is the USB HID usage (spec 2.12
+    /// `scancode`), `virtual_key` the Windows VK code (platform-local
+    /// `logical_key`), `modifiers` per `inject::modifier`.
+    Key {
+        down: bool,
+        hid_usage: u32,
+        virtual_key: u32,
+        modifiers: u16,
+    },
+    /// Committed text (`WM_CHAR`, including IME results), control
+    /// characters excluded -- those keys travel as `Key`.
+    Text(String),
+    /// In-progress IME composition (`WM_IME_COMPOSITION`); empty text
+    /// when the composition ends.
+    ImeComposition { text: String, caret: u16 },
+    MouseMove { x: i32, y: i32 },
+    /// `button` per `inject::button`.
+    MouseButton { button: u8, down: bool, x: i32, y: i32 },
+    /// `WHEEL_DELTA` (120) units.
+    Wheel { dx: i16, dy: i16 },
+    /// The window lost keyboard focus: whatever the client reported as
+    /// held down should be released on the remote side.
+    FocusLost,
+}
+
+/// Per-window state the window procedure needs, reachable through
+/// `GWLP_USERDATA`.
+struct WindowState {
+    input_tx: mpsc::UnboundedSender<WindowInput>,
+    /// DR-025: while an IME composition is in progress, the physical keys
+    /// feeding it are not reported as `Key` events.
+    composing: bool,
+    /// `WM_CHAR` delivers a non-BMP character as two messages.
+    pending_high_surrogate: Option<u16>,
+    buttons_down: u8,
+}
+
+/// Detaches and frees the `WindowState` when the display thread exits.
+struct UserDataGuard {
+    hwnd: HWND,
+    state: *mut WindowState,
+}
+
+impl Drop for UserDataGuard {
+    fn drop(&mut self) {
+        unsafe {
+            SetWindowLongPtrW(self.hwnd, GWLP_USERDATA, 0);
+            drop(Box::from_raw(self.state));
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct DisplayConfig {
@@ -166,6 +236,9 @@ pub struct H264DisplayWindow {
     /// new generation, which is what makes the backlog skippable.
     tx: std::sync::mpsc::Sender<SubmittedFrame>,
     timing_rx: mpsc::Receiver<FrameTiming>,
+    /// Taken by the client with [`Self::take_input_receiver`] so it can
+    /// be polled independently of [`Self::next_timing`].
+    input_rx: Option<mpsc::UnboundedReceiver<WindowInput>>,
     shared: Arc<Shared>,
     worker: Option<JoinHandle<()>>,
 }
@@ -176,6 +249,9 @@ impl H264DisplayWindow {
     pub fn open(config: DisplayConfig, clock: Clock) -> Result<Self, WinDisplayError> {
         let (tx, rx) = std::sync::mpsc::channel::<SubmittedFrame>();
         let (timing_tx, timing_rx) = mpsc::channel::<FrameTiming>(64);
+        // Unbounded: key events must never be dropped (a lost key-up is a
+        // stuck key), and the volume is tiny next to video.
+        let (input_tx, input_rx) = mpsc::unbounded_channel::<WindowInput>();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
         let shared = Arc::new(Shared {
             closed: AtomicBool::new(false),
@@ -186,7 +262,7 @@ impl H264DisplayWindow {
             let shared = shared.clone();
             std::thread::Builder::new()
                 .name("sardp-win-display".into())
-                .spawn(move || worker_main(config, clock, rx, timing_tx, ready_tx, shared))
+                .spawn(move || worker_main(config, clock, rx, timing_tx, input_tx, ready_tx, shared))
                 .map_err(|e| WinDisplayError::Init(format!("spawn display thread: {e}")))?
         };
 
@@ -206,9 +282,17 @@ impl H264DisplayWindow {
         Ok(Self {
             tx,
             timing_rx,
+            input_rx: Some(input_rx),
             shared,
             worker: Some(worker),
         })
+    }
+
+    /// The window's input events, as a receiver the caller owns (so it
+    /// can sit in a `select!` next to [`Self::next_timing`]). `None` after
+    /// the first call. Ends (`recv() == None`) when the window is gone.
+    pub fn take_input_receiver(&mut self) -> Option<mpsc::UnboundedReceiver<WindowInput>> {
+        self.input_rx.take()
     }
 
     /// Queues a frame for decode+display. Never blocks and never drops
@@ -250,6 +334,7 @@ fn worker_main(
     clock: Clock,
     rx: std::sync::mpsc::Receiver<SubmittedFrame>,
     timing_tx: mpsc::Sender<FrameTiming>,
+    input_tx: mpsc::UnboundedSender<WindowInput>,
     ready_tx: std::sync::mpsc::Sender<Result<(), String>>,
     shared: Arc<Shared>,
 ) {
@@ -263,7 +348,7 @@ fn worker_main(
     }
 
     let mut ready_tx = Some(ready_tx);
-    if let Err(e) = run_worker(config, clock, rx, timing_tx, &mut ready_tx, &shared) {
+    if let Err(e) = run_worker(config, clock, rx, timing_tx, input_tx, &mut ready_tx, &shared) {
         if let Some(ready) = ready_tx.take() {
             let _ = ready.send(Err(e));
         } else {
@@ -325,6 +410,7 @@ fn run_worker(
     clock: Clock,
     rx: std::sync::mpsc::Receiver<SubmittedFrame>,
     timing_tx: mpsc::Sender<FrameTiming>,
+    input_tx: mpsc::UnboundedSender<WindowInput>,
     ready_tx: &mut Option<std::sync::mpsc::Sender<Result<(), String>>>,
     shared: &Shared,
 ) -> Result<(), String> {
@@ -332,6 +418,14 @@ fn run_worker(
 
     let hwnd = create_window(&config).map_err(|err| e("create window", err))?;
     trace(format!("window created: hwnd={:?}", hwnd.0));
+    let state = Box::into_raw(Box::new(WindowState {
+        input_tx,
+        composing: false,
+        pending_high_surrogate: None,
+        buttons_down: 0,
+    }));
+    unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, state as isize) };
+    let _user_data = UserDataGuard { hwnd, state };
 
     let (device, context) = create_d3d11_device(
         D3D11_CREATE_DEVICE_VIDEO_SUPPORT | D3D11_CREATE_DEVICE_BGRA_SUPPORT,
@@ -828,6 +922,13 @@ fn wide(s: &str) -> Vec<u16> {
 }
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    let state = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut WindowState;
+    if !state.is_null() {
+        let state = unsafe { &mut *state };
+        if let Some(result) = handle_input_message(hwnd, state, msg, wparam, lparam) {
+            return result;
+        }
+    }
     match msg {
         WM_CLOSE => {
             let _ = unsafe { DestroyWindow(hwnd) };
@@ -839,6 +940,224 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
     }
+}
+
+/// Whether the message being processed came from this machine's own
+/// `sardp-win` injector (server and client on one machine): forwarding it
+/// again would echo forever.
+fn is_injected_echo() -> bool {
+    unsafe { GetMessageExtraInfo() }.0 as usize == INJECTED_EXTRA_INFO
+}
+
+fn current_modifiers() -> u16 {
+    let down = |vk: windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY| {
+        let state = unsafe { GetKeyState(i32::from(vk.0)) };
+        state < 0
+    };
+    let mut modifiers = 0;
+    if down(VK_SHIFT) {
+        modifiers |= modifier::SHIFT;
+    }
+    if down(VK_CONTROL) {
+        modifiers |= modifier::CTRL;
+    }
+    if down(VK_MENU) {
+        modifiers |= modifier::ALT;
+    }
+    if down(VK_LWIN) || down(VK_RWIN) {
+        modifiers |= modifier::META;
+    }
+    modifiers
+}
+
+fn mouse_position(lparam: LPARAM) -> (i32, i32) {
+    let x = (lparam.0 & 0xFFFF) as u16 as i16;
+    let y = ((lparam.0 >> 16) & 0xFFFF) as u16 as i16;
+    (i32::from(x), i32::from(y))
+}
+
+/// Input-related messages; `None` hands the message to the default
+/// window procedure.
+fn handle_input_message(
+    hwnd: HWND,
+    state: &mut WindowState,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> Option<LRESULT> {
+    let send = |state: &WindowState, event: WindowInput| {
+        // The receiver is gone only while the client is shutting down.
+        let _ = state.input_tx.send(event);
+    };
+    match msg {
+        WM_KEYDOWN | WM_SYSKEYDOWN | WM_KEYUP | WM_SYSKEYUP => {
+            // Consumed either way: no local menu activation for Alt/F10,
+            // and Alt+F4 goes to the remote desktop, not this window.
+            if is_injected_echo() || state.composing {
+                return Some(LRESULT(0));
+            }
+            let down = msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN;
+            let l = lparam.0 as u32;
+            let scancode = ((l >> 16) & 0xFF) as u16;
+            let extended = (l >> 24) & 1 == 1;
+            match keymap::scancode_to_hid(scancode, extended) {
+                Some(hid_usage) => send(
+                    state,
+                    WindowInput::Key {
+                        down,
+                        hid_usage,
+                        virtual_key: wparam.0 as u32,
+                        modifiers: current_modifiers(),
+                    },
+                ),
+                None => trace(format!(
+                    "unmapped key: scancode={scancode:#x} extended={extended} vk={:#x}",
+                    wparam.0
+                )),
+            }
+            Some(LRESULT(0))
+        }
+        WM_CHAR => {
+            if is_injected_echo() {
+                return Some(LRESULT(0));
+            }
+            let unit = wparam.0 as u16;
+            if (0xD800..=0xDBFF).contains(&unit) {
+                state.pending_high_surrogate = Some(unit);
+                return Some(LRESULT(0));
+            }
+            let text = match state.pending_high_surrogate.take() {
+                Some(high) if (0xDC00..=0xDFFF).contains(&unit) => {
+                    String::from_utf16_lossy(&[high, unit])
+                }
+                _ => match char::from_u32(u32::from(unit)) {
+                    Some(c) => c.to_string(),
+                    None => return Some(LRESULT(0)),
+                },
+            };
+            // Enter/Tab/Backspace/Escape and Ctrl+letter arrive here as
+            // control characters; those keys travel as `Key` events.
+            if text.chars().all(char::is_control) {
+                return Some(LRESULT(0));
+            }
+            send(state, WindowInput::Text(text));
+            Some(LRESULT(0))
+        }
+        // Alt+key: the `Key` event carries it; don't let DefWindowProc
+        // treat it as a menu mnemonic.
+        WM_SYSCHAR => Some(LRESULT(0)),
+        WM_IME_STARTCOMPOSITION => {
+            state.composing = true;
+            None
+        }
+        WM_IME_ENDCOMPOSITION => {
+            state.composing = false;
+            send(
+                state,
+                WindowInput::ImeComposition {
+                    text: String::new(),
+                    caret: 0,
+                },
+            );
+            None
+        }
+        WM_IME_COMPOSITION => {
+            if (lparam.0 as u32) & GCS_COMPSTR.0 != 0
+                && let Some((text, caret)) = read_composition(hwnd)
+            {
+                send(state, WindowInput::ImeComposition { text, caret });
+            }
+            // DefWindowProc turns the result string into WM_CHARs.
+            None
+        }
+        WM_MOUSEMOVE => {
+            if !is_injected_echo() {
+                let (x, y) = mouse_position(lparam);
+                send(state, WindowInput::MouseMove { x, y });
+            }
+            Some(LRESULT(0))
+        }
+        WM_LBUTTONDOWN | WM_LBUTTONUP | WM_RBUTTONDOWN | WM_RBUTTONUP | WM_MBUTTONDOWN
+        | WM_MBUTTONUP | WM_XBUTTONDOWN | WM_XBUTTONUP => {
+            let (button, down) = match msg {
+                WM_LBUTTONDOWN => (button::LEFT, true),
+                WM_LBUTTONUP => (button::LEFT, false),
+                WM_RBUTTONDOWN => (button::RIGHT, true),
+                WM_RBUTTONUP => (button::RIGHT, false),
+                WM_MBUTTONDOWN => (button::MIDDLE, true),
+                WM_MBUTTONUP => (button::MIDDLE, false),
+                _ => {
+                    let which = ((wparam.0 >> 16) & 0xFFFF) as u16;
+                    let button = if which == 2 { button::X2 } else { button::X1 };
+                    (button, msg == WM_XBUTTONDOWN)
+                }
+            };
+            // Keep receiving the drag even when it leaves the window.
+            if down {
+                state.buttons_down = state.buttons_down.saturating_add(1);
+                unsafe { SetCapture(hwnd) };
+            } else {
+                state.buttons_down = state.buttons_down.saturating_sub(1);
+                if state.buttons_down == 0 {
+                    let _ = unsafe { ReleaseCapture() };
+                }
+            }
+            if !is_injected_echo() {
+                let (x, y) = mouse_position(lparam);
+                send(state, WindowInput::MouseButton { button, down, x, y });
+            }
+            Some(LRESULT(0))
+        }
+        WM_MOUSEWHEEL | WM_MOUSEHWHEEL => {
+            if !is_injected_echo() {
+                let delta = ((wparam.0 >> 16) & 0xFFFF) as u16 as i16;
+                let vertical = msg == WM_MOUSEWHEEL;
+                let (dx, dy) = if vertical { (0, delta) } else { (delta, 0) };
+                send(state, WindowInput::Wheel { dx, dy });
+            }
+            Some(LRESULT(0))
+        }
+        WM_KILLFOCUS => {
+            state.composing = false;
+            send(state, WindowInput::FocusLost);
+            None
+        }
+        _ => None,
+    }
+}
+
+/// The in-progress composition string and caret from the window's IME
+/// context.
+fn read_composition(hwnd: HWND) -> Option<(String, u16)> {
+    let himc: HIMC = unsafe { ImmGetContext(hwnd) };
+    if himc == HIMC::default() {
+        return None;
+    }
+    let result = (|| {
+        let bytes = unsafe { ImmGetCompositionStringW(himc, GCS_COMPSTR, None, 0) };
+        if bytes < 0 {
+            return None;
+        }
+        let mut buf = vec![0u16; bytes as usize / 2];
+        if !buf.is_empty() {
+            let written = unsafe {
+                ImmGetCompositionStringW(
+                    himc,
+                    GCS_COMPSTR,
+                    Some(buf.as_mut_ptr().cast()),
+                    bytes as u32,
+                )
+            };
+            if written < 0 {
+                return None;
+            }
+            buf.truncate(written as usize / 2);
+        }
+        let caret = unsafe { ImmGetCompositionStringW(himc, GCS_CURSORPOS, None, 0) }.max(0);
+        Some((String::from_utf16_lossy(&buf), caret.min(i32::from(u16::MAX)) as u16))
+    })();
+    let _ = unsafe { ImmReleaseContext(hwnd, himc) };
+    result
 }
 
 fn create_window(config: &DisplayConfig) -> windows::core::Result<HWND> {
@@ -892,7 +1211,14 @@ fn pump_messages() -> bool {
             if msg.message == WM_QUIT {
                 return true;
             }
-            let _ = TranslateMessage(&msg);
+            // An echo of our own injector's key press must not be
+            // translated into a WM_CHAR either (it would be forwarded as
+            // text and injected again).
+            let injected_key =
+                matches!(msg.message, WM_KEYDOWN | WM_SYSKEYDOWN) && is_injected_echo();
+            if !injected_key {
+                let _ = TranslateMessage(&msg);
+            }
             DispatchMessageW(&msg);
         }
     }

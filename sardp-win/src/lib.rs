@@ -17,11 +17,22 @@
 //! in-box H.264 decoder MFT with DXVA (D3D11 device manager) out to NV12
 //! textures, `ID3D11VideoProcessor` NV12->BGRA into a flip-model swap
 //! chain on a Win32 window. Persistent decoder, so P-frame streams work.
+//! The same window reports the user's keyboard/mouse input
+//! ([`WindowInput`]) for the client to forward as spec 2.12 messages.
+//!
+//! Input injection ([`inject`], 3W-1-d-4): spec 2.12 messages -> `SendInput`
+//! on a dedicated thread, with the HID usage <-> scan code table in
+//! [`keymap`].
 
 pub mod desktop_h264;
 pub mod display;
+pub mod inject;
+pub mod keymap;
 
 pub use desktop_h264::{
     Clock, DesktopH264Config, DesktopH264Source, EncodedFrame, SourceInfo, WinCaptureError,
 };
-pub use display::{DisplayConfig, FrameTiming, H264DisplayWindow, SubmittedFrame, WinDisplayError};
+pub use display::{
+    DisplayConfig, FrameTiming, H264DisplayWindow, SubmittedFrame, WinDisplayError, WindowInput,
+};
+pub use inject::{INJECTED_EXTRA_INFO, InjectCommand, InjectorConfig, InputInjector};

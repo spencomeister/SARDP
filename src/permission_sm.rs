@@ -162,6 +162,10 @@ pub fn parse_admin_command(line: &str) -> Option<AdminCommand> {
     match line.trim() {
         "grant-view" => toggle(bit::VIEW, true),
         "revoke-view" => toggle(bit::VIEW, false),
+        "grant-keyboard" => toggle(bit::INPUT_KEYBOARD, true),
+        "revoke-keyboard" => toggle(bit::INPUT_KEYBOARD, false),
+        "grant-mouse" => toggle(bit::INPUT_MOUSE, true),
+        "revoke-mouse" => toggle(bit::INPUT_MOUSE, false),
         "grant-clip-read" => toggle(bit::CLIP_READ, true),
         "revoke-clip-read" => toggle(bit::CLIP_READ, false),
         "grant-clip-write" => toggle(bit::CLIP_WRITE, true),
@@ -345,6 +349,20 @@ mod tests {
             parse_admin_command("grant-clip-read"),
             Some(AdminCommand::TogglePermission {
                 bit: bit::CLIP_READ,
+                grant: true
+            })
+        );
+        assert_eq!(
+            parse_admin_command("revoke-keyboard"),
+            Some(AdminCommand::TogglePermission {
+                bit: bit::INPUT_KEYBOARD,
+                grant: false
+            })
+        );
+        assert_eq!(
+            parse_admin_command("grant-mouse"),
+            Some(AdminCommand::TogglePermission {
+                bit: bit::INPUT_MOUSE,
                 grant: true
             })
         );
