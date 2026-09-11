@@ -617,7 +617,22 @@ impl Encoder {
         // 提出した入力数ぶんの出力が揃った時点で完了とみなす。これが主判定。
         // METransformNeedInputイベントは、ドレイン後にこのMFTから来るとは限らない
         // (実測で確認済み)ため、イベント待ちはあくまでフォールバックの安全弁とする。
+        //
+        // wait_for_event自体は個々にタイムアウトするが、それだけではHaveOutputイベントが
+        // 進捗(output_countの増加)を伴わずに来続けた場合にループ全体が終わらない
+        // 可能性が残る(レビュー指摘)。ドレイン全体にも締め切りを設け、超過したら
+        // その時点までに集まった分で諦めてエラーを返す。
+        let drain_deadline = Instant::now() + Duration::from_secs(30);
         while self.output_count < self.input_count {
+            if Instant::now() >= drain_deadline {
+                return Err(windows::core::Error::new(
+                    windows::Win32::Foundation::E_FAIL,
+                    format!(
+                        "drain did not complete within 30s ({}/{} samples produced)",
+                        self.output_count, self.input_count
+                    ),
+                ));
+            }
             let event = self.wait_for_event(Duration::from_secs(10))?;
             let event_type = unsafe { event.GetType()? };
             if event_type == METransformHaveOutput.0 as u32 {
@@ -681,8 +696,26 @@ fn find_hardware_h264_encoder() -> windows::core::Result<IMFActivate> {
             "no hardware H.264 encoder MFT found",
         ));
     }
-    let slice: &[Option<IMFActivate>] = unsafe { std::slice::from_raw_parts(activates, count as usize) };
-    let first = slice[0].clone().expect("first activate present");
+
+    // MFTEnumExが返す配列は、配列自体のメモリ(CoTaskMemFreeで解放)と、各要素が保持する
+    // IMFActivateへの強参照(個別にReleaseが必要)が別物。Option::take()で各スロットの
+    // 所有権をRust側へ正しく取り出せば、使わない要素はそのままループを抜ける際にDropし
+    // (windows-rsのCOMラッパーがDropでRelease()を呼ぶ)、使う最初の1要素だけを保持する。
+    // 以前はslice[0].clone()で複製を取るだけだったため、配列内の全要素(1番目の元参照を
+    // 含む)がリークしていた。
+    let slice: &mut [Option<IMFActivate>] =
+        unsafe { std::slice::from_raw_parts_mut(activates, count as usize) };
+    let mut first: Option<IMFActivate> = None;
+    for (i, slot) in slice.iter_mut().enumerate() {
+        let owned = slot.take();
+        if i == 0 {
+            first = owned;
+        }
+        // i != 0の場合、ここでownedがスコープを抜けてReleaseされる。
+    }
+    unsafe { windows::Win32::System::Com::CoTaskMemFree(Some(activates as *const _)) };
+    let first = first.expect("first activate present");
+
     let mut name_buf = String::new();
     if let Ok(name) = unsafe {
         let mut ptr = PWSTR::null();
@@ -694,7 +727,6 @@ fn find_hardware_h264_encoder() -> windows::core::Result<IMFActivate> {
         name_buf = name;
     }
     println!("[mf-h264-encode] using hardware encoder MFT: {name_buf}");
-    unsafe { windows::Win32::System::Com::CoTaskMemFree(Some(activates as *const _)) };
     Ok(first)
 }
 

@@ -127,3 +127,15 @@ Pausedな状態で`on_reset()`/`on_instance_streaming()`が無条件で作動し
 ### 11. `FeedbackReceiver`の`read_one`/`read_message`の重複
 
 `read_one`(`TransportFeedback`専用)と`read_message`(両方対応)がほぼ重複した形で共存しています(`src/feedback_session.rs`)。将来どちらかだけ修正されて挙動がずれるリスクがあります。
+
+## Stage 3(Windows OS統合、`tools/dxgi-capture-poc`)関連
+
+Stage 3ロードマップの3W-1(在席キャプチャ・エンコード基盤)実装中に判明した、SARDP本体ではなく検証機材・OS依存の既知事項です。3W-1-d(SARDP本体への結線)や他OSでの展開時に見直すべき点として記録します。
+
+### 12. H.264ハードウェアエンコードはMedia Foundation経由で、この検証機ではNVIDIA機でのみ動作確認済み
+
+3W-1-bは`IMFTransform`を直接駆動する構成でハードウェアH.264エンコードを実装しました(`tools/dxgi-capture-poc/src/bin/mf_h264_encode.rs`)。この検証機ではNVIDIA GPU上で「NVIDIA H.264 Encoder MFT」(D3D11対応・非同期)を使っており、実質的にNVENCがMedia Foundation経由で動いている状態です。
+
+- **ベンダー差はMFの抽象化レイヤーが吸収する設計**: `find_hardware_h264_encoder`はベンダー名を一切ハードコードしておらず、`MFT_ENUM_FLAG_HARDWARE`でハードウェアカテゴリのMFTを列挙して先頭を使うだけです。理論上、同じコードがIntel Quick SyncやAMD AMFのMFTでも動くはずです。
+- **ただしIntel/AMD環境では未検証**: 検証機がNVIDIA GPU搭載機のみのため、実際にIntel Quick SyncやAMD AMFのMFT経由で動作するかは確認できていません。特に3W-1-bで踏んだ「入力フォーマットがNV12のみ(BGRA不可)」「非同期MFTは`MF_TRANSFORM_ASYNC_UNLOCK`必須」といった制約がベンダーMFTごとにどう変わるかは未知数です。
+- **ハードウェアエンコーダが存在しない環境向けのTier 4(ソフトウェアエンコード)フォールバックが未実装**: `mf_probe`(`tools/dxgi-capture-poc/src/bin/mf_probe.rs`)はこの検証機で、NVIDIAのMFTに加えて「H264 Encoder MFT」(MicrosoftのソフトウェアエンコーダでMF_SA_D3D11_AWARE=0)も検出しています。Part 6のTier区分でいうTier 4(ソフトウェアエンコード)フォールバックの実装候補になり得ますが、現在の`find_hardware_h264_encoder`は`MFT_ENUM_FLAG_HARDWARE`のみを見るため、ハードウェアエンコーダが1つも見つからない環境では単純にエラーになります。同じ`IMFTransform`駆動ロジックのまま、フォールバック時に列挙フラグからHARDWAREを外して選択するMFTを切り替えるだけで対応できる見込みです。
