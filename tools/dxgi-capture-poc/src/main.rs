@@ -6,23 +6,22 @@
 
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
-use std::mem::size_of;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use windows::core::Interface;
-use windows::Win32::Foundation::{HMODULE, RECT};
-use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_UNKNOWN;
+use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Resource, ID3D11Texture2D,
-    D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_FLAG, D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE,
-    D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
+    ID3D11Device, ID3D11DeviceContext, ID3D11Resource, ID3D11Texture2D, D3D11_CPU_ACCESS_READ,
+    D3D11_CREATE_DEVICE_FLAG, D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE, D3D11_TEXTURE2D_DESC,
+    D3D11_USAGE_STAGING,
 };
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
-use windows::Win32::Graphics::Dxgi::{
-    CreateDXGIFactory1, IDXGIAdapter, IDXGIAdapter1, IDXGIFactory1, IDXGIOutput, IDXGIOutput1,
-    IDXGIOutputDuplication, IDXGIResource, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_WAIT_TIMEOUT,
-    DXGI_OUTDUPL_FRAME_INFO,
+use windows::Win32::Graphics::Dxgi::{IDXGIResource, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO};
+
+use dxgi_capture_poc::capture::{
+    create_d3d11_device, create_output_duplication, read_dirty_rects, read_move_rect_count,
+    FrameGuard,
 };
 
 /// 1フレーム取得を待つ最大時間(ms)。これを超えると「変化なし」としてリトライする。
@@ -31,21 +30,6 @@ const ACQUIRE_TIMEOUT_MS: u32 = 500;
 const MAX_FRAMES: u32 = 30;
 /// フレーム取得後、次のAcquireNextFrameまでの最小間隔。「毎秒数フレーム」に収める。
 const MIN_FRAME_INTERVAL: Duration = Duration::from_millis(200);
-
-/// AcquireNextFrame成功後、確実にReleaseFrameを対応させるRAIIガード。
-/// Desktop Duplicationは未解放フレームを1つしか許さないため、
-/// 以降の処理が`?`で早期returnしてもpanicでunwindしても解放漏れが起きないようにする。
-struct FrameGuard<'a> {
-    duplication: &'a IDXGIOutputDuplication,
-}
-
-impl Drop for FrameGuard<'_> {
-    fn drop(&mut self) {
-        if let Err(e) = unsafe { self.duplication.ReleaseFrame() } {
-            eprintln!("[dxgi-capture-poc] ReleaseFrame failed: {e}");
-        }
-    }
-}
 
 fn main() -> windows::core::Result<()> {
     let out_dir = output_dir();
@@ -58,7 +42,7 @@ fn main() -> windows::core::Result<()> {
     writeln!(log, "# 3W-1-a DXGI Desktop Duplication capture log").ok();
     writeln!(log, "# started_at={:?}", SystemTime::now()).ok();
 
-    let (device, context) = create_d3d11_device()?;
+    let (device, context) = create_d3d11_device(D3D11_CREATE_DEVICE_FLAG(0))?;
     let duplication = create_output_duplication(&device)?;
 
     let mut saved_frames = 0u32;
@@ -151,88 +135,6 @@ fn output_dir() -> PathBuf {
         .join("..")
         .join("captures")
         .join(format!("session_{timestamp}"))
-}
-
-fn create_d3d11_device() -> windows::core::Result<(ID3D11Device, ID3D11DeviceContext)> {
-    let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1() }?;
-    let adapter1: IDXGIAdapter1 = unsafe { factory.EnumAdapters1(0) }?;
-    let adapter: IDXGIAdapter = adapter1.cast()?;
-
-    let mut device: Option<ID3D11Device> = None;
-    let mut context: Option<ID3D11DeviceContext> = None;
-
-    unsafe {
-        D3D11CreateDevice(
-            &adapter,
-            D3D_DRIVER_TYPE_UNKNOWN,
-            HMODULE::default(),
-            D3D11_CREATE_DEVICE_FLAG(0),
-            None,
-            D3D11_SDK_VERSION,
-            Some(&mut device),
-            None,
-            Some(&mut context),
-        )?;
-    }
-
-    Ok((device.expect("device"), context.expect("context")))
-}
-
-fn create_output_duplication(device: &ID3D11Device) -> windows::core::Result<IDXGIOutputDuplication> {
-    let dxgi_device: IDXGIAdapter = unsafe {
-        device
-            .cast::<windows::Win32::Graphics::Dxgi::IDXGIDevice>()?
-            .GetAdapter()?
-    };
-    let output: IDXGIOutput = unsafe { dxgi_device.EnumOutputs(0) }?;
-    let output1: IDXGIOutput1 = output.cast()?;
-    unsafe { output1.DuplicateOutput(device) }
-}
-
-fn read_dirty_rects(
-    duplication: &IDXGIOutputDuplication,
-    frame_info: &DXGI_OUTDUPL_FRAME_INFO,
-) -> windows::core::Result<Vec<RECT>> {
-    if frame_info.TotalMetadataBufferSize == 0 {
-        return Ok(Vec::new());
-    }
-    // Vec<RECT>として確保することでRECTのアラインメントを型システムに保証させる
-    // (Vec<u8>をas *mut RECTでキャストするのはアロケータの実務上の挙動に依存したUB)。
-    let capacity = (frame_info.TotalMetadataBufferSize as usize).div_ceil(size_of::<RECT>());
-    let mut buf: Vec<RECT> = vec![RECT::default(); capacity];
-    let mut needed = 0u32;
-    unsafe {
-        duplication.GetFrameDirtyRects(
-            (buf.len() * size_of::<RECT>()) as u32,
-            buf.as_mut_ptr(),
-            &mut needed,
-        )?;
-    }
-    let count = needed as usize / size_of::<RECT>();
-    buf.truncate(count);
-    Ok(buf)
-}
-
-fn read_move_rect_count(
-    duplication: &IDXGIOutputDuplication,
-    frame_info: &DXGI_OUTDUPL_FRAME_INFO,
-) -> windows::core::Result<usize> {
-    use windows::Win32::Graphics::Dxgi::DXGI_OUTDUPL_MOVE_RECT;
-    if frame_info.TotalMetadataBufferSize == 0 {
-        return Ok(0);
-    }
-    let capacity =
-        (frame_info.TotalMetadataBufferSize as usize).div_ceil(size_of::<DXGI_OUTDUPL_MOVE_RECT>());
-    let mut buf: Vec<DXGI_OUTDUPL_MOVE_RECT> = vec![DXGI_OUTDUPL_MOVE_RECT::default(); capacity];
-    let mut needed = 0u32;
-    unsafe {
-        duplication.GetFrameMoveRects(
-            (buf.len() * size_of::<DXGI_OUTDUPL_MOVE_RECT>()) as u32,
-            buf.as_mut_ptr(),
-            &mut needed,
-        )?;
-    }
-    Ok(needed as usize / size_of::<DXGI_OUTDUPL_MOVE_RECT>())
 }
 
 fn log_frame_info(
