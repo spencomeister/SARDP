@@ -898,11 +898,21 @@ dependencies = [
  "rand",
  "rcgen",
  "rustls-pemfile",
+ "sardp-win",
  "serde",
  "serde_bytes",
  "sha2",
  "subtle",
  "tokio",
+]
+
+[[package]]
+name = "sardp-win"
+version = "0.1.0"
+dependencies = [
+ "dxgi-capture-poc",
+ "tokio",
+ "windows",
 ]
 
 [[package]]

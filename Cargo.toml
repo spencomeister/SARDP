@@ -1,5 +1,5 @@
 [workspace]
-members = ["tools/dxgi-capture-poc"]
+members = ["tools/dxgi-capture-poc", "sardp-win"]
 # fuzz/ is its own standalone cargo-fuzz workspace (depends on this crate
 # via a path dependency, deliberately kept outside the normal build graph
 # so libfuzzer-sys doesn't leak into ordinary `cargo build`/`cargo test`).
@@ -22,6 +22,11 @@ serde_bytes = "0.11.19"
 sha2 = "0.11.0"
 subtle = "2.6.1"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "io-std", "io-util", "signal", "sync", "time"] }
+
+# Real desktop capture + hardware encode (Stage 3, 3W-1-d). Windows-only;
+# the crate wraps all the unsafe COM/FFI so this crate's `forbid` stays.
+[target.'cfg(windows)'.dependencies]
+sardp-win = { path = "sardp-win" }
 
 [lints.rust]
 unsafe_code = "forbid"

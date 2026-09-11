@@ -57,6 +57,124 @@ struct Args {
     height: u32,
     fps: f64,
     server_name: String,
+    capture: CaptureMode,
+}
+
+/// Where video frames come from (`--capture`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CaptureMode {
+    /// The M1-M6 timecode pattern, encoded with a per-frame `ffmpeg`
+    /// subprocess. Runs anywhere; the default.
+    Synthetic,
+    /// The real desktop via DXGI Desktop Duplication + a hardware H.264
+    /// encoder MFT (`sardp-win`, Stage 3 3W-1-d). Windows only.
+    Desktop,
+}
+
+/// The per-connection video frame source. Held by `run_active_session`
+/// for the session's lifetime (the desktop source owns a capture thread
+/// and the encoder's state, so it must outlive every generation).
+enum FrameSource {
+    Synthetic { width: u32, height: u32 },
+    #[cfg(windows)]
+    Desktop(sardp_win::DesktopH264Source),
+}
+
+/// One frame ready to go on the wire, whatever produced it.
+struct SourcedFrame {
+    bytes: Vec<u8>,
+    is_idr: bool,
+    capture_ts: u64,
+    encode_done_ts: u64,
+}
+
+/// Bounds how many non-IDR desktop frames `next_idr_frame` will discard
+/// while waiting for the encoder to honor an IDR request.
+const MAX_FRAMES_TO_SKIP_FOR_IDR: u32 = 120;
+
+/// Next frame from `source`. For the synthetic source this is a fresh
+/// timecode frame right now; for the desktop source it waits for the
+/// capture thread's next encoded frame (`None` if that thread stopped).
+async fn next_frame(source: &mut FrameSource) -> Result<Option<SourcedFrame>, ConnError> {
+    match source {
+        FrameSource::Synthetic { width, height } => {
+            let capture_ts = clock::now_us();
+            let frame =
+                timecode_frame::generate_timecode_frame(*width, *height, capture_ts, [40, 40, 40]);
+            let bytes =
+                tokio::task::spawn_blocking(move || encoder::encode_single_frame_idr(&frame))
+                    .await??;
+            Ok(Some(SourcedFrame {
+                bytes,
+                is_idr: true,
+                capture_ts,
+                encode_done_ts: clock::now_us(),
+            }))
+        }
+        #[cfg(windows)]
+        FrameSource::Desktop(desktop) => Ok(desktop.next_frame().await.map(|f| SourcedFrame {
+            bytes: f.annex_b,
+            is_idr: f.is_idr,
+            capture_ts: f.capture_ts,
+            encode_done_ts: f.encode_done_ts,
+        })),
+    }
+}
+
+/// The desktop source's next frame, as a `select!` arm: never completes
+/// for the synthetic source (whose frames are paced by the tick arm).
+async fn next_desktop_frame(source: &mut FrameSource) -> Result<Option<SourcedFrame>, ConnError> {
+    match source {
+        FrameSource::Synthetic { .. } => std::future::pending().await,
+        #[cfg(windows)]
+        FrameSource::Desktop(_) => next_frame(source).await,
+    }
+}
+
+/// `VideoFrameHeader` + payload for one sourced frame (DR-035 split done
+/// by `video_session::send_video_frame`).
+async fn send_sourced_frame(
+    video_send: &mut quinn::SendStream,
+    generation: u64,
+    frame_id: u64,
+    width: u32,
+    height: u32,
+    frame: &SourcedFrame,
+) -> Result<(), ConnError> {
+    let flags = if frame.is_idr { messages::VIDEO_FRAME_FLAG_IDR } else { 0 };
+    video_session::send_video_frame(
+        video_send,
+        generation,
+        frame_id,
+        1,
+        flags,
+        frame.capture_ts,
+        frame.encode_done_ts,
+        width,
+        height,
+        &frame.bytes,
+    )
+    .await?;
+    Ok(())
+}
+
+/// A frame that can open a new video Instance: asks the source for an IDR
+/// and skips whatever non-IDR frames arrive first.
+async fn next_idr_frame(source: &mut FrameSource) -> Result<SourcedFrame, ConnError> {
+    #[cfg(windows)]
+    if let FrameSource::Desktop(desktop) = source {
+        desktop.request_idr();
+    }
+    for _ in 0..MAX_FRAMES_TO_SKIP_FOR_IDR {
+        match next_frame(source).await? {
+            Some(frame) if frame.is_idr => return Ok(frame),
+            Some(_) => continue,
+            None => return Err(ConnError::Capture("desktop capture stopped".into())),
+        }
+    }
+    Err(ConnError::Capture(format!(
+        "no IDR from the encoder within {MAX_FRAMES_TO_SKIP_FOR_IDR} frames"
+    )))
 }
 
 /// State shared across every connection this server handles: `sessions`
@@ -105,6 +223,9 @@ OPTIONS:\n\
     --width <N>             Synthetic frame width, >=512 (default 640)\n\
     --height <N>            Synthetic frame height (default 360)\n\
     --fps <N>               Frame send rate (default 4)\n\
+    --capture <MODE>        synthetic (default): M1-M6 timecode pattern via ffmpeg\n\
+                            desktop: real desktop via DXGI + hardware H.264 (Windows;\n\
+                            --width/--height/--fps are then taken from the display)\n\
     --server-name <NAME>    Name announced in ServerHello (default sardp-server)\n\
     --help                  Show this message\n\n\
 Once a client is connected, typing one of the following (Enter) toggles\n\
@@ -128,6 +249,7 @@ fn parse_args() -> Args {
     let mut height = 360u32;
     let mut fps = 4.0f64;
     let mut server_name = "sardp-server".to_string();
+    let mut capture = CaptureMode::Synthetic;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -172,6 +294,22 @@ fn parse_args() -> Args {
                     .expect("invalid --fps")
             }
             "--server-name" => server_name = args.next().expect("--server-name requires a value"),
+            "--capture" => {
+                capture = match args.next().expect("--capture requires a value").as_str() {
+                    "synthetic" => CaptureMode::Synthetic,
+                    "desktop" => {
+                        if !cfg!(windows) {
+                            eprintln!("--capture desktop is only available on Windows");
+                            std::process::exit(2);
+                        }
+                        CaptureMode::Desktop
+                    }
+                    other => {
+                        eprintln!("invalid --capture value: {other} (expected synthetic|desktop)");
+                        std::process::exit(2);
+                    }
+                }
+            }
             "--help" | "-h" => {
                 print_help();
                 std::process::exit(0);
@@ -193,6 +331,7 @@ fn parse_args() -> Args {
         height,
         fps,
         server_name,
+        capture,
     }
 }
 
@@ -305,7 +444,7 @@ async fn main() {
                 let Some(incoming) = incoming else { break };
                 let trusted_pubkey = args.trusted_pubkey;
                 let server_name = args.server_name.clone();
-                let (width, height, fps) = (args.width, args.height, args.fps);
+                let (width, height, fps, capture) = (args.width, args.height, args.fps, args.capture);
                 let shutdown = shutdown.clone();
                 let permission_command = permission_command.clone();
                 let state = state.clone();
@@ -319,7 +458,7 @@ async fn main() {
                     };
                     let peer = connection.remote_address();
                     match handle_connection(
-                        connection, &server_name, &trusted_pubkey, width, height, fps,
+                        connection, &server_name, &trusted_pubkey, width, height, fps, capture,
                         shutdown, permission_command, state,
                     ).await {
                         Ok(()) => eprintln!("[{peer}] connection ended cleanly"),
@@ -403,6 +542,7 @@ async fn handle_connection(
     width: u32,
     height: u32,
     fps: f64,
+    capture: CaptureMode,
     shutdown: Arc<Notify>,
     permission_command: PermissionCommand,
     state: Arc<ServerState>,
@@ -443,15 +583,37 @@ async fn handle_connection(
 
     sardp::timesync::server_respond_time_sync(&mut ctx.control).await?;
 
+    // The frame source outlives every generation of this session (the
+    // desktop one owns the capture thread and the encoder's state).
+    let (mut frame_source, width, height, fps, profile, tier) = match capture {
+        CaptureMode::Synthetic => (FrameSource::Synthetic { width, height }, width, height, fps, 66u16, 4u8),
+        #[cfg(windows)]
+        CaptureMode::Desktop => {
+            let clock: sardp_win::Clock = Arc::new(clock::now_us);
+            let source = sardp_win::DesktopH264Source::start(sardp_win::DesktopH264Config::default(), clock)
+                .map_err(|e| ConnError::Capture(e.to_string()))?;
+            let info = source.info();
+            eprintln!(
+                "[{peer}] desktop capture started: {}x{} @ {}Hz, hardware H.264 (all-IDR for 3W-1-d-2)",
+                info.width, info.height, info.fps
+            );
+            // Main profile (what the hardware MFT negotiates), Tier 3
+            // (hardware 4:2:0, no QP map yet -- spec Part 6).
+            (FrameSource::Desktop(source), info.width, info.height, f64::from(info.fps), 77u16, 3u8)
+        }
+        #[cfg(not(windows))]
+        CaptureMode::Desktop => unreachable!("--capture desktop is rejected at argument parsing off Windows"),
+    };
+
     let encoder_config = EncoderConfig {
         codec: Codec::H264,
-        profile: 66,
+        profile,
         chroma_format: ChromaFormat::C420,
         bit_depth: 8,
         width,
         height,
         max_fps: fps.round() as u16,
-        tier: 4,
+        tier,
         b_frames: 0,
         server_cursor_excludable: false,
     };
@@ -464,8 +626,7 @@ async fn handle_connection(
             ctx.starting_generation,
             0,
             encoder_config,
-            width,
-            height,
+            &mut frame_source,
         ),
     )
     .await
@@ -503,8 +664,7 @@ async fn handle_connection(
         feedback_receiver,
         permission_sm,
         encoder_config,
-        width,
-        height,
+        &mut frame_source,
         fps,
         peer,
         &shutdown,
@@ -582,8 +742,7 @@ async fn run_active_session(
     mut feedback_receiver: FeedbackReceiver,
     mut permission_sm: PermissionSm,
     encoder_config: EncoderConfig,
-    width: u32,
-    height: u32,
+    frame_source: &mut FrameSource,
     fps: f64,
     peer: SocketAddr,
     shutdown: &Arc<Notify>,
@@ -593,6 +752,10 @@ async fn run_active_session(
     session_id: [u8; 16],
     user_id: &str,
 ) -> Result<(), ConnError> {
+    let (width, height) = (encoder_config.width, encoder_config.height);
+    // For the synthetic source this paces frame generation; for the
+    // desktop source frames arrive on their own arm and this tick only
+    // services admin commands.
     let mut frame_interval = tokio::time::interval(Duration::from_secs_f64(1.0 / fps));
     frame_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut keepalive_interval = tokio::time::interval(timeouts::KEEPALIVE_INTERVAL);
@@ -746,15 +909,29 @@ async fn run_active_session(
                 if !permission_sm.is_granted(bit::VIEW) {
                     continue;
                 }
-
-                let capture_ts = clock::now_us();
-                let frame = timecode_frame::generate_timecode_frame(width, height, capture_ts, [40, 40, 40]);
-                let bytes = tokio::task::spawn_blocking(move || encoder::encode_single_frame_idr(&frame)).await??;
-                let encode_done_ts = clock::now_us();
-                video_session::send_video_frame(
-                    &mut video_send, video_channel.generation(), frame_id, 1,
-                    messages::VIDEO_FRAME_FLAG_IDR, capture_ts, encode_done_ts, width, height, &bytes,
-                ).await?;
+                // Desktop frames arrive through their own arm below.
+                if !matches!(frame_source, FrameSource::Synthetic { .. }) {
+                    continue;
+                }
+                let Some(frame) = next_frame(frame_source).await? else { continue };
+                send_sourced_frame(&mut video_send, video_channel.generation(), frame_id, width, height, &frame).await?;
+                frame_id += 1;
+            }
+            desktop = next_desktop_frame(frame_source) => {
+                let frame = desktop?.ok_or_else(|| ConnError::Capture("desktop capture stopped".into()))?;
+                // Same VIEW gate as the synthetic path; a revoked VIEW just
+                // drops captured frames on the floor (the capture thread
+                // keeps running so re-granting resumes instantly).
+                if !permission_sm.is_granted(bit::VIEW) {
+                    continue;
+                }
+                send_sourced_frame(&mut video_send, video_channel.generation(), frame_id, width, height, &frame).await?;
+                if frame_id <= 3 || frame_id % 60 == 0 {
+                    eprintln!(
+                        "[{peer}] desktop frame {frame_id}: {} bytes, idr={}, encode {}us",
+                        frame.bytes.len(), frame.is_idr, frame.encode_done_ts.saturating_sub(frame.capture_ts)
+                    );
+                }
                 frame_id += 1;
             }
             feedback = feedback_receiver.read_one() => {
@@ -770,7 +947,7 @@ async fn run_active_session(
                         let new_generation = video_channel.prepare_reopen();
                         video_send = tokio::time::timeout(
                             VIDEO_CONFIGURING_TIMEOUT,
-                            open_generation(connection, new_generation, 1, encoder_config, width, height),
+                            open_generation(connection, new_generation, 1, encoder_config, frame_source),
                         )
                         .await
                         .map_err(|_elapsed| ConnError::Violation(ReasonCode::PROTOCOL_VIDEO_CONFIGURING_TIMEOUT))??;
@@ -987,30 +1164,33 @@ fn spawn_file_transfer(
 }
 
 /// Opens a fresh video Instance at `generation` (spec 2.10/4.3.2): a
-/// synthetic self-contained IDR plus setup messages. Shared by the
+/// self-contained IDR from `source` plus setup messages. Shared by the
 /// initial open and every backpressure-triggered reopen.
 async fn open_generation(
     connection: &quinn::Connection,
     generation: u64,
     config_id: u64,
     encoder_config: EncoderConfig,
-    width: u32,
-    height: u32,
+    source: &mut FrameSource,
 ) -> Result<quinn::SendStream, ConnError> {
-    let capture_ts = clock::now_us();
-    let frame = timecode_frame::generate_timecode_frame(width, height, capture_ts, [40, 40, 40]);
-    let idr =
-        tokio::task::spawn_blocking(move || encoder::encode_single_frame_idr(&frame)).await??;
-    let encode_done_ts = clock::now_us();
+    let idr = next_idr_frame(source).await?;
+    if !sardp::h264::is_self_contained_idr(&idr.bytes) {
+        // Spec 2.10 requires every IDR to carry its own SPS/PPS. The
+        // synthetic encoder guarantees it (repeat-headers=1); the desktop
+        // encoder prepends the negotiated sequence header when needed, so
+        // this firing means that fallback broke -- worth a loud log rather
+        // than a silent bad stream.
+        eprintln!("warning: IDR opening generation {generation} is not self-contained (no SPS/PPS before the IDR slice)");
+    }
     let (send, _sm) = video_session::open_video_instance(
         connection,
         0,
         generation,
         config_id,
         encoder_config,
-        idr,
-        capture_ts,
-        encode_done_ts,
+        idr.bytes,
+        idr.capture_ts,
+        idr.encode_done_ts,
     )
     .await?;
     Ok(send)
