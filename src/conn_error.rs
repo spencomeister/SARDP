@@ -6,6 +6,7 @@
 //! tests -- `ConnError` itself is only ever constructed by
 //! `src/bin/sardp-server.rs`.
 
+use crate::audio_session::AudioError;
 use crate::encoder;
 use crate::feedback_session::ReadFeedbackError;
 use crate::handshake::HandshakeError;
@@ -30,6 +31,7 @@ pub enum ConnError {
     Join(tokio::task::JoinError),
     Read(StreamReadError),
     TimeSync(TimeSyncError),
+    Audio(AudioError),
     /// Spec 4.1: `IDLE_TIMEOUT` fired (`Active -> Suspended`). Distinct
     /// from a genuine transport failure so `handle_connection` can tell
     /// the two apart in logs, even though both are handled the same way
@@ -92,6 +94,11 @@ impl From<tokio::task::JoinError> for ConnError {
         Self::Join(e)
     }
 }
+impl From<AudioError> for ConnError {
+    fn from(e: AudioError) -> Self {
+        Self::Audio(e)
+    }
+}
 
 /// Whether `error` represents the underlying QUIC transport actually going
 /// away (peer killed, network partition, timed out, ...) rather than a
@@ -122,6 +129,11 @@ pub fn is_transport_disconnect(error: &ConnError) -> bool {
         // read notices anything wrong.
         ConnError::Video(VideoError::Quic(_) | VideoError::Write(_)) => true,
         ConnError::Video(VideoError::Read(e)) => is_read_disconnect(e),
+        // The audio_capture acceptor arm (KNOWN_ISSUES.md #12) surfaces a
+        // dead connection the same way: accept_uni()/read failing with a
+        // transport-level error rather than a protocol violation.
+        ConnError::Audio(AudioError::Quic(_) | AudioError::Write(_)) => true,
+        ConnError::Audio(AudioError::Read(e)) => is_read_disconnect(e),
         _ => false,
     }
 }
@@ -203,6 +215,30 @@ mod tests {
     fn a_video_protocol_violation_is_not_a_disconnect() {
         assert!(!is_transport_disconnect(&ConnError::Video(
             VideoError::FrameLengthMismatch
+        )));
+    }
+
+    #[test]
+    fn an_audio_quic_or_write_error_is_a_disconnect() {
+        assert!(is_transport_disconnect(&ConnError::Audio(
+            AudioError::Quic(quinn::ConnectionError::Reset)
+        )));
+        assert!(is_transport_disconnect(&ConnError::Audio(
+            AudioError::Write(quinn::WriteError::ClosedStream)
+        )));
+    }
+
+    #[test]
+    fn an_audio_closed_early_is_a_disconnect() {
+        assert!(is_transport_disconnect(&ConnError::Audio(
+            AudioError::Read(StreamReadError::ClosedEarly)
+        )));
+    }
+
+    #[test]
+    fn an_audio_protocol_violation_is_not_a_disconnect() {
+        assert!(!is_transport_disconnect(&ConnError::Audio(
+            AudioError::WrongStreamKind
         )));
     }
 

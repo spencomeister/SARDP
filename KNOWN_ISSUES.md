@@ -56,6 +56,25 @@ acceptループの振り分けを可能にするため`server_handshake_with_tim
 
 `tests/handshake_timeout_budget.rs`に回帰テストを追加。`read_first_control_message`は実際にネットワーク入力を待つ(=本物のブロッキングポイントがある)ため、既に経過したデッドラインを渡すと即座に`HandshakeTimeout`になることを直接検証できます。一方`server_handshake_from_client_hello`側の`ServerHello`送信は、QUICストリームの初期フロー制御ウィンドウ内に収まる小さな書き込みが実際にはブロックしない(=`tokio::time::timeout_at`が経過済みデッドラインを観測する機会がない)ため、同じ手法でのランタイム上の実証はできません。こちらの修正は「`Duration`を受け取って独自の新しいウィンドウを再計算する」という選択肢自体をシグネチャから排除したことで担保しています。
 
+### G. クリップボード・音声が実バイナリに未配線だった(旧#12)
+
+`clipboard_session.rs`・`audio_session.rs`はライブラリ層+実QUIC結合テストのみで検証済みで、`sardp-server`/`sardp-client`本体には配線していませんでした。
+
+**修正**: 以下の3方向を実配線しました(1-Aで確立したパターンに従い、新規ロジックはlib側に切り出してユニット/統合テストを追加)。
+
+- **`AUDIO_PLAYBACK`(server→client)**: `sardp-server`が`AUDIO_PLAYBACK`許可時に`audio_playback`ストリームを遅延オープンし、20ms間隔で合成サイン波フレームを送信(`audio_session::generate_sine_wave_payload`、新規)。VIEW/frame送出ループと同じく`permission_sm`のライブ状態で毎回ゲート。`sardp-client`は`accept_uni()`で常時待受し、受信フレームをログ出力。
+- **`AUDIO_CAPTURE`(client→server)**: `sardp-client`はハンドシェイク時点の`granted_permissions`に`AUDIO_CAPTURE`が含まれていれば`audio_capture`ストリームを起動時に一度だけ開き、20ms間隔で合成無音フレーム(`audio_session::generate_silence_payload`、新規)を送信。`sardp-server`は新設の`audio_session::accept_audio_capture_gated`(DR-037のownership rejectと同じ「拒否するなら能動的に`stop()`する」形)でアクセプト時に許可を確認し、拒否時はストリームを`stop()`して破棄、許可時は専用タスクにフレーム読み取りを委譲(`spawn_file_transfer`と同じ独立タスクパターン)。
+- **`CLIP_READ`(server→client、announcer=server)**: `sardp-server`の新しい管理者stdinコマンド`send-clipboard`で、`CLIP_READ`が許可されていれば固定の合成`text/plain`コンテンツを1回announceするタスクを起動(`announce_clipboard_formats`→`read_clipboard_request`→`respond_to_clipboard_request`、いずれも既存の1-A前からある関数)。`sardp-client`は`accept_bi()`で常時待受し、announceを受けたら自動で最初のフォーマットを`request_clipboard_data`でリクエストしてログ出力。
+
+VIEWのみだった管理者stdinトグル機構は`permission_sm::AdminCommand`/`parse_admin_command`(新規、ユニットテスト付き)として汎化し、`grant-clip-read`/`revoke-clip-read`・`grant-clip-write`/`revoke-clip-write`・`grant-audio-playback`/`revoke-audio-playback`・`grant-audio-capture`/`revoke-audio-capture`・`send-clipboard`を追加。`permission_sm::build_view_toggle`も任意ビットに使える`build_permission_toggle(current_granted, bit, grant)`に一般化しました。
+
+`ConnError`/`AppError`にそれぞれ`Audio(AudioError)`variantを追加し、`is_transport_disconnect`にも`AudioError::Quic`系の分類を追加(サーバー側の`accept_audio_capture_gated`アーム・クライアント側の`accept_audio_stream`アームが、接続断のときに正しく`?`で伝播してセッション終了・再接続フローに乗るようにするため — さもないと「常にすぐ失敗する`accept`をタイトループで呼び続ける」というビジーループになり得ます)。
+
+**未対応の付随事項**:
+1. **`CLIP_WRITE`(client→server、announcer=client)は実配線していません。** サーバー側で`accept_bi()`を追加すると、`spawn_file_transfer`が個別タスクで独立に呼んでいる`accept_bi()`と同じ着信bidiストリームのキューを取り合うことになり、どちらのタスクが実際にどのストリームを受け取るか非決定的になる(ファイル転送用に開かれたはずのストリームをクリップボード側が奪う、またはその逆)というレースが生じます。単一の集中ディスパッチャに一本化しない限り安全に追加できないため、今回はスコープ外としました。`grant-clip-write`/`revoke-clip-write`コマンド自体は存在しますが、対応する消費者はまだありません。
+2. `AUDIO_CAPTURE`は`sardp-client`起動時の`granted_permissions`スナップショットでのみ判定しており、セッション中に後から`PermissionUpdate`で許可されても反応しません(サーバー側に対話的な管理者トグルがあるのに対し、クライアント側にはstdinのような対話手段がないための割り切りです)。`AUDIO_PLAYBACK`/`CLIP_READ`はサーバー側が毎回ライブに`permission_sm`を見るため、後から`grant-*`しても効きます。
+3. 実バイナリ同士でこの配線をエンドツーエンドに手動確認することはできていません。ビデオchannelを開く(`open_generation`)処理がハンドシェイク直後に必ず走り、その中の`ffmpeg`呼び出しがこのサンドボックスには存在しないため、`run_active_session`(clipboard/audioの配線はすべてこの中)に到達する前にセッションが終了してしまいます。ライブラリレベルのユニット/統合テスト(`accept_audio_capture_gated`・`parse_admin_command`・`is_transport_disconnect`のAudio分類など)でのみ検証済みです。
+
 ## 未対応(現在のスコープでは許容している既知の課題)
 
 ### 2. suspend-on-disconnectの検証パターンが手動テスト1回分に限られている
@@ -89,7 +108,3 @@ Pausedな状態で`on_reset()`/`on_instance_streaming()`が無条件で作動し
 ### 11. `FeedbackReceiver`の`read_one`/`read_message`の重複
 
 `read_one`(`TransportFeedback`専用)と`read_message`(両方対応)がほぼ重複した形で共存しています(`src/feedback_session.rs`)。将来どちらかだけ修正されて挙動がずれるリスクがあります。
-
-### 12. クリップボード・音声は実バイナリに未配線
-
-`clipboard_session.rs`・`audio_session.rs`はライブラリ層+実QUIC結合テストでのみ検証済みで、`sardp-server`/`sardp-client`本体には配線していません。Phase 2a〜2c・Phase 3全体を通じて一貫してこのスコープで進めています。

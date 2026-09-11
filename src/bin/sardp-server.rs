@@ -19,8 +19,10 @@ use ed25519_dalek::VerifyingKey;
 use tokio::io::AsyncBufReadExt;
 use tokio::sync::{Mutex, Notify};
 
+use sardp::audio_session;
 use sardp::backpressure::BackpressureDecision;
 use sardp::channel_sm::ChannelState;
+use sardp::clipboard_session;
 use sardp::conn_error::{ConnError, is_transport_disconnect};
 use sardp::connection_sm::defaults as timeouts;
 use sardp::encoder;
@@ -29,8 +31,9 @@ use sardp::file_handle_store::FileHandleStore;
 use sardp::file_transfer_session::{self as file_transfer};
 use sardp::handshake::ControlChannel;
 use sardp::messages::{
-    self, ChromaFormat, Codec, EncoderConfig, FileTransferAccept, FileTransferReject,
-    FileTransferRequest, SessionClose,
+    self, AudioCodec, AudioConfig, ChromaFormat, ClipboardFormatEntry, ClipboardFormats, Codec,
+    EncoderConfig, FileTransferAccept, FileTransferReject, FileTransferRequest, FormatNamespace,
+    SessionClose,
 };
 use sardp::permission_set::bit;
 use sardp::permission_sm::{self, PermissionSm};
@@ -42,7 +45,7 @@ use sardp::timecode_frame;
 use sardp::video_channel::VideoChannel;
 use sardp::video_session;
 use sardp::video_sm::defaults::VIDEO_CONFIGURING_TIMEOUT;
-use sardp::{clock, dev_identity, net, pki};
+use sardp::{StreamKind, clock, dev_identity, net, pki};
 
 struct Args {
     bind: SocketAddr,
@@ -104,8 +107,14 @@ OPTIONS:\n\
     --fps <N>               Frame send rate (default 4)\n\
     --server-name <NAME>    Name announced in ServerHello (default sardp-server)\n\
     --help                  Show this message\n\n\
-Once a client is connected, typing `revoke-view` or `grant-view` (Enter)\n\
-toggles its VIEW permission live."
+Once a client is connected, typing one of the following (Enter) toggles\n\
+the corresponding permission live, or triggers a one-shot action:\n\
+    grant-view / revoke-view\n\
+    grant-clip-read / revoke-clip-read\n\
+    grant-audio-playback / revoke-audio-playback\n\
+    grant-audio-capture / revoke-audio-capture\n\
+    send-clipboard   (announces synthetic clipboard content once,\n\
+                      if CLIP_READ is currently granted)"
     );
 }
 
@@ -187,10 +196,10 @@ fn parse_args() -> Args {
     }
 }
 
-/// Shared, admin-triggered permission command for the one connected
-/// client this PoC server handles interactively (stdin `revoke-view` /
-/// `grant-view`). `None` once consumed by the connection's own loop.
-type PermissionCommand = Arc<Mutex<Option<bool>>>; // Some(true)=grant VIEW, Some(false)=revoke VIEW
+/// Shared queue of admin commands (stdin, see `permission_sm::AdminCommand`)
+/// for the one connected client this PoC server handles interactively.
+/// Drained by the connection's own loop.
+type PermissionCommand = Arc<Mutex<Vec<permission_sm::AdminCommand>>>;
 
 #[tokio::main]
 async fn main() {
@@ -227,7 +236,7 @@ async fn main() {
     eprintln!("sardp-server listening on {local_addr}");
 
     let shutdown = Arc::new(Notify::new());
-    let permission_command: PermissionCommand = Arc::new(Mutex::new(None));
+    let permission_command: PermissionCommand = Arc::new(Mutex::new(Vec::new()));
     let state = Arc::new(ServerState::default());
     // KNOWN_ISSUES.md #3: actively reclaims file_handles nobody ever opened
     // the `file` stream for, rather than relying solely on `validate`'s
@@ -246,18 +255,16 @@ async fn main() {
                     _ = shutdown.notified() => return,
                     line = lines.next_line() => {
                         match line {
-                            Ok(Some(line)) => match line.trim() {
-                                "revoke-view" => {
-                                    *permission_command.lock().await = Some(false);
-                                    eprintln!("(admin) queued: revoke VIEW");
+                            Ok(Some(line)) => {
+                                if line.trim().is_empty() {
+                                    // nothing typed, just Enter
+                                } else if let Some(command) = permission_sm::parse_admin_command(&line) {
+                                    eprintln!("(admin) queued: {command:?}");
+                                    permission_command.lock().await.push(command);
+                                } else {
+                                    eprintln!("(admin) unknown command: {line:?} (--help lists the recognized ones)");
                                 }
-                                "grant-view" => {
-                                    *permission_command.lock().await = Some(true);
-                                    eprintln!("(admin) queued: grant VIEW");
-                                }
-                                "" => {}
-                                other => eprintln!("(admin) unknown command: {other:?} (try revoke-view / grant-view)"),
-                            },
+                            }
                             _ => return,
                         }
                     }
@@ -560,6 +567,28 @@ async fn run_active_session(
     let mut frame_id = 1u64;
     let mut last_activity = tokio::time::Instant::now();
 
+    // KNOWN_ISSUES.md #12: audio_playback (server -> client), gated live on
+    // AUDIO_PLAYBACK the same way video frame send is gated on VIEW.
+    // Lazily opened on the first tick it's granted, rather than
+    // unconditionally at session start, since a fresh handshake doesn't
+    // grant it by default (see `handshake.rs`'s doc comment on
+    // `granted_permissions`).
+    let audio_config = AudioConfig {
+        codec: AudioCodec::Opus,
+        sample_rate: 48_000,
+        channels: 1,
+        frame_duration_ms: 20,
+    };
+    let audio_samples_per_frame = (u64::from(audio_config.sample_rate)
+        * u64::from(audio_config.frame_duration_ms)
+        / 1000) as usize;
+    let mut audio_interval = tokio::time::interval(Duration::from_millis(u64::from(
+        audio_config.frame_duration_ms,
+    )));
+    audio_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut audio_playback_send: Option<quinn::SendStream> = None;
+    let mut audio_sequence = 0u64;
+
     loop {
         let idle_deadline = last_activity + timeouts::IDLE_TIMEOUT;
         tokio::select! {
@@ -658,14 +687,29 @@ async fn run_active_session(
                 write_envelope(&mut control.send, messages::type_id::KEEP_ALIVE, &messages::encode(&messages::KeepAlive {})).await?;
             }
             _ = frame_interval.tick() => {
-                let mut command = permission_command.lock().await;
-                if let Some(grant) = command.take() {
-                    let update = permission_sm::build_view_toggle(granted_permissions, grant);
-                    permission_sm.apply_update(&update);
-                    write_envelope(&mut control.send, messages::type_id::PERMISSION_UPDATE, &messages::encode(&update)).await?;
-                    eprintln!("[{peer}] VIEW is now {}", if grant { "granted" } else { "revoked" });
+                let mut commands = permission_command.lock().await;
+                for admin_command in commands.drain(..) {
+                    match admin_command {
+                        permission_sm::AdminCommand::TogglePermission { bit: toggled_bit, grant } => {
+                            let update = permission_sm::build_permission_toggle(granted_permissions, toggled_bit, grant);
+                            permission_sm.apply_update(&update);
+                            write_envelope(&mut control.send, messages::type_id::PERMISSION_UPDATE, &messages::encode(&update)).await?;
+                            eprintln!(
+                                "[{peer}] {} is now {}",
+                                permission_bit_name(toggled_bit),
+                                if grant { "granted" } else { "revoked" }
+                            );
+                        }
+                        permission_sm::AdminCommand::SendClipboard => {
+                            if let Err(reason) = permission_sm.check_gate(bit::CLIP_READ) {
+                                eprintln!("[{peer}] cannot send clipboard: CLIP_READ not granted ({reason:?})");
+                            } else {
+                                spawn_clipboard_announce(connection.clone(), peer);
+                            }
+                        }
+                    }
                 }
-                drop(command);
+                drop(commands);
 
                 if !permission_sm.is_granted(bit::VIEW) {
                     continue;
@@ -708,8 +752,116 @@ async fn run_active_session(
                     }
                 }
             }
+            _ = audio_interval.tick() => {
+                if permission_sm.is_granted(bit::AUDIO_PLAYBACK) {
+                    if audio_playback_send.is_none() {
+                        let send = audio_session::open_audio_stream(connection, StreamKind::AudioPlayback, &audio_config).await?;
+                        eprintln!("[{peer}] opened audio_playback stream");
+                        audio_playback_send = Some(send);
+                    }
+                    let send = audio_playback_send.as_mut().expect("just ensured Some above");
+                    let capture_ts = clock::now_us();
+                    let payload = audio_session::generate_sine_wave_payload(audio_samples_per_frame, audio_config.sample_rate, 440.0);
+                    let duration_us = u32::from(audio_config.frame_duration_ms) * 1000;
+                    audio_session::send_audio_frame(send, audio_sequence, capture_ts, duration_us, &payload).await?;
+                    audio_sequence += 1;
+                }
+            }
+            accept_result = audio_session::accept_audio_capture_gated(connection, permission_sm.is_granted(bit::AUDIO_CAPTURE)) => {
+                match accept_result? {
+                    Some((_config, mut frame_reader)) => {
+                        eprintln!("[{peer}] accepted audio_capture stream");
+                        tokio::spawn(async move {
+                            loop {
+                                match frame_reader.read_next_frame().await {
+                                    Ok((header, payload)) => {
+                                        eprintln!("[{peer}] audio_capture frame sequence={} bytes={}", header.sequence, payload.len());
+                                    }
+                                    Err(e) => {
+                                        eprintln!("[{peer}] audio_capture stream ended: {e:?}");
+                                        return;
+                                    }
+                                }
+                            }
+                        });
+                    }
+                    None => {
+                        eprintln!("[{peer}] refused audio_capture stream: AUDIO_CAPTURE not granted");
+                    }
+                }
+            }
         }
     }
+}
+
+/// A human-readable name for one of this server's admin-togglable
+/// `PermissionSet` bits, for the stdin admin log line -- falls back to the
+/// raw bitmask for anything not in that list (there shouldn't be any,
+/// since `permission_sm::parse_admin_command` is the only source of these
+/// values).
+fn permission_bit_name(toggled_bit: u32) -> String {
+    match toggled_bit {
+        b if b == bit::VIEW => "VIEW".to_string(),
+        b if b == bit::CLIP_READ => "CLIP_READ".to_string(),
+        b if b == bit::CLIP_WRITE => "CLIP_WRITE".to_string(),
+        b if b == bit::AUDIO_PLAYBACK => "AUDIO_PLAYBACK".to_string(),
+        b if b == bit::AUDIO_CAPTURE => "AUDIO_CAPTURE".to_string(),
+        other => format!("permission bit {other:#x}"),
+    }
+}
+
+/// Spawns a task that announces synthetic clipboard content (spec 2.7,
+/// KNOWN_ISSUES.md #12) to whichever peer is on `connection` -- triggered
+/// by the `send-clipboard` admin command -- and, if a `ClipboardRequest`
+/// for it arrives, responds with fixed pseudo text. Independent of
+/// `run_active_session`'s own select loop for the same reason
+/// `spawn_file_transfer` is: `read_clipboard_request` blocks until the
+/// peer actually asks, which must not stall video/control/keepalive on
+/// the same connection.
+///
+/// Only the server-announces-to-client direction (`CLIP_READ`) is wired
+/// here; see KNOWN_ISSUES.md #12 for why the reverse direction
+/// (`CLIP_WRITE`, the client announcing to the server) isn't.
+fn spawn_clipboard_announce(connection: quinn::Connection, peer: SocketAddr) {
+    tokio::spawn(async move {
+        let formats = ClipboardFormats {
+            request_id: 1,
+            formats: vec![ClipboardFormatEntry {
+                namespace: FormatNamespace::Mime,
+                format_id: "text/plain".to_string(),
+            }],
+        };
+        let (mut send, mut reader) =
+            match clipboard_session::announce_clipboard_formats(&connection, &formats).await {
+                Ok(pair) => pair,
+                Err(e) => {
+                    eprintln!("[{peer}] failed to announce clipboard formats: {e:?}");
+                    return;
+                }
+            };
+        match clipboard_session::read_clipboard_request(&mut reader).await {
+            Ok(request) => {
+                let pseudo_data = b"hello from sardp-server's synthetic clipboard".to_vec();
+                let request_id = request.request_id;
+                let result = clipboard_session::respond_to_clipboard_request(
+                    &mut send,
+                    request.request_id,
+                    request.namespace,
+                    request.format_id,
+                    pseudo_data,
+                    None,
+                )
+                .await;
+                match result {
+                    Ok(()) => eprintln!("[{peer}] responded to ClipboardRequest {request_id}"),
+                    Err(e) => eprintln!("[{peer}] failed to respond to ClipboardRequest: {e:?}"),
+                }
+            }
+            Err(e) => {
+                eprintln!("[{peer}] clipboard announce: never received a ClipboardRequest ({e:?})");
+            }
+        }
+    });
 }
 
 /// Spawns a task that drives `request`'s transfer via

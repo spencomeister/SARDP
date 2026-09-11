@@ -9,7 +9,9 @@
 use std::f64::consts::PI;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
-use sardp::audio_session::{accept_audio_stream, open_audio_stream, send_audio_frame};
+use sardp::audio_session::{
+    accept_audio_capture_gated, accept_audio_stream, open_audio_stream, send_audio_frame,
+};
 use sardp::feedback_session::{FeedbackMessage, FeedbackReceiver, send_audio_sync_feedback};
 use sardp::messages::{AudioCodec, AudioConfig, AudioSyncFeedback};
 use sardp::stream_kind::StreamKind;
@@ -158,6 +160,43 @@ async fn accepting_the_wrong_stream_kind_is_rejected() {
         accept_result,
         Err(sardp::audio_session::AudioError::WrongStreamKind)
     ));
+}
+
+/// KNOWN_ISSUES.md #12: `sardp-server`'s real wiring refuses an
+/// `audio_capture` stream rather than accepting it when `AUDIO_CAPTURE`
+/// isn't granted -- proven here at the library level `accept_audio_capture_gated`
+/// exists for.
+#[tokio::test]
+async fn audio_capture_is_accepted_when_granted() {
+    let (client_connection, server_connection) = connect_pair().await;
+    let config = test_audio_config();
+
+    let (open_result, accept_result) = tokio::join!(
+        open_audio_stream(&client_connection, StreamKind::AudioCapture, &config),
+        accept_audio_capture_gated(&server_connection, true),
+    );
+    open_result.expect("client opens audio_capture");
+    let (received_config, _frame_reader) = accept_result
+        .expect("accept succeeds")
+        .expect("granted, so Some(..) not None");
+    assert_eq!(received_config, config);
+}
+
+#[tokio::test]
+async fn audio_capture_is_refused_when_not_granted() {
+    let (client_connection, server_connection) = connect_pair().await;
+    let config = test_audio_config();
+
+    let (open_result, accept_result) = tokio::join!(
+        open_audio_stream(&client_connection, StreamKind::AudioCapture, &config),
+        accept_audio_capture_gated(&server_connection, false),
+    );
+    open_result.expect("client opens audio_capture regardless -- permission is the server's call");
+    let outcome = accept_result.expect("accept itself succeeds; the stream is merely refused");
+    assert!(
+        outcome.is_none(),
+        "AUDIO_CAPTURE not granted must yield None, not a usable reader"
+    );
 }
 
 /// `AudioSyncFeedback` (spec 2.13) shares the `feedback` stream with
