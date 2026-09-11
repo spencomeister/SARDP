@@ -58,6 +58,18 @@ struct Args {
     fps: f64,
     server_name: String,
     capture: CaptureMode,
+    /// Desktop capture only: encode every frame as an IDR. Off by default
+    /// since 3W-1-d-3 (the client's persistent decoder handles P-frames);
+    /// kept for debugging and for the ffmpeg-per-frame `--display log`
+    /// client path, which can only decode self-contained frames.
+    all_idr: bool,
+}
+
+/// Per-connection copy of the capture-related arguments.
+#[derive(Debug, Clone, Copy)]
+struct CaptureSettings {
+    mode: CaptureMode,
+    all_idr: bool,
 }
 
 /// Where video frames come from (`--capture`).
@@ -226,6 +238,8 @@ OPTIONS:\n\
     --capture <MODE>        synthetic (default): M1-M6 timecode pattern via ffmpeg\n\
                             desktop: real desktop via DXGI + hardware H.264 (Windows;\n\
                             --width/--height/--fps are then taken from the display)\n\
+    --all-idr               With --capture desktop: encode every frame as an IDR\n\
+                            (needed for a client running --display log; default off)\n\
     --server-name <NAME>    Name announced in ServerHello (default sardp-server)\n\
     --help                  Show this message\n\n\
 Once a client is connected, typing one of the following (Enter) toggles\n\
@@ -250,6 +264,7 @@ fn parse_args() -> Args {
     let mut fps = 4.0f64;
     let mut server_name = "sardp-server".to_string();
     let mut capture = CaptureMode::Synthetic;
+    let mut all_idr = false;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -310,6 +325,7 @@ fn parse_args() -> Args {
                     }
                 }
             }
+            "--all-idr" => all_idr = true,
             "--help" | "-h" => {
                 print_help();
                 std::process::exit(0);
@@ -332,6 +348,7 @@ fn parse_args() -> Args {
         fps,
         server_name,
         capture,
+        all_idr,
     }
 }
 
@@ -444,7 +461,8 @@ async fn main() {
                 let Some(incoming) = incoming else { break };
                 let trusted_pubkey = args.trusted_pubkey;
                 let server_name = args.server_name.clone();
-                let (width, height, fps, capture) = (args.width, args.height, args.fps, args.capture);
+                let (width, height, fps) = (args.width, args.height, args.fps);
+                let capture = CaptureSettings { mode: args.capture, all_idr: args.all_idr };
                 let shutdown = shutdown.clone();
                 let permission_command = permission_command.clone();
                 let state = state.clone();
@@ -542,7 +560,7 @@ async fn handle_connection(
     width: u32,
     height: u32,
     fps: f64,
-    capture: CaptureMode,
+    capture: CaptureSettings,
     shutdown: Arc<Notify>,
     permission_command: PermissionCommand,
     state: Arc<ServerState>,
@@ -585,17 +603,24 @@ async fn handle_connection(
 
     // The frame source outlives every generation of this session (the
     // desktop one owns the capture thread and the encoder's state).
-    let (mut frame_source, width, height, fps, profile, tier) = match capture {
+    let (mut frame_source, width, height, fps, profile, tier) = match capture.mode {
         CaptureMode::Synthetic => (FrameSource::Synthetic { width, height }, width, height, fps, 66u16, 4u8),
         #[cfg(windows)]
         CaptureMode::Desktop => {
             let clock: sardp_win::Clock = Arc::new(clock::now_us);
-            let source = sardp_win::DesktopH264Source::start(sardp_win::DesktopH264Config::default(), clock)
+            let config = sardp_win::DesktopH264Config {
+                all_idr: capture.all_idr,
+                ..Default::default()
+            };
+            let source = sardp_win::DesktopH264Source::start(config, clock)
                 .map_err(|e| ConnError::Capture(e.to_string()))?;
             let info = source.info();
             eprintln!(
-                "[{peer}] desktop capture started: {}x{} @ {}Hz, hardware H.264 (all-IDR for 3W-1-d-2)",
-                info.width, info.height, info.fps
+                "[{peer}] desktop capture started: {}x{} @ {}Hz, hardware H.264, {}",
+                info.width,
+                info.height,
+                info.fps,
+                if capture.all_idr { "all-IDR (--all-idr)" } else { "IDR + P-frames" }
             );
             // Main profile (what the hardware MFT negotiates), Tier 3
             // (hardware 4:2:0, no QP map yet -- spec Part 6).
@@ -926,7 +951,7 @@ async fn run_active_session(
                     continue;
                 }
                 send_sourced_frame(&mut video_send, video_channel.generation(), frame_id, width, height, &frame).await?;
-                if frame_id <= 3 || frame_id % 60 == 0 {
+                if frame_id <= 3 || frame_id.is_multiple_of(60) {
                     eprintln!(
                         "[{peer}] desktop frame {frame_id}: {} bytes, idr={}, encode {}us",
                         frame.bytes.len(), frame.is_idr, frame.encode_done_ts.saturating_sub(frame.capture_ts)

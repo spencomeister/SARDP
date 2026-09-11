@@ -29,20 +29,24 @@ pub enum SubmitOutcome {
     DiscardedStaleGeneration,
 }
 
+/// Generic over the displayed-frame type so the same generation gating
+/// serves both the in-memory `SyntheticFrame` path (M4-M6, the default)
+/// and Stage 3's on-screen window, where the pixels live on the GPU and
+/// what's tracked here is just the frame's identity.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ClientDisplay {
+pub struct ClientDisplay<F = SyntheticFrame> {
     current_generation: Option<u64>,
-    displayed_frame: Option<SyntheticFrame>,
+    displayed_frame: Option<F>,
     last_displayed_frame_id: Option<u64>,
 }
 
-impl Default for ClientDisplay {
+impl<F> Default for ClientDisplay<F> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl ClientDisplay {
+impl<F> ClientDisplay<F> {
     pub fn new() -> Self {
         Self {
             current_generation: None,
@@ -55,14 +59,8 @@ impl ClientDisplay {
     /// than the generation already being displayed is discarded (spec
     /// 2.10); anything else (including the very first frame, or a newer
     /// generation) replaces the displayed frame.
-    pub fn submit_frame(
-        &mut self,
-        header: &VideoFrameHeader,
-        decoded: SyntheticFrame,
-    ) -> SubmitOutcome {
-        if let Some(current) = self.current_generation
-            && header.generation < current
-        {
+    pub fn submit_frame(&mut self, header: &VideoFrameHeader, decoded: F) -> SubmitOutcome {
+        if !self.would_display(header) {
             return SubmitOutcome::DiscardedStaleGeneration;
         }
         self.current_generation = Some(header.generation);
@@ -71,11 +69,21 @@ impl ClientDisplay {
         SubmitOutcome::Displayed
     }
 
+    /// The same generation check as [`Self::submit_frame`], without
+    /// submitting -- so a caller can skip decoding a frame that would only
+    /// be discarded anyway.
+    pub fn would_display(&self, header: &VideoFrameHeader) -> bool {
+        match self.current_generation {
+            Some(current) => header.generation >= current,
+            None => true,
+        }
+    }
+
     pub fn current_generation(&self) -> Option<u64> {
         self.current_generation
     }
 
-    pub fn displayed_frame(&self) -> Option<&SyntheticFrame> {
+    pub fn displayed_frame(&self) -> Option<&F> {
         self.displayed_frame.as_ref()
     }
 
@@ -137,6 +145,16 @@ mod tests {
         assert_eq!(outcome, SubmitOutcome::Displayed);
         assert_eq!(display.current_generation(), Some(1));
         assert_eq!(display.displayed_frame(), Some(&frame(2)));
+    }
+
+    #[test]
+    fn would_display_matches_submit_frame() {
+        let mut display = ClientDisplay::<()>::new();
+        assert!(display.would_display(&header(3, 0)));
+        display.submit_frame(&header(3, 0), ());
+        assert!(!display.would_display(&header(2, 0)));
+        assert!(display.would_display(&header(3, 1)));
+        assert!(display.would_display(&header(4, 0)));
     }
 
     #[test]

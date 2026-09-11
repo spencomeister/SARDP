@@ -178,19 +178,33 @@ Stage 3ロードマップの3W-1(在席キャプチャ・エンコード基盤)�
 - `tests/stage3w1d_input.rs`は環境変数`SARDP_TEST_BIND_ADDR`(IPv4)でバインド先を差し替えられるようにしてあり、`SARDP_TEST_BIND_ADDR=192.168.1.10`で実QUIC上の往復2件が成功することを確認済み(2026-09-12)。既存の統合テスト群の`loopback()`ヘルパーにも同じ差し替えを入れれば、この機で全て実行できるはずです(未実施)。
 - `sardp-server --bind`/`sardp-client --server`は任意のアドレスを取れるため、3W-1-d-2以降の実機疎通は`127.0.0.1`の代わりにLAN IPを使えば、規範仕様5.2節のTCPフォールバック(現状`src/`に一切未実装: ChannelBind、TLS-Exporterによるproof、チャネル別TLS+TCP接続)を先に実装する迂回は不要です。
 
-### 15. 3W-1-d-2時点: 実デスクトップ配信は全フレームIDRで、クライアントのフレーム毎`ffmpeg`デコードが追いつかずバックプレッシャの世代リセットが多発する
+### 15. `sardp-client --display log`(フレーム毎`ffmpeg`復号)は実デスクトップ配信に追いつかず、バックプレッシャの世代リセットが多発する(3W-1-d-2の観察、d-3で永続デコーダ側は解決)
 
-`sardp-server --capture desktop`(`sardp-win`クレート、DXGI→GPU上でNV12変換→ハードウェアH.264エンコーダMFT→Annex-B)は、既存クライアントがフレームごとに新しい`ffmpeg`プロセスで独立に復号する設計のままでも動くように、**意図的に全フレームをIDR**(GOP=1 + 毎入力`ForceKeyFrame`)にしています。Pフレームは3W-1-d-3で永続デコーダを入れた後に有効化する予定です。
+**d-3での状態(2026-09-12)**: `sardp-server --capture desktop`は既定で**IDR+Pフレーム**(世代オープン時に`request_idr`、安全網として60秒GOP)になり、`sardp-client --display window`(項目16)なら2560x1440@59fpsを世代リセットなしで表示できます。以下の観察は`--display log`(フレーム毎`ffmpeg`起動、自己完結フレームしか復号できない)に`sardp-server --all-idr`を組み合わせた場合に今も再現する挙動で、そちらはM1〜M6由来のタイムコード検証用経路として残しているだけです。d-3では`sardp-client`が世代リセット時に新しいInstanceを受け直すようになった(受け直し中に再度リセットされても継続)ため、この経路でもセッションは終了せずリセットを繰り返しながら続きます(10秒で10世代、`captures/stage3w1d3_logmode_*`)。
 
-E2E疎通(項目14参照)での観察:
+d-2時点の`sardp-server --capture desktop`は、既存クライアントがフレームごとに新しい`ffmpeg`プロセスで独立に復号する設計のままでも動くように、**意図的に全フレームをIDR**(GOP=1 + 毎入力`ForceKeyFrame`)にしていました(現在は`--all-idr`オプション)。
+
+d-2のE2E疎通(項目14参照)での観察:
 
 - サーバー側の`capture_ts→encode_done_ts`は**11〜19ms**(現行PoCのフレーム毎`ffmpeg`起動方式は150〜300ms、DR-036)。
 - クライアントは2560x1440のIDRを1枚ずつ`ffmpeg`で復号するため(数百ms/枚)、59fpsの供給に追いつけません。サーバー側は有界チャネル(容量4)で**ソース側ドロップ**(DR-007)し、25秒で256枚以上を破棄。それでも`client_queue_delay_us`が増え続け、**バックプレッシャのハード閾値超過→世代リセット→再オープン**が6回発生しました(再オープン経路と`DesktopH264Source::request_idr`が実機で動いた確認にはなっています)。
-- **既存の`sardp-client`は世代リセット(`Video(Read(Read(Reset(0))))`)でセッションを終了します**。ライブラリ層(`tests/m5_backpressure.rs`)では再オープンを検証済みですが、バイナリのクライアントは新しい世代のInstanceを受け直す実装になっていません。実デスクトップ配信では負荷次第でリセットが現実に起きるため、3W-1-d-3で永続デコーダと合わせて対応が必要です。
+- (d-2時点)既存の`sardp-client`は世代リセット(`Video(Read(Read(Reset(0))))`)でセッションを終了していました。**d-3で解消**(上記)。
 
 このほか、実装中に判明したMFT側の挙動(3W-1-bのREADMEの追記事項):
 
 - `CODECAPI_AVEncMPVGOPSize`は`SetOutputType`より**後**に設定すると無視されました(先に設定すれば効く)。
 - `MFSampleExtension_CleanPoint`は最初のIDRにしか立たなかったため、IDR判定はNAL種別(type 5)の走査で行っています。
 - ハードウェアMFTはSPS/PPSを最初のIDRにしか付けないため、最初のサンプルから抽出してキャッシュし、以後のIDRに前置きしています(`MF_MT_MPEG_SEQUENCE_HEADER`はフォールバック)。
-- 開始直後の最初のIDRが極端に小さい(767バイト)ケースが2回連続で観察されました。復号自体は成功していますが、内容がほぼ一様(黒画面等)の可能性があります。d-3で実際に表示して確認すること。
+- 開始直後の最初のIDRが極端に小さい(745〜767バイト)件は、**d-3で原因を特定し解消**しました。`sardp-client --dump-frames`で取り出して`ffmpeg`で復号すると2560x1440の**完全な黒画面**で、サーバー側の`DXGI_OUTDUPL_FRAME_INFO`を見ると`DuplicateOutput`直後の最初の`AcquireNextFrame`は`LastPresentTime=0, AccumulatedFrames=0`(デスクトップ画像を伴わない通知フレーム)でした。`LastPresentTime == 0`のフレーム(ポインタのみの更新も同じ)を最初の1枚を含めて常にスキップするよう変更し、最初のIDRが実画面(約190KB)になることを確認済み(`captures/stage3w1d3_final_*/dump/gen0_frame0_idr.png`)。なおエンコーダ入力テクスチャへのblit直後の`ID3D11DeviceContext::Flush`も入れましたが、こちら単独では黒画面は解消しなかった(原因はDXGI側)。副作用として、**完全に静止したデスクトップでは最初の実フレーム(=Instanceの最初のIDR)が次のデスクトップ更新まで待たされる**点が残ります(1秒経過で警告ログ、サーバー側は`SESSION_SETUP_TIMEOUT`15秒で打ち切り)。在席セッションでは実用上問題にならない想定ですが、静止画面での接続直後の挙動として記録しておきます。
+
+### 16. 3W-1-d-3: `sardp-client --display window`(Windows、永続ハードウェアデコーダ+ウィンドウ表示)で分かったこと
+
+`sardp-win::H264DisplayWindow`(`sardp-win/src/display.rs`)は専用スレッドでWin32ウィンドウ・D3D11デバイス・フリップモデルのスワップチェーン・Microsoft H264 Video Decoder MFT(D3D11デバイスマネージャ経由のDXVA、出力はNV12テクスチャ)を持ち、`ID3D11VideoProcessor`でNV12→バックバッファへ直接blitして表示します。CPU側の画素コピーはありません。E2E(`captures/stage3w1d3_final_*`、LAN経由、30秒)の結果は、2560x1440のIDR+Pフレーム配信を**1754枚表示・世代リセット0回**、定常状態でキュー待ち約25µs・デコード0.4〜0.5ms・表示0.1〜0.2ms(いずれもクライアント側計測、`client.stdout.log`)。実装中に踏んだ点:
+
+- **`VideoFrameReader::read_next_frame`がキャンセル安全でなかった**(SARDP本体側のバグ、`src/video_session.rs`で修正)。ヘッダとペイロードを2回の`read_envelope`で読むため、`tokio::select!`の別アームが先に完了して途中でdropされると、次回の呼び出しがペイロードをヘッダとして読んで`PROTOCOL_UNEXPECTED_MESSAGE`になっていました。d-2までは`select!`の他アームが滅多に完了しなかったため顕在化せず、d-3でウィンドウのタイミング報告アームが毎フレーム完了するようになって発覚。読み終えたヘッダを`pending_header`に退避する形で修正し、`tests/stage3w1d_video_reader.rs`で回帰テスト化(`SARDP_TEST_BIND_ADDR`対応)。
+- **Microsoft H264 Video Decoder MFTは低遅延モードを指定しないと出力を溜め込む**: 指定なしでは全フレームで`MF_E_TRANSFORM_NEED_MORE_INPUT`が返り続け、1枚も出ませんでした(Bフレームなしのストリームでも)。`IMFTransform::GetAttributes()`に`MF_LOW_LATENCY=1`を設定して解消。同じGUIDの`ICodecAPI`(`CODECAPI_AVLowLatencyMode`)経由は`VT_UI4`型を要求します(`VT_BOOL`は`E_INVALIDARG`)。
+- **表示スレッドの`Present`をvsyncでブロックさせてはいけない**: `Present(1)`(および通常のフリップモデルでの`Present(0)`)は実測で約16ms/フレーム(=リフレッシュ間隔)ブロックし、供給レート59fpsと等しいため、デコーダ起動時の遅れ(約100ms)が永遠に解消されず、バックプレッシャのリセットが1秒ごとに繰り返されました。`DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT`+最大フレームレイテンシ1のスワップチェーンにし、待機オブジェクトを`WaitForSingleObject(…, 0)`でポーリングして、受け付け可能なときだけblit+`Present(0)`、そうでなければデコード済み・未表示(参照フレームは維持)にする方式に変更。30秒で162枚が未表示(`not_presented`)になりましたが、これは受信バーストで復号がリフレッシュより先行した分で、リセットは0回です。
+- **サーバー側の供給が59Hzディスプレイで約120フレーム/秒になっていた**: DXGI Desktop Duplicationはポインタのみの更新(`LastPresentTime == 0`)でもフレームを返すため、d-2の`sardp-win`はそれも全てエンコードしていました。ポインタのみのフレームをスキップし、さらにリフレッシュ間隔(`EncoderConfig.max_fps`と同じ値)で明示的にペーシングするよう変更(`captures/stage3w1d3_e2e_20260912_041834`が変更前、`042402`以降が変更後)。
+- **クライアント側でフレームを落としてはいけない**: 最初の実装はデコーダキューが溢れたらフレームを捨てて「次のIDRまで待つ」設計でしたが、Pフレーム配信ではクライアントからIDRを要求する手段が仕様上なく(`TransportFeedback`にそのフィールドはない)、GOP内は永遠に復帰しません。現在は無制限キューにして、遅延は`client_queue_delay_us`としてサーバーへ報告し、仕様2.10のバックプレッシャ(リセット→新世代=IDR)に任せます。新しい世代が来たら表示スレッドは古い世代の残りをスキップします。
+- **`VideoConverter::convert`(サーバー側、d-2)で`ID3D11VideoProcessorInputView`の参照が毎フレーム1つリークしていた**(`ManuallyDrop`で渡したCOMポインタを解放していなかった)。d-3で修正。
+- **未対応のまま残っている点**: ウィンドウのリサイズ非対応(固定サイズ、`--window-size`で指定)、ストリーム解像度の変更はデコーダを作り直すだけで未検証、`--display window`はWindows専用(他OSは`--display log`のみ)、Tier 4(ソフトウェア)デコーダへのフォールバックなし(DXVA非対応MFTだと`MFT_OUTPUT_STREAM_PROVIDES_SAMPLES`チェックで起動失敗する)。

@@ -73,9 +73,11 @@ pub type Clock = Arc<dyn Fn() -> u64 + Send + Sync>;
 pub struct DesktopH264Config {
     pub bitrate_bps: u32,
     /// Encode every frame as an IDR (GOP size 1). Costs bitrate but keeps
-    /// each frame independently decodable -- needed while the client still
-    /// decodes each frame with a fresh `ffmpeg` process (3W-1-d-2; the
-    /// persistent decoder is 3W-1-d-3).
+    /// each frame independently decodable -- needed for a client that
+    /// decodes each frame with a fresh `ffmpeg` process (`sardp-client
+    /// --display log`). Off: IDR on request ([`DesktopH264Source::request_idr`],
+    /// i.e. at each generation open) plus a long safety-net GOP; the rest
+    /// are P-frames (3W-1-d-3, with the client's persistent decoder).
     pub all_idr: bool,
     /// `AcquireNextFrame` timeout; also bounds how often the worker checks
     /// its stop flag.
@@ -86,7 +88,7 @@ impl Default for DesktopH264Config {
     fn default() -> Self {
         Self {
             bitrate_bps: 8_000_000,
-            all_idr: true,
+            all_idr: false,
             acquire_timeout: Duration::from_millis(500),
         }
     }
@@ -275,6 +277,17 @@ fn run_worker(
     let mut converter: Option<VideoConverter> = None;
     let mut encoder: Option<Encoder> = None;
     let mut dropped: u64 = 0;
+    let mut stats = CaptureStats::default();
+    // Pacing: at most one encoded frame per display refresh. DXGI hands
+    // out more "frames" than that -- pointer-only updates carry no new
+    // desktop image at all (`LastPresentTime == 0`), and the first d-3 run
+    // measured ~120 frames/s reaching the client from a 59Hz display,
+    // which is what overloaded its decoder. The negotiated
+    // `EncoderConfig.max_fps` is `fps`, so the source must honor it.
+    let min_interval = refresh;
+    let mut next_due: Option<Instant> = None;
+    let start = Instant::now();
+    let mut warned_no_image = false;
 
     while !stop.load(Ordering::SeqCst) {
         let mut frame_info = DXGI_OUTDUPL_FRAME_INFO::default();
@@ -291,11 +304,62 @@ fn run_worker(
             Err(err) => return Err(e("AcquireNextFrame", err)),
         }
         let capture_ts = clock();
+        let now = Instant::now();
 
         // Same RAII guard as 3W-1-a: ReleaseFrame on every exit path.
         let frame_guard = FrameGuard {
             duplication: &duplication,
         };
+        stats.acquired += 1;
+        if stats.acquired <= 3 {
+            eprintln!(
+                "[sardp-win] capture frame {}: LastPresentTime={} AccumulatedFrames={} metadata={}B rects_coalesced={} protected={}",
+                stats.acquired,
+                frame_info.LastPresentTime,
+                frame_info.AccumulatedFrames,
+                frame_info.TotalMetadataBufferSize,
+                frame_info.RectsCoalesced.as_bool(),
+                frame_info.ProtectedContentMaskedOut.as_bool(),
+            );
+        }
+        // `LastPresentTime == 0` means no new desktop image in this frame
+        // (pointer-only update) -- and that includes the very first frame
+        // DXGI hands out right after `DuplicateOutput`, whose texture is
+        // not the desktop yet (encoding it produced a pure black 745-byte
+        // IDR as the Instance's first frame; 3W-1-d-3 finding, frame_info
+        // logged above). Anything ahead of the pacing schedule is released
+        // without encoding too. Skipped frames are never lost: DXGI
+        // accumulates dirty regions into the next acquired frame.
+        if frame_info.LastPresentTime == 0 {
+            stats.pointer_only += 1;
+            if encoder.is_none() && start.elapsed() > Duration::from_secs(1) && !warned_no_image {
+                // A completely static desktop produces no presents; the
+                // first real frame (and so the Instance's first IDR) waits
+                // for the next desktop update.
+                eprintln!("[sardp-win] no desktop image update yet after {:?}", start.elapsed());
+                warned_no_image = true;
+            }
+            continue;
+        }
+        if let Some(due) = next_due
+            && now + Duration::from_millis(1) < due
+        {
+            stats.paced_out += 1;
+            continue;
+        }
+        next_due = Some(match next_due {
+            // Keep the schedule phase-locked to the refresh rather than to
+            // our own (jittery) wake-ups, unless we've fallen well behind.
+            Some(due) if now < due + min_interval => due + min_interval,
+            _ => now + min_interval,
+        });
+        stats.encoded += 1;
+        if stats.encoded.is_multiple_of(600) {
+            eprintln!(
+                "[sardp-win] capture: acquired={} encoded={} pointer_only={} paced_out={} dropped_by_consumer={}",
+                stats.acquired, stats.encoded, stats.pointer_only, stats.paced_out, dropped
+            );
+        }
         let resource = resource.expect("AcquireNextFrame succeeded without a resource");
         let texture: ID3D11Texture2D = resource.cast().map_err(|err| e("frame texture cast", err))?;
 
@@ -353,6 +417,15 @@ fn run_worker(
         let _ = enc.finish();
     }
     Ok(())
+}
+
+/// Capture-loop counters, logged every 600 encoded frames.
+#[derive(Default)]
+struct CaptureStats {
+    acquired: u64,
+    encoded: u64,
+    pointer_only: u64,
+    paced_out: u64,
 }
 
 fn create_device_manager(device: &ID3D11Device) -> windows::core::Result<IMFDXGIDeviceManager> {
@@ -498,7 +571,7 @@ impl VideoConverter {
         let dst: ID3D11Resource = self.bgra.cast()?;
         unsafe { context.CopyResource(&dst, &src) };
 
-        let stream = D3D11_VIDEO_PROCESSOR_STREAM {
+        let mut streams = [D3D11_VIDEO_PROCESSOR_STREAM {
             Enable: true.into(),
             OutputIndex: 0,
             InputFrameOrField: 0,
@@ -506,11 +579,21 @@ impl VideoConverter {
             FutureFrames: 0,
             pInputSurface: ManuallyDrop::new(Some(self.input_view.clone())),
             ..Default::default()
-        };
-        unsafe {
+        }];
+        let blt = unsafe {
             self.video_context
-                .VideoProcessorBlt(&self.processor, &self.output_view, 0, &[stream])?;
-        }
+                .VideoProcessorBlt(&self.processor, &self.output_view, 0, &streams)
+        };
+        // The struct takes a raw COM pointer; release our AddRef'd clone
+        // (this used to leak one reference per frame).
+        unsafe { ManuallyDrop::drop(&mut streams[0].pInputSurface) };
+        blt?;
+        // Submit the copy+blit to the GPU now. The encoder MFT reads the
+        // NV12 texture from its own queue; without this the first frame
+        // it saw was the texture's zero-initialised contents (a pure black
+        // 745-byte IDR at 2560x1440, 3W-1-d-3 finding), the blit only
+        // landing on the GPU later.
+        unsafe { context.Flush() };
         Ok(&self.nv12)
     }
 }
@@ -570,15 +653,18 @@ impl Encoder {
         // non-cooperating encoder degrades to "some frames aren't IDR",
         // not to mislabelled frames.
         let codec_api: Option<ICodecAPI> = transform.cast().ok();
-        if config.all_idr {
-            if let Some(api) = &codec_api {
-                let gop = VARIANT::from(1u32);
-                if let Err(err) = unsafe { api.SetValue(&CODECAPI_AVEncMPVGOPSize, &gop) } {
-                    eprintln!("[sardp-win] CODECAPI_AVEncMPVGOPSize=1 rejected: {err}");
-                }
-            } else {
-                eprintln!("[sardp-win] encoder MFT has no ICodecAPI; cannot force all-IDR");
+        // GOP 1 = every frame an IDR. Otherwise a long GOP: IDRs are meant
+        // to come from `request_idr` (generation open, spec 2.10) since
+        // QUIC streams are lossless, so the periodic one is only a safety
+        // net; 60s keeps it from mattering for bitrate.
+        let gop_size = if config.all_idr { 1 } else { fps.max(1) * 60 };
+        if let Some(api) = &codec_api {
+            let gop = VARIANT::from(gop_size);
+            if let Err(err) = unsafe { api.SetValue(&CODECAPI_AVEncMPVGOPSize, &gop) } {
+                eprintln!("[sardp-win] CODECAPI_AVEncMPVGOPSize={gop_size} rejected: {err}");
             }
+        } else {
+            eprintln!("[sardp-win] encoder MFT has no ICodecAPI; GOP size left at the driver default");
         }
 
         let output_type = unsafe {
