@@ -20,6 +20,7 @@ use crate::messages::{
     self, FileChunk, FileTransferAccept, FileTransferComplete, FileTransferDirection,
     FileTransferError, FileTransferReject, FileTransferRequest,
 };
+use crate::permission_set::bit;
 use crate::prologue;
 use crate::reason_code::ReasonCode;
 use crate::stream_kind::StreamKind;
@@ -64,6 +65,15 @@ impl From<StreamReadError> for FileTransferSessionError {
 impl From<quinn::WriteError> for FileTransferSessionError {
     fn from(e: quinn::WriteError) -> Self {
         Self::Write(e)
+    }
+}
+
+/// The `PermissionSet` bit spec 4.5 requires to start a new transfer in
+/// `direction` (`FILE_UP` for an upload, `FILE_DOWN` for a download).
+pub fn required_permission_bit(direction: FileTransferDirection) -> u32 {
+    match direction {
+        FileTransferDirection::Upload => bit::FILE_UP,
+        FileTransferDirection::Download => bit::FILE_DOWN,
     }
 }
 
@@ -227,6 +237,53 @@ pub async fn accept_file_stream_verified(
             Err(FileTransferSessionError::OwnershipRejected(ownership_error))
         }
     }
+}
+
+/// Drives one accepted transfer to completion: accepts the `file` stream
+/// the peer is expected to open for `request.file_handle` (spec 2.6:
+/// whichever side `request.direction` names as the sender), verifies its
+/// ownership against `store` (DR-037), then dispatches to the receiver or
+/// sender flow according to `direction`, always removing the issued
+/// handle from `store` once done (success or a `FileTransferError` already
+/// sent to the peer) so a `spawn`ed caller doesn't need its own cleanup
+/// path.
+///
+/// Returns `Err` only if the `file` stream itself was never legitimately
+/// accepted (wrong stream kind, ownership rejected, transport error) --
+/// the handle is left in `store` in that case, to expire on its own TTL
+/// rather than being removed out from under a peer that might still open
+/// the stream correctly on a retry.
+pub async fn run_file_transfer(
+    connection: &quinn::Connection,
+    store: &FileHandleStore,
+    session_id: [u8; 16],
+    user_id: &str,
+    request: &FileTransferRequest,
+) -> Result<(), FileTransferSessionError> {
+    let (mut send, mut reader, handle) =
+        accept_file_stream_verified(connection, store, session_id, user_id, request.direction)
+            .await?;
+
+    let result = match request.direction {
+        FileTransferDirection::Upload => {
+            receive_file(&mut send, &mut reader, handle, request.declared_size)
+                .await
+                .map(|_outcome| ())
+        }
+        FileTransferDirection::Download => {
+            // No real filesystem in this PoC: fixed pseudo content, capped
+            // so a client-declared huge size doesn't allocate unbounded
+            // memory.
+            let pseudo_size = request.declared_size.min(1024 * 1024) as usize;
+            let pseudo_data = vec![0xABu8; pseudo_size];
+            send_file_data(&mut send, &pseudo_data, 64 * 1024)
+                .await
+                .map_err(FileTransferSessionError::Write)
+        }
+    };
+
+    store.remove(handle);
+    result
 }
 
 pub async fn send_file_chunk(

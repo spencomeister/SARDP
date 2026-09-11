@@ -19,6 +19,7 @@
 //! revisit if/when a real "reconnect from a different device" use case
 //! needs it.
 
+use ed25519_dalek::VerifyingKey;
 use rand::Rng;
 
 use crate::connection_sm::ConnectionSm;
@@ -92,6 +93,95 @@ pub async fn read_first_control_message(
         ));
     };
     Ok((send, reader, message))
+}
+
+/// Everything `sardp-server` needs to enter the Active state on a new
+/// connection, unified across both ways spec 4.6 lets a connection's first
+/// control message establish a session: a fresh `ClientHello` handshake,
+/// or a `SessionReauthenticate` resuming a `Suspended` one.
+pub struct ConnectionContext {
+    pub connection_sm: ConnectionSm,
+    pub control: ControlChannel,
+    pub session_id: [u8; 16],
+    pub user_id: String,
+    pub reconnect_token: [u8; 32],
+    pub granted_permissions: u32,
+    /// The video Channel's next Instance should open at this generation:
+    /// `0` for a fresh handshake, `ReconnectOutcome::resumed_generation`
+    /// (`last_generation + 1`, DR-026) for a resumed session.
+    pub starting_generation: u64,
+    pub is_resumed: bool,
+}
+
+/// The result of [`establish_connection`]: either a session ready to enter
+/// the Active state, or a reconnect attempt spec 4.6 rejected (the peer
+/// has already been sent `AuthResult{DENIED}` by
+/// [`server_complete_reconnect`] by the time this is returned -- there is
+/// nothing left to do but log `reason` and end the connection).
+pub enum EstablishOutcome {
+    Established(ConnectionContext),
+    ReconnectRejected(ReasonCode),
+}
+
+/// Accepts a new connection's `control` stream and drives it all the way
+/// to the Active state's threshold (spec 4.6): reads the first Envelope to
+/// tell a fresh `ClientHello` apart from a `SessionReauthenticate`, then
+/// completes whichever of the handshake or the reconnection protocol
+/// applies. Bounded by `handshake_timeout`/`auth_timeout` (spec 4.7) the
+/// same way the two paths already were individually.
+pub async fn establish_connection(
+    connection: &quinn::Connection,
+    server_name: &str,
+    trusted_pubkey: &VerifyingKey,
+    sessions: &SessionStore,
+    handshake_timeout: std::time::Duration,
+    auth_timeout: std::time::Duration,
+) -> Result<EstablishOutcome, HandshakeError> {
+    let (send, reader, first_message) =
+        read_first_control_message(connection, handshake_timeout).await?;
+    match first_message {
+        FirstControlMessage::ClientHello(client_hello_bytes) => {
+            let (outcome, connection_sm, control) =
+                crate::handshake::server_handshake_from_client_hello(
+                    send,
+                    reader,
+                    client_hello_bytes,
+                    connection,
+                    server_name,
+                    trusted_pubkey,
+                    handshake_timeout,
+                    auth_timeout,
+                )
+                .await?;
+            Ok(EstablishOutcome::Established(ConnectionContext {
+                connection_sm,
+                control,
+                session_id: outcome.session_id,
+                user_id: outcome.user_id,
+                reconnect_token: outcome.reconnect_token,
+                granted_permissions: outcome.granted_permissions,
+                starting_generation: 0,
+                is_resumed: false,
+            }))
+        }
+        FirstControlMessage::SessionReauthenticate(reauth) => {
+            match server_complete_reconnect(send, reader, &reauth, sessions).await {
+                Ok((outcome, connection_sm, control)) => {
+                    Ok(EstablishOutcome::Established(ConnectionContext {
+                        connection_sm,
+                        control,
+                        session_id: outcome.session_id,
+                        user_id: outcome.user_id,
+                        reconnect_token: outcome.reconnect_token,
+                        granted_permissions: outcome.granted_permissions,
+                        starting_generation: outcome.resumed_generation,
+                        is_resumed: true,
+                    }))
+                }
+                Err(e) => Ok(EstablishOutcome::ReconnectRejected(e.reason_code())),
+            }
+        }
+    }
 }
 
 /// The outcome of a successful reconnection: same shape as

@@ -21,6 +21,7 @@ use sardp::handshake::client_handshake;
 use sardp::messages::{self, SessionClose};
 use sardp::reason_code::ReasonCode;
 use sardp::reconnection::client_reconnect;
+use sardp::session_file::{SavedSession, read_saved_session, write_saved_session};
 use sardp::stream_reader::write_envelope;
 use sardp::timecode_frame::extract_timecode;
 use sardp::timesync::client_time_sync;
@@ -154,54 +155,6 @@ fn parse_args() -> Args {
         client_name,
         target_latency_us,
         session_file,
-    }
-}
-
-/// Session state persisted across process runs for the `--session-file`
-/// reconnect demo/test (see [`Args::session_file`]). Plain hex/text, not
-/// any format worth a dependency for.
-struct SavedSession {
-    session_id: [u8; 16],
-    reconnect_token: [u8; 32],
-    user_id: String,
-}
-
-fn hex_encode(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-
-fn parse_hex_bytes(s: &str) -> Option<Vec<u8>> {
-    if !s.len().is_multiple_of(2) {
-        return None;
-    }
-    (0..s.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
-        .collect()
-}
-
-fn read_saved_session(path: &std::path::Path) -> Option<SavedSession> {
-    let contents = std::fs::read_to_string(path).ok()?;
-    let mut lines = contents.lines();
-    let session_id: [u8; 16] = parse_hex_bytes(lines.next()?)?.try_into().ok()?;
-    let reconnect_token: [u8; 32] = parse_hex_bytes(lines.next()?)?.try_into().ok()?;
-    let user_id = lines.next()?.to_string();
-    Some(SavedSession {
-        session_id,
-        reconnect_token,
-        user_id,
-    })
-}
-
-fn write_saved_session(path: &std::path::Path, session: &SavedSession) {
-    let contents = format!(
-        "{}\n{}\n{}\n",
-        hex_encode(&session.session_id),
-        hex_encode(&session.reconnect_token),
-        session.user_id
-    );
-    if let Err(e) = std::fs::write(path, contents) {
-        eprintln!("warning: failed to write --session-file {path:?}: {e}");
     }
 }
 

@@ -21,25 +21,26 @@ use tokio::sync::{Mutex, Notify};
 
 use sardp::backpressure::BackpressureDecision;
 use sardp::channel_sm::ChannelState;
-use sardp::connection_sm::{ConnectionSm, defaults as timeouts};
+use sardp::conn_error::{ConnError, is_transport_disconnect};
+use sardp::connection_sm::defaults as timeouts;
 use sardp::encoder;
-use sardp::feedback_session::{FeedbackReceiver, ReadFeedbackError};
+use sardp::feedback_session::FeedbackReceiver;
 use sardp::file_handle_store::FileHandleStore;
-use sardp::file_transfer_session::{self as file_transfer, FileTransferSessionError};
-use sardp::handshake::{ControlChannel, HandshakeError};
+use sardp::file_transfer_session::{self as file_transfer};
+use sardp::handshake::ControlChannel;
 use sardp::messages::{
-    self, ChromaFormat, Codec, EncoderConfig, FileTransferAccept, FileTransferDirection,
-    FileTransferReject, FileTransferRequest, PermissionUpdate, SessionClose,
+    self, ChromaFormat, Codec, EncoderConfig, FileTransferAccept, FileTransferReject,
+    FileTransferRequest, SessionClose,
 };
 use sardp::permission_set::bit;
-use sardp::permission_sm::{BitState, PermissionSm};
+use sardp::permission_sm::{self, PermissionSm};
 use sardp::reason_code::ReasonCode;
-use sardp::reconnection::{self, FirstControlMessage};
-use sardp::session_store::{SessionStore, SuspendedSession};
-use sardp::stream_reader::{StreamReadError, write_envelope};
+use sardp::reconnection::{self, EstablishOutcome};
+use sardp::session_store::SessionStore;
+use sardp::stream_reader::write_envelope;
 use sardp::timecode_frame;
 use sardp::video_channel::VideoChannel;
-use sardp::video_session::{self, VideoError};
+use sardp::video_session;
 use sardp::video_sm::defaults::VIDEO_CONFIGURING_TIMEOUT;
 use sardp::{clock, dev_identity, net, pki};
 
@@ -58,11 +59,14 @@ struct Args {
 /// State shared across every connection this server handles: `sessions`
 /// (Phase 1) backs reconnection (spec 4.6), `file_handles` (this task)
 /// backs file transfer's `file_handle` issuance and DR-037 ownership
-/// checks (spec 2.6).
+/// checks (spec 2.6). Each store is independently `Arc`-wrapped (rather
+/// than the whole struct) so a task that only needs one of them --
+/// [`sardp::session_store::SessionStore::suspend_and_schedule_expiry`]'s
+/// own background expiry task, in particular -- can hold just that.
 #[derive(Default)]
 struct ServerState {
-    sessions: SessionStore,
-    file_handles: FileHandleStore,
+    sessions: Arc<SessionStore>,
+    file_handles: Arc<FileHandleStore>,
 }
 
 /// How long an issued `file_handle` stays valid if the `file` stream isn't
@@ -167,85 +171,6 @@ fn parse_args() -> Args {
         height,
         fps,
         server_name,
-    }
-}
-
-// The variant payloads are only ever read via the `Debug` derive (when
-// `main` logs a failed connection's error) -- rustc's dead_code lint
-// doesn't credit that as a "read", hence the blanket allow.
-#[derive(Debug)]
-#[allow(dead_code)]
-enum ConnError {
-    Handshake(HandshakeError),
-    Quic(quinn::ConnectionError),
-    Write(quinn::WriteError),
-    Video(VideoError),
-    Feedback(sardp::feedback_session::ReadFeedbackError),
-    Violation(ReasonCode),
-    Encode(encoder::EncodeError),
-    Join(tokio::task::JoinError),
-    Read(sardp::stream_reader::StreamReadError),
-    TimeSync(sardp::timesync::TimeSyncError),
-    /// Spec 4.1: `IDLE_TIMEOUT` fired (`Active -> Suspended`). Distinct
-    /// from a genuine transport failure so `handle_connection` can tell
-    /// the two apart in logs, even though both are handled the same way
-    /// (see `is_transport_disconnect`).
-    IdleTimeout,
-}
-
-impl From<sardp::stream_reader::StreamReadError> for ConnError {
-    fn from(e: sardp::stream_reader::StreamReadError) -> Self {
-        Self::Read(e)
-    }
-}
-impl From<sardp::timesync::TimeSyncError> for ConnError {
-    fn from(e: sardp::timesync::TimeSyncError) -> Self {
-        Self::TimeSync(e)
-    }
-}
-impl From<HandshakeError> for ConnError {
-    fn from(e: HandshakeError) -> Self {
-        Self::Handshake(e)
-    }
-}
-impl From<quinn::ConnectionError> for ConnError {
-    fn from(e: quinn::ConnectionError) -> Self {
-        Self::Quic(e)
-    }
-}
-impl From<quinn::WriteError> for ConnError {
-    fn from(e: quinn::WriteError) -> Self {
-        Self::Write(e)
-    }
-}
-impl From<VideoError> for ConnError {
-    fn from(e: VideoError) -> Self {
-        Self::Video(e)
-    }
-}
-impl From<sardp::feedback_session::ReadFeedbackError> for ConnError {
-    fn from(e: sardp::feedback_session::ReadFeedbackError) -> Self {
-        Self::Feedback(e)
-    }
-}
-impl From<sardp::ProtocolViolation> for ConnError {
-    fn from(v: sardp::ProtocolViolation) -> Self {
-        Self::Violation(v.reason)
-    }
-}
-impl From<sardp::video_sm::ProtocolViolation> for ConnError {
-    fn from(v: sardp::video_sm::ProtocolViolation) -> Self {
-        Self::Violation(v.reason)
-    }
-}
-impl From<encoder::EncodeError> for ConnError {
-    fn from(e: encoder::EncodeError) -> Self {
-        Self::Encode(e)
-    }
-}
-impl From<tokio::task::JoinError> for ConnError {
-    fn from(e: tokio::task::JoinError) -> Self {
-        Self::Join(e)
     }
 }
 
@@ -440,76 +365,37 @@ async fn handle_connection(
 
     // Spec 4.6: a new connection's first control message is either a fresh
     // `ClientHello` or a `SessionReauthenticate` resuming a `Suspended`
-    // session.
-    let (send, reader, first_message) =
-        reconnection::read_first_control_message(&connection, timeouts::HANDSHAKE_TIMEOUT).await?;
-    let (
-        mut connection_sm,
-        mut control,
-        session_id,
-        user_id,
-        reconnect_token,
-        granted_permissions,
-        starting_generation,
-        is_resumed,
-    ) = match first_message {
-        FirstControlMessage::ClientHello(client_hello_bytes) => {
-            let (outcome, connection_sm, control) =
-                sardp::handshake::server_handshake_from_client_hello(
-                    send,
-                    reader,
-                    client_hello_bytes,
-                    &connection,
-                    server_name,
-                    trusted_pubkey,
-                    timeouts::HANDSHAKE_TIMEOUT,
-                    timeouts::AUTH_TIMEOUT,
-                )
-                .await?;
-            eprintln!(
-                "[{peer}] authenticated (fresh handshake), session_id={:x?}, user_id={:?}",
-                outcome.session_id, outcome.user_id
-            );
-            (
-                connection_sm,
-                control,
-                outcome.session_id,
-                outcome.user_id,
-                outcome.reconnect_token,
-                outcome.granted_permissions,
-                0u64,
-                false,
-            )
-        }
-        FirstControlMessage::SessionReauthenticate(reauth) => {
-            match reconnection::server_complete_reconnect(send, reader, &reauth, &state.sessions)
-                .await
-            {
-                Ok((outcome, connection_sm, control)) => {
-                    eprintln!(
-                        "[{peer}] reconnected, session_id={:x?}, user_id={:?}, resuming at generation {}",
-                        outcome.session_id, outcome.user_id, outcome.resumed_generation
-                    );
-                    (
-                        connection_sm,
-                        control,
-                        outcome.session_id,
-                        outcome.user_id,
-                        outcome.reconnect_token,
-                        outcome.granted_permissions,
-                        outcome.resumed_generation,
-                        true,
-                    )
-                }
-                Err(e) => {
-                    eprintln!("[{peer}] reconnect rejected: {:?}", e.reason_code());
-                    return Ok(());
-                }
-            }
+    // session; `establish_connection` dispatches between the two and
+    // drives whichever applies to the Active-state threshold.
+    let outcome = reconnection::establish_connection(
+        &connection,
+        server_name,
+        trusted_pubkey,
+        &state.sessions,
+        timeouts::HANDSHAKE_TIMEOUT,
+        timeouts::AUTH_TIMEOUT,
+    )
+    .await?;
+    let mut ctx = match outcome {
+        EstablishOutcome::Established(ctx) => ctx,
+        EstablishOutcome::ReconnectRejected(reason) => {
+            eprintln!("[{peer}] reconnect rejected: {reason:?}");
+            return Ok(());
         }
     };
+    if ctx.is_resumed {
+        eprintln!(
+            "[{peer}] reconnected, session_id={:x?}, user_id={:?}, resuming at generation {}",
+            ctx.session_id, ctx.user_id, ctx.starting_generation
+        );
+    } else {
+        eprintln!(
+            "[{peer}] authenticated (fresh handshake), session_id={:x?}, user_id={:?}",
+            ctx.session_id, ctx.user_id
+        );
+    }
 
-    sardp::timesync::server_respond_time_sync(&mut control).await?;
+    sardp::timesync::server_respond_time_sync(&mut ctx.control).await?;
 
     let encoder_config = EncoderConfig {
         codec: Codec::H264,
@@ -524,12 +410,12 @@ async fn handle_connection(
         server_cursor_excludable: false,
     };
 
-    let mut video_channel = VideoChannel::new(starting_generation);
+    let mut video_channel = VideoChannel::new(ctx.starting_generation);
     let video_send = tokio::time::timeout(
         timeouts::SESSION_SETUP_TIMEOUT,
         open_generation(
             &connection,
-            starting_generation,
+            ctx.starting_generation,
             0,
             encoder_config,
             width,
@@ -539,23 +425,23 @@ async fn handle_connection(
     .await
     .map_err(|_elapsed| ConnError::Violation(ReasonCode::PROTOCOL_SESSION_SETUP_TIMEOUT))??;
     video_channel.mark_instance_streaming()?;
-    if !is_resumed {
+    if !ctx.is_resumed {
         // A resumed connection_sm is already `Active` (spec 4.6:
         // `resume()` skips straight there); only a fresh handshake needs
         // this Authenticated -> Active transition.
-        connection_sm.on_channel_live()?;
+        ctx.connection_sm.on_channel_live()?;
     }
     eprintln!(
         "[{peer}] video channel Live, connection {:?}",
-        connection_sm.state()
+        ctx.connection_sm.state()
     );
 
     let feedback_receiver = FeedbackReceiver::accept(&connection).await?;
-    let permission_sm = PermissionSm::new(granted_permissions);
+    let permission_sm = PermissionSm::new(ctx.granted_permissions);
 
     let result = run_active_session(
         &connection,
-        &mut control,
+        &mut ctx.control,
         &mut video_channel,
         video_send,
         feedback_receiver,
@@ -567,10 +453,10 @@ async fn handle_connection(
         peer,
         &shutdown,
         &permission_command,
-        granted_permissions,
+        ctx.granted_permissions,
         &state,
-        session_id,
-        &user_id,
+        ctx.session_id,
+        &ctx.user_id,
     )
     .await;
 
@@ -580,11 +466,11 @@ async fn handle_connection(
             eprintln!("[{peer}] connection lost unexpectedly ({e:?}); suspending session");
             suspend_and_store(
                 &state,
-                session_id,
-                user_id,
-                connection_sm,
-                reconnect_token,
-                granted_permissions,
+                ctx.session_id,
+                ctx.user_id,
+                ctx.connection_sm,
+                ctx.reconnect_token,
+                ctx.granted_permissions,
                 video_channel.generation(),
                 peer,
             )
@@ -593,83 +479,34 @@ async fn handle_connection(
     }
 }
 
-/// Whether `error` represents the underlying QUIC transport actually going
-/// away (peer killed, network partition, timed out, ...) rather than a
-/// protocol violation this server itself detected. Spec 4.1's diagram only
-/// lists `IDLE_TIMEOUT` as an explicit `Active -> Suspended` trigger
-/// (`run_active_session` handles that one inline), but a real abrupt
-/// disconnect -- the scenario "kill the client, then reconnect" actually
-/// exercises -- surfaces here as exactly this kind of transport error, in
-/// practice well before `IDLE_TIMEOUT` would otherwise fire. Treating it
-/// the same way (`Suspended`, reconnectable) rather than a hard failure is
-/// what makes reconnection reachable from a real disconnect, matching how
-/// `tests/phase1_reconnection.rs` already frames a "genuinely lost"
-/// connection at the library level.
-fn is_transport_disconnect(error: &ConnError) -> bool {
-    fn is_read_disconnect(e: &StreamReadError) -> bool {
-        matches!(e, StreamReadError::Read(_) | StreamReadError::ClosedEarly)
-    }
-    match error {
-        ConnError::IdleTimeout => true,
-        ConnError::Quic(_) | ConnError::Write(_) => true,
-        ConnError::Read(e) => is_read_disconnect(e),
-        ConnError::Feedback(ReadFeedbackError::Quic(_)) => true,
-        ConnError::Feedback(ReadFeedbackError::Read(e)) => is_read_disconnect(e),
-        // The video stream (frame send, and the backpressure reopen path)
-        // wraps its own transport errors in VideoError rather than
-        // ConnError directly -- caught by manual testing: a real `kill -9`
-        // surfaces here (mid frame-send) well before any control-stream
-        // read notices anything wrong.
-        ConnError::Video(VideoError::Quic(_) | VideoError::Write(_)) => true,
-        ConnError::Video(VideoError::Read(e)) => is_read_disconnect(e),
-        _ => false,
-    }
-}
-
 /// Transitions `connection_sm` `Active -> Suspended` and registers the
 /// session in `state.sessions` so a new connection presenting
 /// `reconnect_token` can resume it within `RECONNECT_GRACE_PERIOD` (spec
-/// 4.6). Spawns a task that expires the entry if nobody reconnects in time
-/// (a no-op if a reconnect already consumed it first --
-/// `SessionStore::expire` is safe to call unconditionally).
+/// 4.6), via [`SessionStore::suspend_and_schedule_expiry`].
 #[allow(clippy::too_many_arguments)]
 fn suspend_and_store(
     state: &Arc<ServerState>,
     session_id: [u8; 16],
     user_id: String,
-    mut connection_sm: ConnectionSm,
+    connection_sm: sardp::ConnectionSm,
     reconnect_token: [u8; 32],
     granted_permissions: u32,
     last_generation: u64,
     peer: SocketAddr,
 ) -> Result<(), ConnError> {
-    connection_sm.suspend()?;
-    state.sessions.suspend(
+    state.sessions.suspend_and_schedule_expiry(
         session_id,
-        SuspendedSession {
-            reconnect_token,
-            connection_sm,
-            granted_permissions,
-            last_generation,
-            user_id,
-        },
-    );
+        user_id,
+        connection_sm,
+        reconnect_token,
+        granted_permissions,
+        last_generation,
+        timeouts::RECONNECT_GRACE_PERIOD,
+    )?;
     eprintln!(
         "[{peer}] session {session_id:x?} suspended, reconnectable for {:?}",
         timeouts::RECONNECT_GRACE_PERIOD
     );
-
-    // expire_if_token_matches, not expire: if this session is reconnected
-    // and then suspended again before this timer fires, a plain
-    // unconditional expire(session_id) would remove that *later* suspend
-    // episode instead of the one this timer was actually armed for.
-    let state = state.clone();
-    tokio::spawn(async move {
-        tokio::time::sleep(timeouts::RECONNECT_GRACE_PERIOD).await;
-        state
-            .sessions
-            .expire_if_token_matches(session_id, reconnect_token);
-    });
     Ok(())
 }
 
@@ -741,16 +578,8 @@ async fn run_active_session(
                     // waiting on in-progress operations to finish) both
                     // block starting a *new* one, same as the VIEW gate
                     // below for frame sending.
-                    let required_bit = match request.direction {
-                        FileTransferDirection::Upload => bit::FILE_UP,
-                        FileTransferDirection::Download => bit::FILE_DOWN,
-                    };
-                    if !permission_sm.is_granted(required_bit) {
-                        let reason = if permission_sm.state(required_bit) == BitState::Draining {
-                            ReasonCode::POLICY_PERMISSION_REVOKED
-                        } else {
-                            ReasonCode::POLICY_PERMISSION_DENIED
-                        };
+                    let required_bit = file_transfer::required_permission_bit(request.direction);
+                    if let Err(reason) = permission_sm.check_gate(required_bit) {
                         let reject = FileTransferReject {
                             request_id: request.request_id,
                             reason,
@@ -796,12 +625,7 @@ async fn run_active_session(
             _ = frame_interval.tick() => {
                 let mut command = permission_command.lock().await;
                 if let Some(grant) = command.take() {
-                    let other_bits = granted_permissions & !bit::VIEW;
-                    let view_bit = if grant { bit::VIEW } else { 0 };
-                    let update = PermissionUpdate {
-                        granted_permissions: view_bit | other_bits,
-                        immediate_revoke: if grant { 0 } else { bit::VIEW },
-                    };
+                    let update = permission_sm::build_view_toggle(granted_permissions, grant);
                     permission_sm.apply_update(&update);
                     write_envelope(&mut control.send, messages::type_id::PERMISSION_UPDATE, &messages::encode(&update)).await?;
                     eprintln!("[{peer}] VIEW is now {}", if grant { "granted" } else { "revoked" });
@@ -853,11 +677,8 @@ async fn run_active_session(
     }
 }
 
-/// Spawns a task that accepts the `file` stream this connection's peer is
-/// expected to open for `file_handle` (spec 2.6: whichever side
-/// `request.direction` names as the sender), verifies its ownership
-/// against `state.file_handles` (DR-037), and drives the (in-memory
-/// pseudo-data) transfer to completion. Runs independently of
+/// Spawns a task that drives `request`'s transfer via
+/// [`file_transfer::run_file_transfer`] to completion, independently of
 /// `handle_connection`'s own select loop so a slow or stalled transfer
 /// doesn't block keepalives, video frames, or control messages on the same
 /// connection.
@@ -871,44 +692,16 @@ fn spawn_file_transfer(
     peer: SocketAddr,
 ) {
     tokio::spawn(async move {
-        let accepted = file_transfer::accept_file_stream_verified(
+        if let Err(e) = file_transfer::run_file_transfer(
             &connection,
             &state.file_handles,
             session_id,
             &user_id,
-            request.direction,
+            &request,
         )
-        .await;
-        match accepted {
-            Ok((mut send, mut reader, handle)) => {
-                let result = match request.direction {
-                    FileTransferDirection::Upload => file_transfer::receive_file(
-                        &mut send,
-                        &mut reader,
-                        handle,
-                        request.declared_size,
-                    )
-                    .await
-                    .map(|_outcome| ()),
-                    FileTransferDirection::Download => {
-                        // No real filesystem in this PoC: fixed pseudo
-                        // content, capped so a client-declared huge size
-                        // doesn't allocate unbounded memory.
-                        let pseudo_size = request.declared_size.min(1024 * 1024) as usize;
-                        let pseudo_data = vec![0xABu8; pseudo_size];
-                        file_transfer::send_file_data(&mut send, &pseudo_data, 64 * 1024)
-                            .await
-                            .map_err(FileTransferSessionError::Write)
-                    }
-                };
-                if let Err(e) = result {
-                    eprintln!("[{peer}] file transfer {handle:#x} ended with an error: {e:?}");
-                }
-                state.file_handles.remove(handle);
-            }
-            Err(e) => {
-                eprintln!("[{peer}] file stream for handle {file_handle:#x} rejected: {e:?}");
-            }
+        .await
+        {
+            eprintln!("[{peer}] file transfer for handle {file_handle:#x} failed: {e:?}");
         }
     });
 }
