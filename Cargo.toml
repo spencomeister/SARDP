@@ -1,3 +1,10 @@
+[workspace]
+members = ["tools/dxgi-capture-poc"]
+# fuzz/ is its own standalone cargo-fuzz workspace (depends on this crate
+# via a path dependency, deliberately kept outside the normal build graph
+# so libfuzzer-sys doesn't leak into ordinary `cargo build`/`cargo test`).
+exclude = ["fuzz"]
+
 [package]
 name = "sardp"
 version = "0.1.0"

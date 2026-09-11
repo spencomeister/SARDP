@@ -156,3 +156,19 @@ Stage 3ロードマップの3W-1(在席キャプチャ・エンコード基盤)�
 - 間隔を設定可能にし、運用側の判断に委ねる。
 
 現時点ではいずれも実装しておらず、3W-1-cのPoCは50ms固定のまま3W-1-dへ進んでいます。
+
+### 14. 検証機で、UDPループバック(127.0.0.1 / ::1)が通らず、実QUIC接続を張る統合テストが実行できない(環境要因)
+
+3W-1-d-1(入力メッセージ型・`input_session.rs`の追加)の際に判明した、コードではなく検証機側の問題です。`git stash`で変更前のコミット(`8513830`)に戻しても`tests/conn_establish.rs`が同じ「client-side QUIC handshake: TimedOut」で失敗するため、SARDPの変更とは無関係です。
+
+切り分け結果(2026-09-12):
+
+- `quinn`やTLSを介さない、同一プロセス内で送受信を完結させる素のUDPループバック(`System.Net.Sockets.UdpClient`)で、`127.0.0.1`宛・`::1`宛のいずれもパケットが届かない(受信側がタイムアウト)。
+- 同じ場所での素のTCPループバック(`TcpListener`/`TcpClient`、`127.0.0.1`)は**通る**。
+- Discordの画面共有を止めても変化なし。
+- 環境: Tailscale VPN(`Tailscale Tunnel`アダプタ)稼働中、Hyper-V仮想アダプタ(`vEthernet (WSL (Hyper-V firewall))`、`vEthernet (Default Switch)`)あり、AVはWindows Defenderのみ。Hyper-Vファイアウォール設定(`Get-NetFirewallHyperVVMSetting`/`Get-NetFirewallHyperVProfile`)は全て`NotConfigured`。ファイアウォールのブロックログは無効で、`netsh wfp`からもUDPを塞ぐフィルタは見つからなかった(非管理者のため網羅性は不明)。
+- 時間を区切った切り分け(約15分)ではここまでで、根本原因は未特定。
+
+**影響**: `tests/conn_establish.rs`、`tests/m2_handshake.rs`、`tests/stage3w1d_input.rs`をはじめ、ループバックQUICを張る統合テスト全てがこの機では実行できません。`cargo test --lib`(ユニットテスト、310件)は通ります。3W-1-d-1の`input_session.rs`は、メッセージ型のCBORラウンドトリップまでユニットテストで検証済みですが、実QUIC上の往復(`tests/stage3w1d_input.rs`)は**この機では未実行**のままです(UDPが通る環境で実行して確認すること)。
+
+**対応方針**: 深追いせず記録に留めています。UDPが通らない間、d-2/d-3の実機での疎通確認を規範仕様5.2節のTCPフォールバック経由で進める案は検討中(TCPは通ることが確認済み)。
