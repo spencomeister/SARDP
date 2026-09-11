@@ -48,6 +48,14 @@ lib側にユニットテスト、および実QUIC接続を張った統合テス�
 
 **修正**: `FileHandleStore::sweep_expired`+`spawn_reaper`(`Weak`参照で自身が生存の唯一の理由にならないよう設計)を追加し、`sardp-server`の`main`で60秒間隔で起動。`accept_file_stream_verified`は`accept_file_stream_verified_with_timeout`(既定30秒、`FileTransferSessionError::AcceptTimeout`)の薄いラッパーに変更(`receive_file`/`receive_file_with_timeout`と同じパターン)。`FileHandleStore::issue`は内部的に`try_issue`(容量チェック付き)を呼ぶ形にし、`sardp-server`は`MAX_CONCURRENT_FILE_TRANSFERS`(64)の上限に達すると`FileTransferReject{reason: POLICY_FILE_POLICY_REJECTED}`で拒否するようにしました(spec 4.8.1のReasonCode表に専用コードがないため、既存コードのうち最も意味が近いものを流用)。
 
+### F. handshake.rsの分割でHANDSHAKE_TIMEOUTが最大2倍に伸びていた(旧#6)
+
+acceptループの振り分けを可能にするため`server_handshake_with_timeouts`をClientHello読み取り部分と`server_handshake_from_client_hello`に分割した結果、「ClientHello待ち」と「ServerHello送信」がそれぞれ独立に`handshake_timeout`(既定10秒)でラップされ、理論上の最悪ケースが最大20秒まで伸びていました。
+
+**修正**: `read_first_control_message`/`server_handshake_from_client_hello`の引数を`handshake_timeout: Duration`から共有の`handshake_deadline: tokio::time::Instant`に変更し、`tokio::time::timeout`ではなく`timeout_at`でそのデッドラインを共有する形にしました。デッドラインは`establish_connection`(acceptループ経由)・`server_handshake_with_timeouts`(モノリシック経路、テストが使う`server_handshake`もこちら)それぞれの入口で1回だけ計算し、両フェーズに使い回します。
+
+`tests/handshake_timeout_budget.rs`に回帰テストを追加。`read_first_control_message`は実際にネットワーク入力を待つ(=本物のブロッキングポイントがある)ため、既に経過したデッドラインを渡すと即座に`HandshakeTimeout`になることを直接検証できます。一方`server_handshake_from_client_hello`側の`ServerHello`送信は、QUICストリームの初期フロー制御ウィンドウ内に収まる小さな書き込みが実際にはブロックしない(=`tokio::time::timeout_at`が経過済みデッドラインを観測する機会がない)ため、同じ手法でのランタイム上の実証はできません。こちらの修正は「`Duration`を受け取って独自の新しいウィンドウを再計算する」という選択肢自体をシグネチャから排除したことで担保しています。
+
 ## 未対応(現在のスコープでは許容している既知の課題)
 
 ### 2. suspend-on-disconnectの検証パターンが手動テスト1回分に限られている
@@ -61,10 +69,6 @@ lib側にユニットテスト、および実QUIC接続を張った統合テス�
 ### 5. クライアント側に自動再接続ロジックがない(サーバーとの非対称性)
 
 サーバーは接続断を検知して自動的にSuspendedへ遷移しますが、クライアント側には同等の検知・再接続ロジックが一切ありません。プロセスが生きたまま接続だけ切れた場合、クライアントは単にエラーで終了します。今回実証した「再接続の往復」は、プロセスを手動で再起動して`--session-file`を読ませる形でのみ成立しており、実運用で想定される「プロセスは生きたままネットワークだけ復旧する」ケースはカバーしていません。
-
-### 6. handshake.rsの分割でHANDSHAKE_TIMEOUTの意味が変わった
-
-acceptループの振り分けを可能にするため`server_handshake_with_timeouts`をClientHello読み取り部分と`server_handshake_from_client_hello`に分割した結果、「ClientHello待ち」と「ServerHello送信」がそれぞれ独立に`handshake_timeout`(既定10秒)でラップされる形になりました。以前は1つの10秒予算を共有していたのに対し、理論上の最悪ケースが最大20秒まで伸びています。専用のテストは書いておらず、仕様の「HANDSHAKE_TIMEOUT = 10秒」を厳密な合計上限と読むなら軽微な逸脱です。
 
 ### 7. `file_handle`を仕様の`bytes(16)`ではなく`u64`として実装
 

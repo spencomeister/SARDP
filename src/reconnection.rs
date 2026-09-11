@@ -67,15 +67,19 @@ pub enum FirstControlMessage {
 /// reconnection protocol -- that's the caller's job, using whichever of
 /// [`crate::handshake::server_handshake_from_client_hello`] or
 /// [`server_complete_reconnect`] this result calls for. Bounded by
-/// `handshake_timeout` (spec 4.7), the same phase boundary
-/// `server_handshake_with_timeouts` uses for its own wait on `ClientHello`.
+/// `handshake_deadline` (spec 4.7's `HANDSHAKE_TIMEOUT`) -- a shared
+/// deadline, not a fresh per-call duration, so this wait and whatever the
+/// caller bounds by the same deadline afterwards (e.g.
+/// `server_handshake_from_client_hello`'s `ServerHello` send) together
+/// spend at most one `HANDSHAKE_TIMEOUT` budget rather than one each (see
+/// [`establish_connection`]).
 pub async fn read_first_control_message(
     connection: &quinn::Connection,
-    handshake_timeout: std::time::Duration,
+    handshake_deadline: tokio::time::Instant,
 ) -> Result<(quinn::SendStream, EnvelopeReader, FirstControlMessage), HandshakeError> {
     let (send, mut reader) = accept_control_prologue(connection).await?;
-    let (type_raw, payload) = tokio::time::timeout(
-        handshake_timeout,
+    let (type_raw, payload) = tokio::time::timeout_at(
+        handshake_deadline,
         reader.read_envelope(StreamKind::Control.max_envelope_length()),
     )
     .await
@@ -127,8 +131,12 @@ pub enum EstablishOutcome {
 /// to the Active state's threshold (spec 4.6): reads the first Envelope to
 /// tell a fresh `ClientHello` apart from a `SessionReauthenticate`, then
 /// completes whichever of the handshake or the reconnection protocol
-/// applies. Bounded by `handshake_timeout`/`auth_timeout` (spec 4.7) the
-/// same way the two paths already were individually.
+/// applies. `handshake_timeout` is a single spec 4.7 `HANDSHAKE_TIMEOUT`
+/// budget computed into one deadline here and shared by both the
+/// `ClientHello`-wait and (on that path) `server_handshake_from_client_hello`'s
+/// `ServerHello` send, rather than each independently getting a fresh
+/// `handshake_timeout` window (KNOWN_ISSUES.md #6). `auth_timeout` bounds
+/// the separate `AuthPubkey`/`AuthResult` round trip as before.
 pub async fn establish_connection(
     connection: &quinn::Connection,
     server_name: &str,
@@ -137,8 +145,9 @@ pub async fn establish_connection(
     handshake_timeout: std::time::Duration,
     auth_timeout: std::time::Duration,
 ) -> Result<EstablishOutcome, HandshakeError> {
+    let handshake_deadline = tokio::time::Instant::now() + handshake_timeout;
     let (send, reader, first_message) =
-        read_first_control_message(connection, handshake_timeout).await?;
+        read_first_control_message(connection, handshake_deadline).await?;
     match first_message {
         FirstControlMessage::ClientHello(client_hello_bytes) => {
             let (outcome, connection_sm, control) =
@@ -149,7 +158,7 @@ pub async fn establish_connection(
                     connection,
                     server_name,
                     trusted_pubkey,
-                    handshake_timeout,
+                    handshake_deadline,
                     auth_timeout,
                 )
                 .await?;
