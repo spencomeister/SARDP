@@ -169,6 +169,7 @@ Stage 3ロードマップの3W-1(在席キャプチャ・エンコード基盤)�
 - 環境: Tailscale VPN(`Tailscale Tunnel`アダプタ)稼働中、Hyper-V仮想アダプタ(`vEthernet (WSL (Hyper-V firewall))`、`vEthernet (Default Switch)`)あり、AVはWindows Defenderのみ。Hyper-Vファイアウォール設定(`Get-NetFirewallHyperVVMSetting`/`Get-NetFirewallHyperVProfile`)は全て`NotConfigured`。ファイアウォールのブロックログは無効で、`netsh wfp`からもUDPを塞ぐフィルタは見つからなかった(非管理者のため網羅性は不明)。
 - 時間を区切った切り分け(約15分)ではここまでで、根本原因は未特定。
 - **ただし壊れているのはループバックだけ**: 同じ機の非ループバックのローカルアドレス宛(LANの`192.168.1.10`、Tailscaleの`100.83.176.98`、Hyper-V仮想アダプタの`172.x`)への同一プロセス内UDP送受信は**すべて通る**。
+- **Tailscale切断でも再現、原因はTailscale以外**: `tailscale down`後(バックエンド`NoState`、Tailscaleアダプタは169.254のAPIPAアドレスのみで100.xなし)に同じ素のUDPループバックテストを実行しても、127.0.0.1/::1ともに失敗した。ただし非管理者のため`Tailscale`サービス自体は停止できておらず、アダプタ(とTailscaleが入れているWFPフィルタ)は残った状態での結果である点は留意。残る候補はHyper-V(WSL用ファイアウォール)、Defenderの何らかの機能、他の常駐ソフト。これ以上は深追いしない。
 
 **影響**: `127.0.0.1`をハードコードしている統合テスト(`tests/conn_establish.rs`、`tests/m2_handshake.rs`等、M1〜M6由来のもの)はこの機ではそのままでは実行できません。`cargo test --lib`(ユニットテスト、310件)は通ります。
 
