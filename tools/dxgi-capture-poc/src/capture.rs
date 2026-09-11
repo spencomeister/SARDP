@@ -3,8 +3,9 @@
 //! `src/bin/mf_h264_encode.rs`)の両方から共有される。
 
 use std::mem::size_of;
+use std::time::Duration;
 
-use windows::core::Interface;
+use windows::core::{Interface, PCWSTR};
 use windows::Win32::Foundation::{HMODULE, RECT};
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_UNKNOWN;
 use windows::Win32::Graphics::Direct3D11::{
@@ -15,6 +16,7 @@ use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory1, IDXGIAdapter, IDXGIAdapter1, IDXGIFactory1, IDXGIOutput, IDXGIOutput1,
     IDXGIOutputDuplication, DXGI_OUTDUPL_FRAME_INFO, DXGI_OUTDUPL_MOVE_RECT,
 };
+use windows::Win32::Graphics::Gdi::{DEVMODEW, ENUM_CURRENT_SETTINGS, EnumDisplaySettingsW};
 
 /// AcquireNextFrame成功後、確実にReleaseFrameを対応させるRAIIガード。
 /// Desktop Duplicationは未解放フレームを1つしか許さないため、
@@ -95,6 +97,30 @@ pub fn read_dirty_rects(
     let count = needed as usize / size_of::<RECT>();
     buf.truncate(count);
     Ok(buf)
+}
+
+/// プライマリディスプレイの現在のリフレッシュレートから、1フレームあたりの間隔を返す。
+/// 取得できない場合は60Hz相当にフォールバックする。
+///
+/// 当初はキャプチャ間隔を固定200ms(5fps相当)に絞っていたが、DXGI Desktop Duplicationは
+/// 変化があった時だけAcquireNextFrameが返るため、上限を外しても無変化時の負荷が増える
+/// わけではない。むしろ実際に変化が速い場面(動画再生・スクロール等)で不要に
+/// 間引いてしまっていたため、ディスプレイの実リフレッシュレートまで許容するように変更。
+pub fn primary_display_refresh_interval() -> Duration {
+    let mut devmode = DEVMODEW {
+        dmSize: size_of::<DEVMODEW>() as u16,
+        ..Default::default()
+    };
+    let ok = unsafe { EnumDisplaySettingsW(PCWSTR::null(), ENUM_CURRENT_SETTINGS, &mut devmode) }
+        .as_bool();
+    // dmDisplayFrequencyの0/1は「ハードウェア既定値・不明」を意味する(MSDN)ため、
+    // その場合も60Hzにフォールバックする。
+    let hz = if ok && devmode.dmDisplayFrequency > 1 {
+        devmode.dmDisplayFrequency
+    } else {
+        60
+    };
+    Duration::from_secs_f64(1.0 / hz as f64)
 }
 
 pub fn read_move_rect_count(

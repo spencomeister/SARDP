@@ -20,16 +20,15 @@ use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::Graphics::Dxgi::{IDXGIResource, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO};
 
 use dxgi_capture_poc::capture::{
-    create_d3d11_device, create_output_duplication, read_dirty_rects, read_move_rect_count,
-    FrameGuard,
+    create_d3d11_device, create_output_duplication, primary_display_refresh_interval,
+    read_dirty_rects, read_move_rect_count, FrameGuard,
 };
 
 /// 1フレーム取得を待つ最大時間(ms)。これを超えると「変化なし」としてリトライする。
 const ACQUIRE_TIMEOUT_MS: u32 = 500;
-/// 取得するフレーム数の上限(PoCなのでキャプチャセッションの長さを制限する)。
-const MAX_FRAMES: u32 = 30;
-/// フレーム取得後、次のAcquireNextFrameまでの最小間隔。「毎秒数フレーム」に収める。
-const MIN_FRAME_INTERVAL: Duration = Duration::from_millis(200);
+/// キャプチャセッションの目標時間(PoCなので長さを制限する)。実際に取得するフレーム数の
+/// 上限は、この時間をディスプレイのリフレッシュ間隔で割って求める(MAX_FRAMES算出)。
+const TARGET_SESSION_DURATION: Duration = Duration::from_secs(6);
 
 fn main() -> windows::core::Result<()> {
     let out_dir = output_dir();
@@ -37,8 +36,19 @@ fn main() -> windows::core::Result<()> {
     let log_path = out_dir.join("dirty_regions.log");
     let mut log = BufWriter::new(File::create(&log_path).expect("failed to create log file"));
 
+    // 以前はキャプチャ間隔を固定200ms(5fps)に絞っていたが、DXGI Desktop Duplicationは
+    // 変化があった時だけAcquireNextFrameが返るため、上限を外しても無変化時の負荷は
+    // 増えない。実ディスプレイのリフレッシュレートまで許容するようにする。
+    let min_frame_interval = primary_display_refresh_interval();
+    let max_frames = (TARGET_SESSION_DURATION.as_secs_f64() / min_frame_interval.as_secs_f64())
+        .ceil() as u32;
+
     println!("[dxgi-capture-poc] output directory: {}", out_dir.display());
     println!("[dxgi-capture-poc] log file: {}", log_path.display());
+    println!(
+        "[dxgi-capture-poc] min_frame_interval={:.2}ms max_frames={max_frames}",
+        min_frame_interval.as_secs_f64() * 1000.0
+    );
     writeln!(log, "# 3W-1-a DXGI Desktop Duplication capture log").ok();
     writeln!(log, "# started_at={:?}", SystemTime::now()).ok();
 
@@ -49,7 +59,7 @@ fn main() -> windows::core::Result<()> {
     let mut timeouts = 0u32;
     let start = Instant::now();
 
-    while saved_frames < MAX_FRAMES {
+    while saved_frames < max_frames {
         let frame_start = Instant::now();
         let mut frame_info = DXGI_OUTDUPL_FRAME_INFO::default();
         let mut resource: Option<IDXGIResource> = None;
@@ -90,7 +100,7 @@ fn main() -> windows::core::Result<()> {
         let elapsed_since_start = start.elapsed();
         log_frame_info(&mut log, saved_frames, &frame_info, &dirty_rects, move_rect_count, elapsed_since_start);
         println!(
-            "[dxgi-capture-poc] frame {saved_frames}/{MAX_FRAMES}: dirty_rects={} move_rects={} accumulated_frames={} last_present_qpc={} elapsed={:.3}s",
+            "[dxgi-capture-poc] frame {saved_frames}/{max_frames}: dirty_rects={} move_rects={} accumulated_frames={} last_present_qpc={} elapsed={:.3}s",
             dirty_rects.len(),
             move_rect_count,
             frame_info.AccumulatedFrames,
@@ -107,8 +117,8 @@ fn main() -> windows::core::Result<()> {
         drop(frame_guard);
 
         let elapsed = frame_start.elapsed();
-        if elapsed < MIN_FRAME_INTERVAL {
-            std::thread::sleep(MIN_FRAME_INTERVAL - elapsed);
+        if elapsed < min_frame_interval {
+            std::thread::sleep(min_frame_interval - elapsed);
         }
     }
 

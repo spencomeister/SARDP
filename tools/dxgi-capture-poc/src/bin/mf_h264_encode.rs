@@ -56,18 +56,15 @@ use windows::Win32::Media::MediaFoundation::{
 use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
 
 use dxgi_capture_poc::capture::{
-    create_d3d11_device, create_output_duplication, read_dirty_rects, read_move_rect_count,
-    FrameGuard,
+    create_d3d11_device, create_output_duplication, primary_display_refresh_interval,
+    read_dirty_rects, read_move_rect_count, FrameGuard,
 };
 
 const ACQUIRE_TIMEOUT_MS: u32 = 500;
-/// 3W-1-aより少し長め(約12秒分)。動画として見て分かりやすい尺にする。
-const MAX_FRAMES: u32 = 60;
-const MIN_FRAME_INTERVAL: Duration = Duration::from_millis(200);
+/// キャプチャセッションの目標時間(3W-1-aより少し長め)。実際に取得するフレーム数の
+/// 上限は、この時間をディスプレイのリフレッシュ間隔で割って求める(MAX_FRAMES算出)。
+const TARGET_SESSION_DURATION: Duration = Duration::from_secs(12);
 const BITRATE_BPS: u32 = 8_000_000;
-/// MF_MT_FRAME_RATEに載せる名目値。実際のサンプル時刻は壁時計時間を使うため
-/// 再生速度自体はこれに依存しないが、エンコーダのレート制御の前提値になる。
-const NOMINAL_FPS: u32 = 5;
 
 fn main() -> windows::core::Result<()> {
     unsafe { CoInitializeEx(None, COINIT_MULTITHREADED).ok()? };
@@ -92,8 +89,20 @@ fn run() -> windows::core::Result<()> {
     let log_path = out_dir.join("encode_log.txt");
     let mut log = BufWriter::new(File::create(&log_path).expect("failed to create log file"));
 
+    // 以前はキャプチャ間隔を固定200ms(5fps)に絞っていたが、DXGI Desktop Duplicationは
+    // 変化があった時だけAcquireNextFrameが返るため、上限を外しても無変化時の負荷は
+    // 増えない。実ディスプレイのリフレッシュレートまで許容するようにする。
+    let min_frame_interval = primary_display_refresh_interval();
+    let nominal_fps = (1.0 / min_frame_interval.as_secs_f64()).round().max(1.0) as u32;
+    let max_frames = (TARGET_SESSION_DURATION.as_secs_f64() / min_frame_interval.as_secs_f64())
+        .ceil() as u32;
+
     println!("[mf-h264-encode] output: {}", mp4_path.display());
     println!("[mf-h264-encode] log: {}", log_path.display());
+    println!(
+        "[mf-h264-encode] min_frame_interval={:.2}ms nominal_fps={nominal_fps} max_frames={max_frames}",
+        min_frame_interval.as_secs_f64() * 1000.0
+    );
     writeln!(log, "# 3W-1-b Media Foundation H.264 hardware encode log").ok();
     writeln!(log, "# started_at={:?}", SystemTime::now()).ok();
 
@@ -115,7 +124,7 @@ fn run() -> windows::core::Result<()> {
     let mut timeouts = 0u32;
     let start = Instant::now();
 
-    while encoded_frames < MAX_FRAMES {
+    while encoded_frames < max_frames {
         let frame_start = Instant::now();
         let mut frame_info = DXGI_OUTDUPL_FRAME_INFO::default();
         let mut resource: Option<IDXGIResource> = None;
@@ -158,8 +167,20 @@ fn run() -> windows::core::Result<()> {
                 "[mf-h264-encode] capture size: {}x{} (first frame determines encoder output size)",
                 desc.Width, desc.Height
             );
-            converter = Some(VideoConverter::new(&device, &context, desc.Width, desc.Height)?);
-            encoder = Some(Encoder::new(&device_manager, &mp4_path, desc.Width, desc.Height)?);
+            converter = Some(VideoConverter::new(
+                &device,
+                &context,
+                desc.Width,
+                desc.Height,
+                nominal_fps,
+            )?);
+            encoder = Some(Encoder::new(
+                &device_manager,
+                &mp4_path,
+                desc.Width,
+                desc.Height,
+                nominal_fps,
+            )?);
         }
 
         // DXGI所有のフレームテクスチャを自前のBGRAテクスチャへコピーし
@@ -180,7 +201,7 @@ fn run() -> windows::core::Result<()> {
             elapsed_since_start,
         );
         println!(
-            "[mf-h264-encode] frame {encoded_frames}/{MAX_FRAMES}: dirty_rects={} move_rects={} elapsed={:.3}s",
+            "[mf-h264-encode] frame {encoded_frames}/{max_frames}: dirty_rects={} move_rects={} elapsed={:.3}s",
             dirty_rects.len(),
             move_rect_count,
             elapsed_since_start.as_secs_f64(),
@@ -196,8 +217,8 @@ fn run() -> windows::core::Result<()> {
         drop(frame_guard);
 
         let elapsed = frame_start.elapsed();
-        if elapsed < MIN_FRAME_INTERVAL {
-            std::thread::sleep(MIN_FRAME_INTERVAL - elapsed);
+        if elapsed < min_frame_interval {
+            std::thread::sleep(min_frame_interval - elapsed);
         }
     }
 
@@ -275,6 +296,7 @@ impl VideoConverter {
         context: &ID3D11DeviceContext,
         width: u32,
         height: u32,
+        fps: u32,
     ) -> windows::core::Result<Self> {
         let video_device: ID3D11VideoDevice = device.cast()?;
         let video_context: ID3D11VideoContext = context.cast()?;
@@ -307,13 +329,13 @@ impl VideoConverter {
         let content_desc = D3D11_VIDEO_PROCESSOR_CONTENT_DESC {
             InputFrameFormat: D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE,
             InputFrameRate: DXGI_RATIONAL {
-                Numerator: NOMINAL_FPS,
+                Numerator: fps,
                 Denominator: 1,
             },
             InputWidth: width,
             InputHeight: height,
             OutputFrameRate: DXGI_RATIONAL {
-                Numerator: NOMINAL_FPS,
+                Numerator: fps,
                 Denominator: 1,
             },
             OutputWidth: width,
@@ -414,6 +436,7 @@ struct Encoder {
     events: IMFMediaEventGenerator,
     muxer: Option<Muxer>,
     mp4_path: PathBuf,
+    fps: u32,
     last_pts_100ns: Option<i64>,
     input_count: u32,
     output_count: u32,
@@ -426,6 +449,7 @@ impl Encoder {
         mp4_path: &Path,
         width: u32,
         height: u32,
+        fps: u32,
     ) -> windows::core::Result<Self> {
         let activate = find_hardware_h264_encoder()?;
         let transform: IMFTransform = unsafe { activate.ActivateObject()? };
@@ -452,7 +476,7 @@ impl Encoder {
             t.SetUINT32(&MF_MT_AVG_BITRATE, BITRATE_BPS)?;
             t.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
             set_attribute_u64_pair(&t, &MF_MT_FRAME_SIZE, width, height)?;
-            set_attribute_u64_pair(&t, &MF_MT_FRAME_RATE, NOMINAL_FPS, 1)?;
+            set_attribute_u64_pair(&t, &MF_MT_FRAME_RATE, fps, 1)?;
             set_attribute_u64_pair(&t, &MF_MT_PIXEL_ASPECT_RATIO, 1, 1)?;
             t
         };
@@ -464,7 +488,7 @@ impl Encoder {
             t.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_NV12)?;
             t.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
             set_attribute_u64_pair(&t, &MF_MT_FRAME_SIZE, width, height)?;
-            set_attribute_u64_pair(&t, &MF_MT_FRAME_RATE, NOMINAL_FPS, 1)?;
+            set_attribute_u64_pair(&t, &MF_MT_FRAME_RATE, fps, 1)?;
             set_attribute_u64_pair(&t, &MF_MT_PIXEL_ASPECT_RATIO, 1, 1)?;
             t
         };
@@ -489,6 +513,7 @@ impl Encoder {
             events,
             muxer: None,
             mp4_path: mp4_path.to_path_buf(),
+            fps,
             last_pts_100ns: None,
             input_count: 0,
             output_count: 0,
@@ -500,7 +525,7 @@ impl Encoder {
         let pts = duration_to_100ns(timestamp);
         let duration = match self.last_pts_100ns {
             Some(prev) => (pts - prev).max(1),
-            None => 10_000_000 / NOMINAL_FPS as i64,
+            None => 10_000_000 / self.fps as i64,
         };
         self.last_pts_100ns = Some(pts);
 
