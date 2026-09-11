@@ -474,6 +474,15 @@ async fn run(connection: quinn::Connection, args: &Args) -> Result<(), AppError>
     // its own admin command -- see that binary's matching comment.
     let mut audio_playback_reader: Option<audio_session::AudioFrameReader> = None;
 
+    // CLIP_WRITE (client -> server announce): like AUDIO_CAPTURE, only
+    // acted on if granted at handshake/reconnect time -- this client has
+    // no interactive control surface to react to a later grant with.
+    // Fire-and-forget: this connection's own `accept_bi()` isn't used for
+    // anything else, so a spawned announce here can't race with anything.
+    if granted_permissions & bit::CLIP_WRITE != 0 {
+        tokio::spawn(clipboard_announce_once(connection.clone()));
+    }
+
     loop {
         let idle_deadline = last_activity + timeouts::IDLE_TIMEOUT;
         tokio::select! {
@@ -567,6 +576,50 @@ async fn run(connection: quinn::Connection, args: &Args) -> Result<(), AppError>
                     }
                 });
             }
+        }
+    }
+}
+
+/// CLIP_WRITE (client -> server announce, spec 2.7): announces synthetic
+/// clipboard content once, then responds to a `ClipboardRequest` for it if
+/// one arrives. Mirrors `sardp-server`'s `spawn_clipboard_announce`
+/// (`CLIP_READ` direction) exactly, just from the other side.
+async fn clipboard_announce_once(connection: quinn::Connection) {
+    let formats = messages::ClipboardFormats {
+        request_id: 1,
+        formats: vec![messages::ClipboardFormatEntry {
+            namespace: messages::FormatNamespace::Mime,
+            format_id: "text/plain".to_string(),
+        }],
+    };
+    let (mut send, mut reader) =
+        match clipboard_session::announce_clipboard_formats(&connection, &formats).await {
+            Ok(pair) => pair,
+            Err(e) => {
+                eprintln!("failed to announce clipboard formats: {e:?}");
+                return;
+            }
+        };
+    match clipboard_session::read_clipboard_request(&mut reader).await {
+        Ok(request) => {
+            let pseudo_data = b"hello from sardp-client's synthetic clipboard".to_vec();
+            let request_id = request.request_id;
+            let result = clipboard_session::respond_to_clipboard_request(
+                &mut send,
+                request.request_id,
+                request.namespace,
+                request.format_id,
+                pseudo_data,
+                None,
+            )
+            .await;
+            match result {
+                Ok(()) => eprintln!("responded to ClipboardRequest {request_id}"),
+                Err(e) => eprintln!("failed to respond to ClipboardRequest: {e:?}"),
+            }
+        }
+        Err(e) => {
+            eprintln!("clipboard announce: never received a ClipboardRequest ({e:?})");
         }
     }
 }

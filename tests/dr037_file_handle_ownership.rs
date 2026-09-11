@@ -81,7 +81,7 @@ async fn a_file_handle_issued_to_one_session_is_rejected_from_a_different_connec
     // Opening succeeds at the transport level -- `open_file_stream` has no
     // way to know the handle isn't client_b's own; the ownership check is
     // entirely the receiver's job.
-    let (_send, _reader) = open_result.expect("client_b can open the stream");
+    let _send = open_result.expect("client_b can open the stream");
 
     match accept_result {
         Err(FileTransferSessionError::OwnershipRejected(FileHandleError::SessionMismatch)) => {}
@@ -117,8 +117,8 @@ async fn the_owning_session_s_own_connection_is_accepted() {
             FileTransferDirection::Upload,
         ),
     );
-    let (_send, _reader) = open_result.expect("client_a opens its own stream");
-    let (_send2, _reader2, accepted_handle) =
+    let _send = open_result.expect("client_a opens its own stream");
+    let (_reader, accepted_handle) =
         accept_result.expect("the owning session's own connection is accepted");
     assert_eq!(accepted_handle, file_handle);
 }

@@ -2,13 +2,26 @@
 //! `FileTransferReject` travel on the existing `control` stream -- the
 //! client always sends `FileTransferRequest`, regardless of `direction`.
 //! Once the server issues a `file_handle` via `FileTransferAccept`,
-//! whichever side `direction` names as the sender opens a `file` stream
-//! (`StreamPrologue.context_id = file_handle`) and streams `FileChunk`s,
-//! ending with `FileTransferComplete` (SHA-256 over the whole file) or, on
-//! one of spec 2.6's MUST-reject conditions, `FileTransferError` (spec 4.8:
-//! `PROTOCOL.10 FILE_CHUNK_OVERLAP`, `PROTOCOL.11 FILE_CHUNK_OUT_OF_RANGE`,
+//! whichever side `direction` names as the sender **opens** a `file`
+//! stream (`StreamPrologue.context_id = file_handle`) and streams
+//! `FileChunk`s, ending with `FileTransferComplete` (SHA-256 over the
+//! whole file).
+//!
+//! **`file` is unidirectional (DR-038)**: `FileChunk`/`FileTransferComplete`
+//! only ever flow sender -> receiver, so a uni stream suffices. The one
+//! thing that would naturally flow the other way -- `FileTransferError` on
+//! one of spec 2.6's MUST-reject conditions (spec 4.8: `PROTOCOL.10
+//! FILE_CHUNK_OVERLAP`, `PROTOCOL.11 FILE_CHUNK_OUT_OF_RANGE`,
 //! `PROTOCOL.12 FILE_INCOMPLETE_TRANSFER`, `PROTOCOL.13
-//! FILE_CHECKSUM_MISMATCH`).
+//! FILE_CHECKSUM_MISMATCH`) -- travels on the already-bidirectional
+//! `control` stream instead, correlated by `file_handle`. This module's
+//! receive functions only ever *detect* such an error and return it as
+//! data ([`ReceiveOutcome::Error`]); actually reporting it over `control`
+//! is the caller's job, since this module has no access to that stream.
+//! Keeping `file` unidirectional also means it never contends with
+//! `clipboard`'s `accept_bi()` (QUIC tracks the uni/bidi accept queues
+//! separately) the way an earlier, bidirectional `file` implementation did
+//! (KNOWN_ISSUES.md, resolved).
 //!
 //! This module operates entirely on in-memory buffers (no real filesystem),
 //! matching this PoC's simplified scope for file transfer.
@@ -163,14 +176,15 @@ pub async fn read_file_transfer_decision(
 
 // --- `file` stream: opening, chunks, completion/error ----------------------
 
-/// Sender side: opens the `file` stream once a `file_handle` has been
-/// issued (spec 2.6: `StreamPrologue.context_id = file_handle`).
+/// Sender side (DR-038: `file` is unidirectional): opens the `file` stream
+/// once a `file_handle` has been issued (spec 2.6:
+/// `StreamPrologue.context_id = file_handle`).
 pub async fn open_file_stream(
     connection: &quinn::Connection,
     file_handle: u64,
-) -> Result<(quinn::SendStream, EnvelopeReader), FileTransferSessionError> {
-    let (mut send, recv) = connection
-        .open_bi()
+) -> Result<quinn::SendStream, FileTransferSessionError> {
+    let mut send = connection
+        .open_uni()
         .await
         .map_err(FileTransferSessionError::Quic)?;
 
@@ -178,7 +192,7 @@ pub async fn open_file_stream(
     prologue::encode(StreamKind::File, 1, file_handle, &mut prologue_bytes);
     send.write_all(&prologue_bytes).await?;
 
-    Ok((send, EnvelopeReader::new(recv)))
+    Ok(send)
 }
 
 /// Receiver side: accepts the `file` stream and validates its `context_id`
@@ -186,9 +200,9 @@ pub async fn open_file_stream(
 pub async fn accept_file_stream(
     connection: &quinn::Connection,
     expected_file_handle: u64,
-) -> Result<(quinn::SendStream, EnvelopeReader), FileTransferSessionError> {
-    let (send, recv) = connection
-        .accept_bi()
+) -> Result<EnvelopeReader, FileTransferSessionError> {
+    let recv = connection
+        .accept_uni()
         .await
         .map_err(FileTransferSessionError::Quic)?;
     let mut reader = EnvelopeReader::new(recv);
@@ -204,7 +218,7 @@ pub async fn accept_file_stream(
         });
     }
 
-    Ok((send, reader))
+    Ok(reader)
 }
 
 /// Receiver side, DR-037: accepts the `file` stream, but -- unlike
@@ -217,8 +231,9 @@ pub async fn accept_file_stream(
 /// observing it, or guessing) from having its stream accepted as if it
 /// were that session's own transfer.
 ///
-/// On any ownership failure, the stream is reset at the transport level
-/// (spec 2.6 doesn't define a `file`-stream response for "this handle
+/// On any ownership failure, the stream is stopped at the transport level
+/// (`RecvStream::stop`, the receive-side equivalent of a `SendStream::reset`
+/// -- spec 2.6 doesn't define a `file`-stream response for "this handle
 /// isn't yours" the way `FileTransferReject` covers the control-stream
 /// request) rather than returned to the caller.
 pub async fn accept_file_stream_verified(
@@ -227,7 +242,7 @@ pub async fn accept_file_stream_verified(
     session_id: [u8; 16],
     user_id: &str,
     direction: FileTransferDirection,
-) -> Result<(quinn::SendStream, EnvelopeReader, u64), FileTransferSessionError> {
+) -> Result<(EnvelopeReader, u64), FileTransferSessionError> {
     accept_file_stream_verified_with_timeout(
         connection,
         store,
@@ -250,8 +265,8 @@ pub async fn accept_file_stream_verified_with_timeout(
     user_id: &str,
     direction: FileTransferDirection,
     accept_timeout: std::time::Duration,
-) -> Result<(quinn::SendStream, EnvelopeReader, u64), FileTransferSessionError> {
-    let (mut send, recv) = tokio::time::timeout(accept_timeout, connection.accept_bi())
+) -> Result<(EnvelopeReader, u64), FileTransferSessionError> {
+    let recv = tokio::time::timeout(accept_timeout, connection.accept_uni())
         .await
         .map_err(|_elapsed| FileTransferSessionError::AcceptTimeout)?
         .map_err(FileTransferSessionError::Quic)?;
@@ -264,59 +279,85 @@ pub async fn accept_file_stream_verified_with_timeout(
     let file_handle = stream_prologue.context_id;
 
     match store.validate(file_handle, session_id, user_id, direction) {
-        Ok(_) => Ok((send, reader, file_handle)),
+        Ok(_) => Ok((reader, file_handle)),
         Err(ownership_error) => {
-            let _ = send.reset(quinn::VarInt::from_u32(0));
+            reader.stop(quinn::VarInt::from_u32(0));
             Err(FileTransferSessionError::OwnershipRejected(ownership_error))
         }
     }
 }
 
-/// Drives one accepted transfer to completion: accepts the `file` stream
-/// the peer is expected to open for `request.file_handle` (spec 2.6:
-/// whichever side `request.direction` names as the sender), verifies its
-/// ownership against `store` (DR-037), then dispatches to the receiver or
-/// sender flow according to `direction`, always removing the issued
-/// handle from `store` once done (success or a `FileTransferError` already
-/// sent to the peer) so a `spawn`ed caller doesn't need its own cleanup
-/// path.
+/// What [`run_file_transfer`] leaves for its caller to do.
+#[derive(Debug)]
+pub enum FileTransferOutcome {
+    /// The transfer finished: data received and checksum-verified, or the
+    /// sender finished writing.
+    Done,
+    /// The receiver detected one of spec 2.6's MUST-reject conditions (or a
+    /// stall timeout). DR-038: `run_file_transfer` has no access to the
+    /// `control` stream, so it can only detect this and hand it back --
+    /// the caller MUST report `FileTransferError` over `control` itself,
+    /// correlated by `file_handle`.
+    ReportError(FileTransferError),
+}
+
+/// Drives one accepted transfer to completion: opens or accepts the `file`
+/// stream depending on which side `request.direction` names as the sender
+/// (spec 2.6; DR-037's ownership check applies on the accepting side),
+/// then dispatches to the sender or receiver flow, always removing
+/// `file_handle` from `store` once done so a `spawn`ed caller doesn't need
+/// its own cleanup path.
+///
+/// `file_handle` is required even on the accepting (Upload) side --
+/// where [`accept_file_stream_verified`] would derive it from the stream
+/// itself -- purely so callers always have one value to log/correlate
+/// against regardless of direction; accepting still re-derives and
+/// verifies its own copy from the stream rather than trusting this one.
 ///
 /// Returns `Err` only if the `file` stream itself was never legitimately
-/// accepted (wrong stream kind, ownership rejected, transport error) --
-/// the handle is left in `store` in that case, to expire on its own TTL
-/// rather than being removed out from under a peer that might still open
-/// the stream correctly on a retry.
+/// opened/accepted (wrong stream kind, ownership rejected, transport
+/// error) -- the handle is left in `store` in that case, to expire on its
+/// own TTL rather than being removed out from under a peer that might
+/// still open the stream correctly on a retry.
 pub async fn run_file_transfer(
     connection: &quinn::Connection,
     store: &FileHandleStore,
     session_id: [u8; 16],
     user_id: &str,
     request: &FileTransferRequest,
-) -> Result<(), FileTransferSessionError> {
-    let (mut send, mut reader, handle) =
-        accept_file_stream_verified(connection, store, session_id, user_id, request.direction)
-            .await?;
-
-    let result = match request.direction {
+    file_handle: u64,
+) -> Result<FileTransferOutcome, FileTransferSessionError> {
+    match request.direction {
         FileTransferDirection::Upload => {
-            receive_file(&mut send, &mut reader, handle, request.declared_size)
-                .await
-                .map(|_outcome| ())
+            let (mut reader, verified_handle) = accept_file_stream_verified(
+                connection,
+                store,
+                session_id,
+                user_id,
+                request.direction,
+            )
+            .await?;
+            let outcome = receive_file(&mut reader, verified_handle, request.declared_size).await;
+            store.remove(verified_handle);
+            match outcome? {
+                ReceiveOutcome::Complete(_) => Ok(FileTransferOutcome::Done),
+                ReceiveOutcome::Error(error) => Ok(FileTransferOutcome::ReportError(error)),
+            }
         }
         FileTransferDirection::Download => {
+            let mut send = open_file_stream(connection, file_handle).await?;
             // No real filesystem in this PoC: fixed pseudo content, capped
             // so a client-declared huge size doesn't allocate unbounded
             // memory.
             let pseudo_size = request.declared_size.min(1024 * 1024) as usize;
             let pseudo_data = vec![0xABu8; pseudo_size];
-            send_file_data(&mut send, &pseudo_data, 64 * 1024)
+            let result = send_file_data(&mut send, &pseudo_data, 64 * 1024)
                 .await
-                .map_err(FileTransferSessionError::Write)
+                .map_err(FileTransferSessionError::Write);
+            store.remove(file_handle);
+            result.map(|()| FileTransferOutcome::Done)
         }
-    };
-
-    store.remove(handle);
-    result
+    }
 }
 
 pub async fn send_file_chunk(
@@ -467,8 +508,10 @@ impl FileReassembly {
 }
 
 /// The result of driving [`receive_file`] to completion: either the fully
-/// reassembled file (checksum verified) or the `FileTransferError` that was
-/// both sent to the peer and returned here.
+/// reassembled file (checksum verified) or a `FileTransferError` the
+/// caller MUST report over the `control` stream (DR-038; see
+/// [`FileTransferOutcome::ReportError`]) -- this function only detects the
+/// condition, since it has no access to `control` itself.
 #[derive(Debug)]
 pub enum ReceiveOutcome {
     Complete(Vec<u8>),
@@ -479,13 +522,11 @@ pub enum ReceiveOutcome {
 /// 30s). See [`receive_file_with_timeout`] to override it (e.g. a test
 /// proving the timeout mechanism itself fires without a real 30s wait).
 pub async fn receive_file(
-    send: &mut quinn::SendStream,
     reader: &mut EnvelopeReader,
     file_handle: u64,
     resolved_size: u64,
 ) -> Result<ReceiveOutcome, FileTransferSessionError> {
     receive_file_with_timeout(
-        send,
         reader,
         file_handle,
         resolved_size,
@@ -496,16 +537,16 @@ pub async fn receive_file(
 
 /// Receiver side: reads `FileChunk`s off the `file` stream until either a
 /// verified `FileTransferComplete` or one of spec 2.6's MUST-reject
-/// conditions is hit, sending `FileTransferError` back on the latter.
+/// conditions is hit. DR-038: `file` is unidirectional, so this function
+/// has no `SendStream` to report a resulting `FileTransferError` over --
+/// it only detects the condition and returns it as data
+/// ([`ReceiveOutcome::Error`]); the caller reports it on `control`.
 ///
 /// `stall_timeout` bounds each individual wait for the next message (spec
 /// 4.7 `FILE_TRANSFER_STALL_TIMEOUT`: "最終FileChunk受信" from the last
 /// one) -- on expiry the stream is treated as stalled and force-ended,
-/// same MUST-reject-style handling as the other conditions here (a
-/// best-effort `FileTransferError` is sent, since a stall likely means the
-/// peer is already gone).
+/// same MUST-reject-style handling as the other conditions here.
 pub async fn receive_file_with_timeout(
-    send: &mut quinn::SendStream,
     reader: &mut EnvelopeReader,
     file_handle: u64,
     resolved_size: u64,
@@ -521,49 +562,37 @@ pub async fn receive_file_with_timeout(
         {
             Ok(result) => result?,
             Err(_elapsed) => {
-                let error = FileTransferError {
+                return Ok(ReceiveOutcome::Error(FileTransferError {
                     file_handle,
                     reason: ReasonCode::TRANSPORT_STREAM_STALL_TIMEOUT,
-                };
-                let _ = send_file_transfer_error(send, &error).await;
-                return Ok(ReceiveOutcome::Error(error));
+                }));
             }
         };
         if type_raw == messages::type_id::FILE_CHUNK {
             let chunk: FileChunk =
                 messages::decode(&payload).map_err(FileTransferSessionError::Decode)?;
             if let Err(reason) = reassembly.apply_chunk(&chunk) {
-                let error = FileTransferError {
+                return Ok(ReceiveOutcome::Error(FileTransferError {
                     file_handle,
                     reason,
-                };
-                send_file_transfer_error(send, &error).await?;
-                return Ok(ReceiveOutcome::Error(error));
+                }));
             }
         } else if type_raw == messages::type_id::FILE_TRANSFER_COMPLETE {
             let complete: FileTransferComplete =
                 messages::decode(&payload).map_err(FileTransferSessionError::Decode)?;
             if !reassembly.is_complete() {
-                let error = FileTransferError {
+                return Ok(ReceiveOutcome::Error(FileTransferError {
                     file_handle,
                     reason: ReasonCode::PROTOCOL_FILE_INCOMPLETE_TRANSFER,
-                };
-                send_file_transfer_error(send, &error).await?;
-                return Ok(ReceiveOutcome::Error(error));
+                }));
             }
             if !reassembly.verify_checksum(&complete.checksum) {
-                let error = FileTransferError {
+                return Ok(ReceiveOutcome::Error(FileTransferError {
                     file_handle,
                     reason: ReasonCode::PROTOCOL_FILE_CHECKSUM_MISMATCH,
-                };
-                send_file_transfer_error(send, &error).await?;
-                return Ok(ReceiveOutcome::Error(error));
+                }));
             }
             return Ok(ReceiveOutcome::Complete(reassembly.into_data()));
-        } else if type_raw == messages::type_id::FILE_TRANSFER_ERROR {
-            let error: FileTransferError =
-                messages::decode(&payload).map_err(FileTransferSessionError::Decode)?;
-            return Ok(ReceiveOutcome::Error(error));
         } else {
             return Err(FileTransferSessionError::UnexpectedType(type_raw));
         }

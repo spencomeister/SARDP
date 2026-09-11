@@ -7,6 +7,7 @@
 //! `src/bin/sardp-server.rs`.
 
 use crate::audio_session::AudioError;
+use crate::clipboard_session::ClipboardSessionError;
 use crate::encoder;
 use crate::feedback_session::ReadFeedbackError;
 use crate::handshake::HandshakeError;
@@ -32,6 +33,7 @@ pub enum ConnError {
     Read(StreamReadError),
     TimeSync(TimeSyncError),
     Audio(AudioError),
+    Clipboard(ClipboardSessionError),
     /// Spec 4.1: `IDLE_TIMEOUT` fired (`Active -> Suspended`). Distinct
     /// from a genuine transport failure so `handle_connection` can tell
     /// the two apart in logs, even though both are handled the same way
@@ -99,6 +101,11 @@ impl From<AudioError> for ConnError {
         Self::Audio(e)
     }
 }
+impl From<ClipboardSessionError> for ConnError {
+    fn from(e: ClipboardSessionError) -> Self {
+        Self::Clipboard(e)
+    }
+}
 
 /// Whether `error` represents the underlying QUIC transport actually going
 /// away (peer killed, network partition, timed out, ...) rather than a
@@ -134,6 +141,13 @@ pub fn is_transport_disconnect(error: &ConnError) -> bool {
         // transport-level error rather than a protocol violation.
         ConnError::Audio(AudioError::Quic(_) | AudioError::Write(_)) => true,
         ConnError::Audio(AudioError::Read(e)) => is_read_disconnect(e),
+        // The clipboard-accept arm (CLIP_WRITE, KNOWN_ISSUES.md) is the
+        // same story: accept_bi()/read failing with a transport error
+        // rather than a protocol violation.
+        ConnError::Clipboard(ClipboardSessionError::Quic(_) | ClipboardSessionError::Write(_)) => {
+            true
+        }
+        ConnError::Clipboard(ClipboardSessionError::Read(e)) => is_read_disconnect(e),
         _ => false,
     }
 }
@@ -239,6 +253,30 @@ mod tests {
     fn an_audio_protocol_violation_is_not_a_disconnect() {
         assert!(!is_transport_disconnect(&ConnError::Audio(
             AudioError::WrongStreamKind
+        )));
+    }
+
+    #[test]
+    fn a_clipboard_quic_or_write_error_is_a_disconnect() {
+        assert!(is_transport_disconnect(&ConnError::Clipboard(
+            ClipboardSessionError::Quic(quinn::ConnectionError::Reset)
+        )));
+        assert!(is_transport_disconnect(&ConnError::Clipboard(
+            ClipboardSessionError::Write(quinn::WriteError::ClosedStream)
+        )));
+    }
+
+    #[test]
+    fn a_clipboard_closed_early_is_a_disconnect() {
+        assert!(is_transport_disconnect(&ConnError::Clipboard(
+            ClipboardSessionError::Read(StreamReadError::ClosedEarly)
+        )));
+    }
+
+    #[test]
+    fn a_clipboard_protocol_violation_is_not_a_disconnect() {
+        assert!(!is_transport_disconnect(&ConnError::Clipboard(
+            ClipboardSessionError::WrongStreamKind
         )));
     }
 

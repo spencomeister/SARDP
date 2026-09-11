@@ -40,7 +40,7 @@ use sardp::permission_sm::{self, PermissionSm};
 use sardp::reason_code::ReasonCode;
 use sardp::reconnection::{self, EstablishOutcome};
 use sardp::session_store::SessionStore;
-use sardp::stream_reader::write_envelope;
+use sardp::stream_reader::{EnvelopeReader, write_envelope};
 use sardp::timecode_frame;
 use sardp::video_channel::VideoChannel;
 use sardp::video_session;
@@ -201,6 +201,24 @@ fn parse_args() -> Args {
 /// Drained by the connection's own loop.
 type PermissionCommand = Arc<Mutex<Vec<permission_sm::AdminCommand>>>;
 
+/// The `control` stream's send half, shared between `run_active_session`'s
+/// own loop and any task it spawns that needs to write onto `control` too
+/// (e.g. [`spawn_file_transfer`] reporting a `FileTransferError`, DR-038):
+/// `quinn::SendStream` has exactly one owner, so concurrent writers need a
+/// lock rather than each holding their own `&mut` to it. Locked only for
+/// the duration of one `write_envelope` call, never held across an
+/// `.await` that waits on the peer.
+type SharedControlSend = Arc<Mutex<quinn::SendStream>>;
+
+async fn write_control(
+    control_send: &SharedControlSend,
+    type_raw: u16,
+    payload: &[u8],
+) -> Result<(), quinn::WriteError> {
+    let mut send = control_send.lock().await;
+    write_envelope(&mut send, type_raw, payload).await
+}
+
 #[tokio::main]
 async fn main() {
     let args = parse_args();
@@ -360,16 +378,19 @@ async fn shutdown_signal() {
 /// an unconditional sleep.
 async fn close_gracefully(
     connection: &quinn::Connection,
-    send: &mut quinn::SendStream,
+    control_send: &SharedControlSend,
     reason: ReasonCode,
 ) {
-    let _ = write_envelope(
-        send,
-        messages::type_id::SESSION_CLOSE,
-        &messages::encode(&SessionClose { reason }),
-    )
-    .await;
-    let _ = send.finish();
+    {
+        let mut send = control_send.lock().await;
+        let _ = write_envelope(
+            &mut send,
+            messages::type_id::SESSION_CLOSE,
+            &messages::encode(&SessionClose { reason }),
+        )
+        .await;
+        let _ = send.finish();
+    }
     tokio::time::sleep(timeouts::CLOSING_GRACE_PERIOD).await;
     connection.close(0u32.into(), b"session closed");
 }
@@ -464,9 +485,19 @@ async fn handle_connection(
     let feedback_receiver = FeedbackReceiver::accept(&connection).await?;
     let permission_sm = PermissionSm::new(ctx.granted_permissions);
 
+    // Split into a shared, lockable send half (spawned per-transfer tasks
+    // need to write FileTransferError onto control too, DR-038) and the
+    // read half this loop keeps exclusively.
+    let ControlChannel {
+        send: control_send,
+        reader: mut control_reader,
+    } = ctx.control;
+    let control_send: SharedControlSend = Arc::new(Mutex::new(control_send));
+
     let result = run_active_session(
         &connection,
-        &mut ctx.control,
+        &control_send,
+        &mut control_reader,
         &mut video_channel,
         video_send,
         feedback_receiver,
@@ -544,7 +575,8 @@ fn suspend_and_store(
 #[allow(clippy::too_many_arguments)]
 async fn run_active_session(
     connection: &quinn::Connection,
-    control: &mut ControlChannel,
+    control_send: &SharedControlSend,
+    control_reader: &mut EnvelopeReader,
     video_channel: &mut VideoChannel,
     mut video_send: quinn::SendStream,
     mut feedback_receiver: FeedbackReceiver,
@@ -595,7 +627,7 @@ async fn run_active_session(
             biased;
             () = shutdown.notified() => {
                 eprintln!("[{peer}] server shutting down, closing session");
-                close_gracefully(connection, &mut control.send, ReasonCode::NONE).await;
+                close_gracefully(connection, control_send, ReasonCode::NONE).await;
                 return Ok(());
             }
             () = tokio::time::sleep_until(idle_deadline) => {
@@ -608,7 +640,7 @@ async fn run_active_session(
                 eprintln!("[{peer}] IDLE_TIMEOUT ({:?} since last activity)", timeouts::IDLE_TIMEOUT);
                 return Err(ConnError::IdleTimeout);
             }
-            control_msg = control.reader.read_envelope(sardp::StreamKind::Control.max_envelope_length()) => {
+            control_msg = control_reader.read_envelope(sardp::StreamKind::Control.max_envelope_length()) => {
                 let (type_raw, payload) = control_msg?;
                 last_activity = tokio::time::Instant::now();
                 if type_raw == messages::type_id::SESSION_CLOSE {
@@ -631,7 +663,7 @@ async fn run_active_session(
                             request_id: request.request_id,
                             reason,
                         };
-                        write_envelope(&mut control.send, messages::type_id::FILE_TRANSFER_REJECT, &messages::encode(&reject)).await?;
+                        write_control(control_send, messages::type_id::FILE_TRANSFER_REJECT, &messages::encode(&reject)).await?;
                         eprintln!(
                             "[{peer}] rejected FileTransferRequest ({:?}): permission not granted ({reason:?})",
                             request.direction
@@ -652,7 +684,7 @@ async fn run_active_session(
                             request_id: request.request_id,
                             reason: ReasonCode::POLICY_FILE_POLICY_REJECTED,
                         };
-                        write_envelope(&mut control.send, messages::type_id::FILE_TRANSFER_REJECT, &messages::encode(&reject)).await?;
+                        write_control(control_send, messages::type_id::FILE_TRANSFER_REJECT, &messages::encode(&reject)).await?;
                         eprintln!(
                             "[{peer}] rejected FileTransferRequest ({:?}): at the concurrent transfer limit ({MAX_CONCURRENT_FILE_TRANSFERS})",
                             request.direction
@@ -669,12 +701,12 @@ async fn run_active_session(
                         resolved_size: request.declared_size,
                         expiry_ts,
                     };
-                    write_envelope(&mut control.send, messages::type_id::FILE_TRANSFER_ACCEPT, &messages::encode(&accept)).await?;
+                    write_control(control_send, messages::type_id::FILE_TRANSFER_ACCEPT, &messages::encode(&accept)).await?;
                     eprintln!(
                         "[{peer}] issued file_handle {file_handle:#x} for {:?} of {:?} ({} bytes)",
                         request.direction, request.virtual_path, request.declared_size
                     );
-                    spawn_file_transfer(connection.clone(), state.clone(), session_id, user_id.to_string(), request, file_handle, peer);
+                    spawn_file_transfer(connection.clone(), control_send.clone(), state.clone(), session_id, user_id.to_string(), request, file_handle, peer);
                     continue;
                 }
                 // Other control-stream message types aren't produced by
@@ -684,7 +716,7 @@ async fn run_active_session(
                 // hasn't implemented on purpose).
             }
             _ = keepalive_interval.tick() => {
-                write_envelope(&mut control.send, messages::type_id::KEEP_ALIVE, &messages::encode(&messages::KeepAlive {})).await?;
+                write_control(control_send, messages::type_id::KEEP_ALIVE, &messages::encode(&messages::KeepAlive {})).await?;
             }
             _ = frame_interval.tick() => {
                 let mut commands = permission_command.lock().await;
@@ -693,7 +725,7 @@ async fn run_active_session(
                         permission_sm::AdminCommand::TogglePermission { bit: toggled_bit, grant } => {
                             let update = permission_sm::build_permission_toggle(granted_permissions, toggled_bit, grant);
                             permission_sm.apply_update(&update);
-                            write_envelope(&mut control.send, messages::type_id::PERMISSION_UPDATE, &messages::encode(&update)).await?;
+                            write_control(control_send, messages::type_id::PERMISSION_UPDATE, &messages::encode(&update)).await?;
                             eprintln!(
                                 "[{peer}] {} is now {}",
                                 permission_bit_name(toggled_bit),
@@ -790,6 +822,42 @@ async fn run_active_session(
                     }
                 }
             }
+            accept_result = clipboard_session::accept_clipboard_formats(connection) => {
+                // CLIP_WRITE (client -> server announce): safe to accept
+                // here now that `file` is unidirectional (DR-038) and no
+                // longer touches `accept_bi()` -- this is the only
+                // `accept_bi()` caller left on the server, so there's
+                // nothing left to race with (KNOWN_ISSUES.md).
+                let (mut send, mut reader, formats) = accept_result?;
+                if !permission_sm.is_granted(bit::CLIP_WRITE) {
+                    // Spec 2.7 doesn't define a way to refuse an announce
+                    // outright; simply never requesting anything is
+                    // already a valid response to `ClipboardFormats`.
+                    eprintln!("[{peer}] received clipboard formats but CLIP_WRITE not granted; ignoring");
+                    continue;
+                }
+                let request_id = formats.request_id;
+                let Some(first_format) = formats.formats.into_iter().next() else {
+                    eprintln!("[{peer}] received ClipboardFormats with no formats, nothing to request");
+                    continue;
+                };
+                eprintln!(
+                    "[{peer}] received clipboard formats, requesting {:?}/{}",
+                    first_format.namespace, first_format.format_id
+                );
+                tokio::spawn(async move {
+                    let request = messages::ClipboardRequest {
+                        request_id,
+                        namespace: first_format.namespace,
+                        format_id: first_format.format_id,
+                    };
+                    match clipboard_session::request_clipboard_data(&mut send, &mut reader, &request).await {
+                        Ok(Ok(data)) => eprintln!("[{peer}] clipboard data received: {} bytes", data.data.len()),
+                        Ok(Err(error)) => eprintln!("[{peer}] clipboard request rejected: {:?}", error.reason),
+                        Err(e) => eprintln!("[{peer}] clipboard request failed: {e:?}"),
+                    }
+                });
+            }
         }
     }
 }
@@ -817,11 +885,9 @@ fn permission_bit_name(toggled_bit: u32) -> String {
 /// `run_active_session`'s own select loop for the same reason
 /// `spawn_file_transfer` is: `read_clipboard_request` blocks until the
 /// peer actually asks, which must not stall video/control/keepalive on
-/// the same connection.
-///
-/// Only the server-announces-to-client direction (`CLIP_READ`) is wired
-/// here; see KNOWN_ISSUES.md #12 for why the reverse direction
-/// (`CLIP_WRITE`, the client announcing to the server) isn't.
+/// the same connection. This is the `CLIP_READ` (server-announces)
+/// direction; see `run_active_session`'s own `accept_clipboard_formats`
+/// arm for the reverse (`CLIP_WRITE`, client-announces) direction.
 fn spawn_clipboard_announce(connection: quinn::Connection, peer: SocketAddr) {
     tokio::spawn(async move {
         let formats = ClipboardFormats {
@@ -869,8 +935,10 @@ fn spawn_clipboard_announce(connection: quinn::Connection, peer: SocketAddr) {
 /// `handle_connection`'s own select loop so a slow or stalled transfer
 /// doesn't block keepalives, video frames, or control messages on the same
 /// connection.
+#[allow(clippy::too_many_arguments)]
 fn spawn_file_transfer(
     connection: quinn::Connection,
+    control_send: SharedControlSend,
     state: Arc<ServerState>,
     session_id: [u8; 16],
     user_id: String,
@@ -879,16 +947,41 @@ fn spawn_file_transfer(
     peer: SocketAddr,
 ) {
     tokio::spawn(async move {
-        if let Err(e) = file_transfer::run_file_transfer(
+        match file_transfer::run_file_transfer(
             &connection,
             &state.file_handles,
             session_id,
             &user_id,
             &request,
+            file_handle,
         )
         .await
         {
-            eprintln!("[{peer}] file transfer for handle {file_handle:#x} failed: {e:?}");
+            Ok(file_transfer::FileTransferOutcome::Done) => {
+                eprintln!("[{peer}] file transfer for handle {file_handle:#x} completed");
+            }
+            Ok(file_transfer::FileTransferOutcome::ReportError(error)) => {
+                // DR-038: FileTransferError travels on `control`, not
+                // `file` -- `run_file_transfer` only detected it.
+                let result = write_control(
+                    &control_send,
+                    messages::type_id::FILE_TRANSFER_ERROR,
+                    &messages::encode(&error),
+                )
+                .await;
+                eprintln!(
+                    "[{peer}] file transfer for handle {file_handle:#x} ended with {:?}{}",
+                    error.reason,
+                    if let Err(e) = result {
+                        format!(" (failed to report it on control: {e:?})")
+                    } else {
+                        String::new()
+                    }
+                );
+            }
+            Err(e) => {
+                eprintln!("[{peer}] file transfer for handle {file_handle:#x} failed: {e:?}");
+            }
         }
     });
 }
