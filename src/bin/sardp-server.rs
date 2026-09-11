@@ -74,6 +74,19 @@ struct ServerState {
 /// default.
 const FILE_HANDLE_TTL: Duration = Duration::from_secs(300);
 
+/// How many `file_handle`s this server allows outstanding (issued but not
+/// yet completed/errored/expired) at once, across all connections.
+/// KNOWN_ISSUES.md #3: without this, a client that keeps sending
+/// `FileTransferRequest` faster than transfers finish can grow
+/// `ServerState::file_handles` without bound. Not spec-mandated; a
+/// PoC-reasonable default.
+const MAX_CONCURRENT_FILE_TRANSFERS: usize = 64;
+
+/// How often the server sweeps `ServerState::file_handles` for handles
+/// whose `expiry_ts` passed without their `file` stream ever being opened
+/// (KNOWN_ISSUES.md #3). Not spec-mandated.
+const FILE_HANDLE_REAP_INTERVAL: Duration = Duration::from_secs(60);
+
 fn print_help() {
     println!(
         "sardp-server -- SARDP PoC reference server\n\n\
@@ -216,6 +229,11 @@ async fn main() {
     let shutdown = Arc::new(Notify::new());
     let permission_command: PermissionCommand = Arc::new(Mutex::new(None));
     let state = Arc::new(ServerState::default());
+    // KNOWN_ISSUES.md #3: actively reclaims file_handles nobody ever opened
+    // the `file` stream for, rather than relying solely on `validate`'s
+    // passive expiry check. Runs for the server's whole lifetime; nothing
+    // needs to join it.
+    let _reaper = state.file_handles.spawn_reaper(FILE_HANDLE_REAP_INTERVAL);
 
     // stdin admin command reader (Part 4's minimal live-trigger).
     {
@@ -592,9 +610,26 @@ async fn run_active_session(
                         continue;
                     }
 
-                    let (file_handle, expiry_ts) = state.file_handles.issue(
-                        session_id, user_id.to_string(), request.direction, request.declared_size, FILE_HANDLE_TTL,
-                    );
+                    let Some((file_handle, expiry_ts)) = state.file_handles.try_issue(
+                        session_id, user_id.to_string(), request.direction, request.declared_size,
+                        FILE_HANDLE_TTL, MAX_CONCURRENT_FILE_TRANSFERS,
+                    ) else {
+                        // KNOWN_ISSUES.md #3: refuse rather than growing
+                        // file_handles without bound. Spec 2.6 has no
+                        // dedicated "server busy" code for file transfer;
+                        // POLICY_FILE_POLICY_REJECTED is the closest fit
+                        // among the defined ReasonCode table (spec 4.8.1).
+                        let reject = FileTransferReject {
+                            request_id: request.request_id,
+                            reason: ReasonCode::POLICY_FILE_POLICY_REJECTED,
+                        };
+                        write_envelope(&mut control.send, messages::type_id::FILE_TRANSFER_REJECT, &messages::encode(&reject)).await?;
+                        eprintln!(
+                            "[{peer}] rejected FileTransferRequest ({:?}): at the concurrent transfer limit ({MAX_CONCURRENT_FILE_TRANSFERS})",
+                            request.direction
+                        );
+                        continue;
+                    };
                     let accept = FileTransferAccept {
                         request_id: request.request_id,
                         file_handle,

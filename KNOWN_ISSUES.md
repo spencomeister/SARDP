@@ -22,7 +22,7 @@ suspend→reconnect→再suspendという流れが起きると、最初のsuspen
 
 **修正**: `FileTransferRequest`受信時に、`direction`に応じて`FILE_UP`/`FILE_DOWN`が`Granted`かを確認し、`Granted`でなければ`FileTransferReject`で応答するようにしました(`src/bin/sardp-server.rs`)。`PermissionSm::state()`を使って`Draining`(段階的revoke中)と`NotGranted`を区別し、前者は`POLICY_PERMISSION_REVOKED`、後者は`POLICY_PERMISSION_DENIED`を返します(仕様4.5の表の区別に合わせています)。
 
-**未対応の付随事項**: この修正は`sardp-server.rs`というバイナリ内のロジックであり、下記「1. バイナリ本体が自動テストの対象外」という構造的な問題により、専用の自動回帰テストは追加していません。コードレビューでの確認のみです。また、現状`server_handshake_from_client_hello`が発行する`granted_permissions`には`FILE_UP`/`FILE_DOWN`が含まれていない(`src/handshake.rs`)ため、実バイナリでファイル転送を試すと常に拒否されます。これは意図した保守的挙動ですが、ファイル転送を実際に使う場合は付与ロジック側の対応が別途必要です。
+**付随事項**: 当時は下記「D. バイナリ本体が自動テストの対象外だった」という構造的な問題により、専用の自動回帰テストを追加できていませんでした(Dの修正で`PermissionSm::check_gate`としてテスト可能になっています)。また、現状`server_handshake_from_client_hello`が発行する`granted_permissions`には`FILE_UP`/`FILE_DOWN`が含まれていない(`src/handshake.rs`)ため、実バイナリでファイル転送を試すと常に拒否されます。これは意図した保守的挙動ですが、ファイル転送を実際に使う場合は付与ロジック側の対応が別途必要です。
 
 ### C. `FILE_TRANSFER_STALL_TIMEOUT`(仕様4.7、30秒)が未実装だった
 
@@ -32,23 +32,27 @@ suspend→reconnect→再suspendという流れが起きると、最初のsuspen
 
 `tests/phase2c_file_transfer.rs`に回帰テストを追加(`no_further_chunks_within_the_stall_timeout_yields_stall_timeout_error`、高速化のため50msに差し替えて検証)。
 
+### D. バイナリ本体(`src/bin/*.rs`)が自動テストの対象外だった(旧#1、★最重要)
+
+`cargo test`が通す255件のテストはすべてライブラリクレート(`sardp`)に対するもので、`sardp-server.rs`/`sardp-client.rs`自体のロジックは1行も自動テストの対象になっていませんでした。
+
+**修正**: acceptループの振り分け・`suspend_and_store`/`is_transport_disconnect`・`spawn_file_transfer`本体・ファイル転送とVIEW admin toggleの権限ゲート・`--session-file`読み書きを、それぞれ`src/conn_error.rs`(新規)、`reconnection::establish_connection`、`SessionStore::suspend_and_schedule_expiry`、`file_transfer_session::run_file_transfer`、`PermissionSm::check_gate`/`permission_sm::build_view_toggle`、`src/session_file.rs`(新規)へ切り出しました。バイナリ側は「引数パース→lib呼び出し→ログ/spawn」だけになっています。
+
+lib側にユニットテスト、および実QUIC接続を張った統合テスト(`tests/conn_establish.rs`)を追加。既存255件+新規は`cargo test`のlib 288件+統合39件まで拡大。
+
+### E. リソース枯渇に対する防御がなかった(旧#3)
+
+- `FileHandleStore::issue`で発行したハンドルは、`file`ストリームが一度も開かれなければ`expiry_ts`を過ぎても自動では回収されませんでした。
+- `accept_file_stream_verified`の`connection.accept_bi().await`にタイムアウトがありませんでした。
+- 同時に受け付けられるファイル転送数の上限もありませんでした。
+
+**修正**: `FileHandleStore::sweep_expired`+`spawn_reaper`(`Weak`参照で自身が生存の唯一の理由にならないよう設計)を追加し、`sardp-server`の`main`で60秒間隔で起動。`accept_file_stream_verified`は`accept_file_stream_verified_with_timeout`(既定30秒、`FileTransferSessionError::AcceptTimeout`)の薄いラッパーに変更(`receive_file`/`receive_file_with_timeout`と同じパターン)。`FileHandleStore::issue`は内部的に`try_issue`(容量チェック付き)を呼ぶ形にし、`sardp-server`は`MAX_CONCURRENT_FILE_TRANSFERS`(64)の上限に達すると`FileTransferReject{reason: POLICY_FILE_POLICY_REJECTED}`で拒否するようにしました(spec 4.8.1のReasonCode表に専用コードがないため、既存コードのうち最も意味が近いものを流用)。
+
 ## 未対応(現在のスコープでは許容している既知の課題)
-
-### 1. バイナリ本体(`src/bin/*.rs`)が自動テストの対象外という構造的な穴 ★最重要
-
-`cargo test`が通す255件のテストはすべてライブラリクレート(`sardp`)に対するもので、`sardp-server.rs`/`sardp-client.rs`自体のロジックは1行も自動テストの対象になっていません。acceptループの振り分け、`suspend_and_store`/`is_transport_disconnect`、`spawn_file_transfer`、`--session-file`の読み書き、そして今回追加した権限ゲートも含め、すべて手動検証(または今回のようなコードレビュー)でしか確認していません。テストが通っていても、これらの配線がリグレッションしても`cargo test`は気づけません。
-
-対処するなら、ロジックをライブラリ側の関数に切り出してテスト可能にするか、実バイナリをsubprocessとして起動する統合テストを別途用意する必要があります。
 
 ### 2. suspend-on-disconnectの検証パターンが手動テスト1回分に限られている
 
 `is_transport_disconnect`(`src/bin/sardp-server.rs`)は、video送出パス経由の切断を手動でkill -9して初めて漏れ(`ConnError::Video`が未分解だった)に気づいて直したという経緯があり、それ以外の経路(controlストリーム読み取り中、feedback読み取り中、backpressure再オープン中の切断)は実際に切ってみて確認していません。コード上は同じパターンで拾えるはずですが未検証です。
-
-### 3. リソース枯渇に対する防御がない
-
-- `FileHandleStore::issue`で発行したハンドルは、`file`ストリームが一度も開かれなければ`expiry_ts`を過ぎても自動では回収されません(`validate`は参照時に期限切れを検出するだけで、能動的な掃除タスクがない)。
-- `spawn_file_transfer`内の`accept_file_stream_verified`は`connection.accept_bi().await`にタイムアウトを掛けていません。`FileTransferRequest`だけ送って`file`ストリームを開かないクライアントがいれば、ハンドルもタスクも溜まり続けます。
-- 同時に受け付けられるファイル転送数の上限もありません。
 
 ### 4. `--session-file`はデモ専用の割り切りで、平文で資格情報相当を保存する
 

@@ -26,11 +26,17 @@ use crate::reason_code::ReasonCode;
 use crate::stream_kind::StreamKind;
 use crate::stream_reader::{EnvelopeReader, StreamReadError, write_envelope};
 
-/// Receiver-side timeout (spec 4.7: "FILE_TRANSFER_STALL_TIMEOUT
-/// 30秒(確定)").
+/// Receiver-side timeouts.
 pub mod defaults {
     use std::time::Duration;
+    /// Spec 4.7: "FILE_TRANSFER_STALL_TIMEOUT 30秒(確定)".
     pub const FILE_TRANSFER_STALL_TIMEOUT: Duration = Duration::from_secs(30);
+    /// How long [`super::accept_file_stream_verified`] waits for the
+    /// `file` stream a `FileTransferRequest` promised, before giving up.
+    /// Not spec-mandated, but bounds how long an issued `file_handle`'s
+    /// slot can be tied up waiting for a stream that may never open
+    /// (KNOWN_ISSUES.md #3).
+    pub const FILE_STREAM_ACCEPT_TIMEOUT: Duration = Duration::from_secs(30);
 }
 
 #[derive(Debug)]
@@ -54,6 +60,10 @@ pub enum FileTransferSessionError {
     /// stream is reset (not handed back to the caller) before this is
     /// returned.
     OwnershipRejected(FileHandleError),
+    /// [`accept_file_stream_verified`]'s wait for the `file` stream to be
+    /// opened exceeded `defaults::FILE_STREAM_ACCEPT_TIMEOUT` (or a
+    /// caller-supplied override).
+    AcceptTimeout,
 }
 
 impl From<StreamReadError> for FileTransferSessionError {
@@ -218,9 +228,32 @@ pub async fn accept_file_stream_verified(
     user_id: &str,
     direction: FileTransferDirection,
 ) -> Result<(quinn::SendStream, EnvelopeReader, u64), FileTransferSessionError> {
-    let (mut send, recv) = connection
-        .accept_bi()
+    accept_file_stream_verified_with_timeout(
+        connection,
+        store,
+        session_id,
+        user_id,
+        direction,
+        defaults::FILE_STREAM_ACCEPT_TIMEOUT,
+    )
+    .await
+}
+
+/// Like [`accept_file_stream_verified`], but with an explicit
+/// `accept_timeout` instead of `defaults::FILE_STREAM_ACCEPT_TIMEOUT`
+/// (e.g. a test proving the timeout mechanism itself fires without a real
+/// 30s wait -- same pattern as [`receive_file`]/[`receive_file_with_timeout`]).
+pub async fn accept_file_stream_verified_with_timeout(
+    connection: &quinn::Connection,
+    store: &FileHandleStore,
+    session_id: [u8; 16],
+    user_id: &str,
+    direction: FileTransferDirection,
+    accept_timeout: std::time::Duration,
+) -> Result<(quinn::SendStream, EnvelopeReader, u64), FileTransferSessionError> {
+    let (mut send, recv) = tokio::time::timeout(accept_timeout, connection.accept_bi())
         .await
+        .map_err(|_elapsed| FileTransferSessionError::AcceptTimeout)?
         .map_err(FileTransferSessionError::Quic)?;
     let mut reader = EnvelopeReader::new(recv);
 

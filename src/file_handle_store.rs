@@ -71,6 +71,33 @@ impl FileHandleStore {
         resolved_size: u64,
         ttl: Duration,
     ) -> (u64, u64) {
+        self.try_issue(
+            session_id,
+            user_id,
+            direction,
+            resolved_size,
+            ttl,
+            usize::MAX,
+        )
+        .expect("usize::MAX capacity is never reached")
+    }
+
+    /// Like [`Self::issue`], but refuses (returns `None`, touching nothing)
+    /// if `self` already holds `max_concurrent` outstanding handles --
+    /// issued but not yet [`Self::remove`]d, whether or not their `file`
+    /// stream has even been opened yet. Without this, a client that keeps
+    /// sending `FileTransferRequest` without ever opening the resulting
+    /// `file` stream (or simply requesting far more transfers than it
+    /// finishes) can grow this store without bound (KNOWN_ISSUES.md #3).
+    pub fn try_issue(
+        &self,
+        session_id: [u8; 16],
+        user_id: String,
+        direction: FileTransferDirection,
+        resolved_size: u64,
+        ttl: Duration,
+        max_concurrent: usize,
+    ) -> Option<(u64, u64)> {
         let expiry_ts = clock::now_us() + ttl.as_micros() as u64;
         let record = FileHandleRecord {
             session_id,
@@ -80,15 +107,54 @@ impl FileHandleStore {
             expiry_ts,
         };
         let mut handles = self.handles.lock().unwrap();
+        if handles.len() >= max_concurrent {
+            return None;
+        }
         loop {
             let mut candidate_bytes = [0u8; 8];
             rand::rng().fill_bytes(&mut candidate_bytes);
             let candidate = u64::from_le_bytes(candidate_bytes) & crate::varint::MAX;
             if let Entry::Vacant(entry) = handles.entry(candidate) {
                 entry.insert(record);
-                return (candidate, expiry_ts);
+                return Some((candidate, expiry_ts));
             }
         }
+    }
+
+    /// Removes every handle whose `expiry_ts` has already passed,
+    /// regardless of whether its `file` stream was ever opened. Without an
+    /// active sweep like this, a handle nobody ever presented a `file`
+    /// stream for sits in the map forever: [`Self::validate`] already
+    /// treats it as `Expired`, but nothing previously reclaimed the entry
+    /// itself (KNOWN_ISSUES.md #3). Returns how many were removed.
+    pub fn sweep_expired(&self) -> usize {
+        let now = clock::now_us();
+        let mut handles = self.handles.lock().unwrap();
+        let before = handles.len();
+        handles.retain(|_, record| record.expiry_ts >= now);
+        before - handles.len()
+    }
+
+    /// Spawns a task that calls [`Self::sweep_expired`] every `interval`.
+    /// Holds only a `Weak` reference to `self`, so the task ends on its
+    /// own once every other `Arc<FileHandleStore>` (e.g. `ServerState`'s)
+    /// is dropped, rather than keeping the store alive by itself.
+    pub fn spawn_reaper(
+        self: &std::sync::Arc<Self>,
+        interval: Duration,
+    ) -> tokio::task::JoinHandle<()> {
+        let weak = std::sync::Arc::downgrade(self);
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            ticker.tick().await; // first tick fires immediately; skip it
+            loop {
+                ticker.tick().await;
+                let Some(store) = weak.upgrade() else {
+                    return;
+                };
+                store.sweep_expired();
+            }
+        })
     }
 
     /// DR-037: verifies `file_handle` was issued to exactly this
@@ -245,6 +311,146 @@ mod tests {
         assert_eq!(
             store.validate(handle, session_id, "alice", FileTransferDirection::Upload),
             Err(FileHandleError::Unknown)
+        );
+    }
+
+    #[test]
+    fn try_issue_refuses_once_at_capacity() {
+        let store = FileHandleStore::new();
+        let issue_one = |store: &FileHandleStore| {
+            store.try_issue(
+                [1u8; 16],
+                "alice".into(),
+                FileTransferDirection::Upload,
+                0,
+                TTL,
+                2,
+            )
+        };
+        assert!(issue_one(&store).is_some());
+        assert!(issue_one(&store).is_some());
+        assert_eq!(
+            issue_one(&store),
+            None,
+            "a third handle must be refused once 2 are already outstanding"
+        );
+    }
+
+    #[test]
+    fn try_issue_has_room_again_after_a_handle_is_removed() {
+        let store = FileHandleStore::new();
+        let (handle, _) = store
+            .try_issue(
+                [1u8; 16],
+                "alice".into(),
+                FileTransferDirection::Upload,
+                0,
+                TTL,
+                1,
+            )
+            .unwrap();
+        assert!(
+            store
+                .try_issue(
+                    [1u8; 16],
+                    "alice".into(),
+                    FileTransferDirection::Upload,
+                    0,
+                    TTL,
+                    1,
+                )
+                .is_none()
+        );
+        store.remove(handle);
+        assert!(
+            store
+                .try_issue(
+                    [1u8; 16],
+                    "alice".into(),
+                    FileTransferDirection::Upload,
+                    0,
+                    TTL,
+                    1,
+                )
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn issue_is_unaffected_by_capacity() {
+        // issue() itself (used by callers that don't care about the cap --
+        // e.g. tests) must keep working exactly as before.
+        let store = FileHandleStore::new();
+        for _ in 0..5 {
+            store.issue(
+                [1u8; 16],
+                "alice".into(),
+                FileTransferDirection::Upload,
+                0,
+                TTL,
+            );
+        }
+    }
+
+    #[test]
+    fn sweep_expired_removes_only_past_deadline_handles() {
+        let store = FileHandleStore::new();
+        let (expired, _) = store.issue(
+            [1u8; 16],
+            "alice".into(),
+            FileTransferDirection::Upload,
+            0,
+            Duration::from_micros(0),
+        );
+        let (live, _) = store.issue(
+            [1u8; 16],
+            "alice".into(),
+            FileTransferDirection::Upload,
+            0,
+            TTL,
+        );
+        assert_eq!(store.sweep_expired(), 1);
+        assert_eq!(
+            store.validate(expired, [1u8; 16], "alice", FileTransferDirection::Upload),
+            Err(FileHandleError::Unknown)
+        );
+        assert!(
+            store
+                .validate(live, [1u8; 16], "alice", FileTransferDirection::Upload)
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_reaper_periodically_removes_expired_handles() {
+        let store = std::sync::Arc::new(FileHandleStore::new());
+        let (handle, _) = store.issue(
+            [1u8; 16],
+            "alice".into(),
+            FileTransferDirection::Upload,
+            0,
+            Duration::from_millis(1),
+        );
+        let reaper = store.spawn_reaper(Duration::from_millis(20));
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            store.validate(handle, [1u8; 16], "alice", FileTransferDirection::Upload),
+            Err(FileHandleError::Unknown),
+            "the reaper should have swept the expired handle by now"
+        );
+        reaper.abort();
+    }
+
+    #[tokio::test]
+    async fn spawn_reaper_stops_once_the_store_is_dropped() {
+        let store = std::sync::Arc::new(FileHandleStore::new());
+        let reaper = store.spawn_reaper(Duration::from_millis(10));
+        drop(store);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            reaper.is_finished(),
+            "the reaper must end once the only other Arc is dropped"
         );
     }
 }
