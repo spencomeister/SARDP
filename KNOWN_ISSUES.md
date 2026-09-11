@@ -168,7 +168,10 @@ Stage 3ロードマップの3W-1(在席キャプチャ・エンコード基盤)�
 - Discordの画面共有を止めても変化なし。
 - 環境: Tailscale VPN(`Tailscale Tunnel`アダプタ)稼働中、Hyper-V仮想アダプタ(`vEthernet (WSL (Hyper-V firewall))`、`vEthernet (Default Switch)`)あり、AVはWindows Defenderのみ。Hyper-Vファイアウォール設定(`Get-NetFirewallHyperVVMSetting`/`Get-NetFirewallHyperVProfile`)は全て`NotConfigured`。ファイアウォールのブロックログは無効で、`netsh wfp`からもUDPを塞ぐフィルタは見つからなかった(非管理者のため網羅性は不明)。
 - 時間を区切った切り分け(約15分)ではここまでで、根本原因は未特定。
+- **ただし壊れているのはループバックだけ**: 同じ機の非ループバックのローカルアドレス宛(LANの`192.168.1.10`、Tailscaleの`100.83.176.98`、Hyper-V仮想アダプタの`172.x`)への同一プロセス内UDP送受信は**すべて通る**。
 
-**影響**: `tests/conn_establish.rs`、`tests/m2_handshake.rs`、`tests/stage3w1d_input.rs`をはじめ、ループバックQUICを張る統合テスト全てがこの機では実行できません。`cargo test --lib`(ユニットテスト、310件)は通ります。3W-1-d-1の`input_session.rs`は、メッセージ型のCBORラウンドトリップまでユニットテストで検証済みですが、実QUIC上の往復(`tests/stage3w1d_input.rs`)は**この機では未実行**のままです(UDPが通る環境で実行して確認すること)。
+**影響**: `127.0.0.1`をハードコードしている統合テスト(`tests/conn_establish.rs`、`tests/m2_handshake.rs`等、M1〜M6由来のもの)はこの機ではそのままでは実行できません。`cargo test --lib`(ユニットテスト、310件)は通ります。
 
-**対応方針**: 深追いせず記録に留めています。UDPが通らない間、d-2/d-3の実機での疎通確認を規範仕様5.2節のTCPフォールバック経由で進める案は検討中(TCPは通ることが確認済み)。
+**回避策(採用)**:
+- `tests/stage3w1d_input.rs`は環境変数`SARDP_TEST_BIND_ADDR`(IPv4)でバインド先を差し替えられるようにしてあり、`SARDP_TEST_BIND_ADDR=192.168.1.10`で実QUIC上の往復2件が成功することを確認済み(2026-09-12)。既存の統合テスト群の`loopback()`ヘルパーにも同じ差し替えを入れれば、この機で全て実行できるはずです(未実施)。
+- `sardp-server --bind`/`sardp-client --server`は任意のアドレスを取れるため、3W-1-d-2以降の実機疎通は`127.0.0.1`の代わりにLAN IPを使えば、規範仕様5.2節のTCPフォールバック(現状`src/`に一切未実装: ChannelBind、TLS-Exporterによるproof、チャネル別TLS+TCP接続)を先に実装する迂回は不要です。
