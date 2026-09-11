@@ -32,6 +32,21 @@ const MAX_FRAMES: u32 = 30;
 /// フレーム取得後、次のAcquireNextFrameまでの最小間隔。「毎秒数フレーム」に収める。
 const MIN_FRAME_INTERVAL: Duration = Duration::from_millis(200);
 
+/// AcquireNextFrame成功後、確実にReleaseFrameを対応させるRAIIガード。
+/// Desktop Duplicationは未解放フレームを1つしか許さないため、
+/// 以降の処理が`?`で早期returnしてもpanicでunwindしても解放漏れが起きないようにする。
+struct FrameGuard<'a> {
+    duplication: &'a IDXGIOutputDuplication,
+}
+
+impl Drop for FrameGuard<'_> {
+    fn drop(&mut self) {
+        if let Err(e) = unsafe { self.duplication.ReleaseFrame() } {
+            eprintln!("[dxgi-capture-poc] ReleaseFrame failed: {e}");
+        }
+    }
+}
+
 fn main() -> windows::core::Result<()> {
     let out_dir = output_dir();
     fs::create_dir_all(&out_dir).expect("failed to create output directory");
@@ -74,6 +89,13 @@ fn main() -> windows::core::Result<()> {
             Err(e) => return Err(e),
         }
 
+        // AcquireNextFrameが成功した直後、他の処理より先にガードを作る。
+        // これ以降のどの経路(cast失敗、Map失敗、assert_eq!のpanicなど)でも
+        // スコープを抜ける際にDropが走りReleaseFrameが呼ばれる。
+        let frame_guard = FrameGuard {
+            duplication: &duplication,
+        };
+
         let resource = resource.expect("AcquireNextFrame succeeded without a resource");
         let texture: ID3D11Texture2D = resource.cast()?;
 
@@ -96,7 +118,9 @@ fn main() -> windows::core::Result<()> {
         save_texture_as_bmp(&device, &context, &texture, &bmp_path)?;
         println!("[dxgi-capture-poc]   saved: {}", bmp_path.display());
 
-        unsafe { duplication.ReleaseFrame()? };
+        // 次のAcquireNextFrameより前に明示的に解放する(スロットリングのsleepより前)。
+        // 途中で`?`により抜けた場合はFrameGuard::dropが代わりに解放する。
+        drop(frame_guard);
 
         let elapsed = frame_start.elapsed();
         if elapsed < MIN_FRAME_INTERVAL {
@@ -172,15 +196,21 @@ fn read_dirty_rects(
     if frame_info.TotalMetadataBufferSize == 0 {
         return Ok(Vec::new());
     }
-    let mut buf = vec![0u8; frame_info.TotalMetadataBufferSize as usize];
+    // Vec<RECT>として確保することでRECTのアラインメントを型システムに保証させる
+    // (Vec<u8>をas *mut RECTでキャストするのはアロケータの実務上の挙動に依存したUB)。
+    let capacity = (frame_info.TotalMetadataBufferSize as usize).div_ceil(size_of::<RECT>());
+    let mut buf: Vec<RECT> = vec![RECT::default(); capacity];
     let mut needed = 0u32;
     unsafe {
-        duplication.GetFrameDirtyRects(buf.len() as u32, buf.as_mut_ptr() as *mut RECT, &mut needed)?;
+        duplication.GetFrameDirtyRects(
+            (buf.len() * size_of::<RECT>()) as u32,
+            buf.as_mut_ptr(),
+            &mut needed,
+        )?;
     }
     let count = needed as usize / size_of::<RECT>();
-    let rects: &[RECT] =
-        unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const RECT, count) };
-    Ok(rects.to_vec())
+    buf.truncate(count);
+    Ok(buf)
 }
 
 fn read_move_rect_count(
@@ -191,12 +221,14 @@ fn read_move_rect_count(
     if frame_info.TotalMetadataBufferSize == 0 {
         return Ok(0);
     }
-    let mut buf = vec![0u8; frame_info.TotalMetadataBufferSize as usize];
+    let capacity =
+        (frame_info.TotalMetadataBufferSize as usize).div_ceil(size_of::<DXGI_OUTDUPL_MOVE_RECT>());
+    let mut buf: Vec<DXGI_OUTDUPL_MOVE_RECT> = vec![DXGI_OUTDUPL_MOVE_RECT::default(); capacity];
     let mut needed = 0u32;
     unsafe {
         duplication.GetFrameMoveRects(
-            buf.len() as u32,
-            buf.as_mut_ptr() as *mut DXGI_OUTDUPL_MOVE_RECT,
+            (buf.len() * size_of::<DXGI_OUTDUPL_MOVE_RECT>()) as u32,
+            buf.as_mut_ptr(),
             &mut needed,
         )?;
     }
