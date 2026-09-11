@@ -88,6 +88,12 @@ VIEWのみだった管理者stdinトグル機構は`permission_sm::AdminCommand`
 1. `AUDIO_CAPTURE`/`CLIP_WRITE`は`sardp-client`起動時の`granted_permissions`スナップショットでのみ判定しており、セッション中に後から`PermissionUpdate`で許可されても反応しません(サーバー側に対話的な管理者トグルがあるのに対し、クライアント側にはstdinのような対話手段がないための割り切りです)。`AUDIO_PLAYBACK`/`CLIP_READ`/`CLIP_WRITE`(サーバー側の受理判定)はサーバー側が毎回ライブに`permission_sm`を見るため、後から`grant-*`しても効きます。
 2. 実バイナリ同士でこの配線をエンドツーエンドに手動確認することはできていません。ビデオchannelを開く(`open_generation`)処理がハンドシェイク直後に必ず走り、その中の`ffmpeg`呼び出しがこのサンドボックスには存在しないため、`run_active_session`(clipboard/audioの配線はすべてこの中)に到達する前にセッションが終了してしまいます。ライブラリレベルのユニット/統合テスト(`accept_audio_capture_gated`・`parse_admin_command`・`is_transport_disconnect`のAudio/Clipboard分類など)でのみ検証済みです。
 
+### I. `tests/m6_measurement.rs`の`netem_available()`呼び出しが`NETEM_LOCK`の保護範囲外だった
+
+`wan_profile_transport_latency_is_within_150ms`/`high_rtt_via_real_netem_never_enters_congested`はいずれも`netem::netem_available()`(ルールを試験的に`add`→`del`して可用性を判定するprobe)を`NETEM_LOCK.lock().await`の**前**に呼んでいました。実際のプロファイル適用(`apply_profile`、`tc qdisc replace`)は`NETEM_LOCK`の保護下でしか行われないのに対し、この可用性probeだけはロック外で実行されていたため、`cargo test --test m6_measurement`のデフォルト並列実行時に、あるテストの`netem_available()`のprobe(`add`)が、別のテストが同時に`NETEM_LOCK`保持下で適用中のプロファイル(`replace`で既にroot qdiscが存在する状態)と衝突し、`tc`が失敗して`netem_available()`が実際には使える環境でも`false`を返す(結果としてWANテストが誤ってスキップされる)ことがありました。EC2実機での検証で、並列実行時に`wan_profile_transport_latency_is_within_150ms`が誤スキップされる一方、`--test-threads=1`の直列実行では3テストとも実netemで正しく計測できる(LAN transport_us=646/691、WAN transport_us=80689)ことを確認して発見されました。
+
+**修正**: 両テストで`NETEM_LOCK.lock().await`を`netem_available()`呼び出しより前に移動し、可用性probeから(適用されていれば)`NetemGuard`のdropによるclearまでを、ひとつの連続したロック区間に収めました。これにより`netem_available()`のprobe自体が実質的に`NETEM_LOCK`の保護下で実行されることになり、他テストの`tc`操作との競合が構造的になくなります(`src/netem.rs`自体は変更なし — ロックはテストバイナリ側の`static`のため、呼び出し順序の修正で対応)。
+
 ## 未対応(現在のスコープでは許容している既知の課題)
 
 ### 2. suspend-on-disconnectの検証パターンが手動テスト1回分に限られている

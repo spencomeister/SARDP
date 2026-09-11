@@ -43,9 +43,15 @@
 //! `tc netem` requires the kernel's `sch_netem` qdisc module; some
 //! container/sandbox kernels (no loadable module support at all) cannot
 //! provide it no matter the privilege level. `netem::netem_available()`
-//! probes for this up front, and the WAN/high-RTT tests skip cleanly
-//! (rather than fail) when it's absent, matching the `ffmpeg_available()`
-//! convention used everywhere else in this crate.
+//! probes for this by provisionally adding then removing a rule on `lo`,
+//! and the WAN/high-RTT tests skip cleanly (rather than fail) when it's
+//! absent, matching the `ffmpeg_available()` convention used everywhere
+//! else in this crate. That probe touches the same shared `lo` qdisc as
+//! the actual profile application, so it must run *inside* `NETEM_LOCK`'s
+//! critical section too, not just before it -- the WAN/high-RTT tests
+//! acquire the lock before calling `netem_available()` rather than after,
+//! so a concurrent test's `apply_profile`/`clear` can never race the
+//! probe's own add/delete and make it spuriously report "not available".
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
@@ -151,6 +157,14 @@ async fn wan_profile_transport_latency_is_within_150ms() {
         eprintln!("skipping: ffmpeg not found on PATH");
         return;
     }
+    // Acquire the lock *before* probing availability: `netem_available()`
+    // provisionally adds then removes a qdisc rule on `lo` to check kernel
+    // support, and that probe races against another test's `apply_profile`
+    // (`tc qdisc replace ...`) on the same shared interface if run outside
+    // this lock -- observed as a spurious "not available" skip under
+    // `cargo test`'s default parallel execution, even on hosts where netem
+    // genuinely works (confirmed fixed by serializing the whole check here).
+    let _lock = NETEM_LOCK.lock().await;
     if !netem::netem_available() {
         eprintln!(
             "skipping: tc netem not available on this host/kernel (see sardp::netem docs) -- \
@@ -158,7 +172,6 @@ async fn wan_profile_transport_latency_is_within_150ms() {
         );
         return;
     }
-    let _lock = NETEM_LOCK.lock().await;
     let _guard = netem::NetemGuard::apply(netem::NetemProfile::WAN_80MS_RTT)
         .expect("apply netem WAN profile");
 
@@ -208,6 +221,10 @@ async fn high_rtt_via_real_netem_never_enters_congested() {
         eprintln!("skipping: ffmpeg not found on PATH");
         return;
     }
+    // See the WAN test above: acquire the lock before probing availability
+    // so `netem_available()`'s add-then-delete probe can't race another
+    // test's concurrently-applied profile on the same shared `lo` qdisc.
+    let _lock = NETEM_LOCK.lock().await;
     if !netem::netem_available() {
         eprintln!(
             "skipping: tc netem not available on this host/kernel (see sardp::netem docs) -- \
@@ -215,7 +232,6 @@ async fn high_rtt_via_real_netem_never_enters_congested() {
         );
         return;
     }
-    let _lock = NETEM_LOCK.lock().await;
     let _guard = netem::NetemGuard::apply(netem::NetemProfile::HIGH_RTT_NO_CONGESTION)
         .expect("apply netem high-RTT profile");
 
