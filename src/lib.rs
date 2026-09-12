@@ -18,6 +18,7 @@ pub mod envelope;
 pub mod feedback_session;
 pub mod file_handle_store;
 pub mod file_transfer_session;
+pub mod frame_source;
 pub mod h264;
 pub mod handshake;
 pub mod input_session;

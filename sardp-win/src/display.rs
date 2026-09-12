@@ -79,7 +79,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use dxgi_capture_poc::capture::create_d3d11_device;
 
-use crate::desktop_h264::Clock;
+use sardp::frame_source::Clock;
 use crate::inject::{button, modifier, INJECTED_EXTRA_INFO};
 use crate::keymap;
 

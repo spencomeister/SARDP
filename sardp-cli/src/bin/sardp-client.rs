@@ -45,7 +45,7 @@ use sardp::reconnection::client_reconnect;
 use sardp::session_file::{SavedSession, read_saved_session, write_saved_session};
 use sardp::stream_reader::{StreamReadError, write_envelope};
 use sardp::timecode_frame::extract_timecode;
-use sardp::timesync::client_time_sync;
+use sardp::timesync;
 use sardp::video_session::{VideoError, VideoFrameReader, accept_video_instance};
 use sardp::{StreamKind, clock, dev_identity, net, pki};
 
@@ -522,10 +522,17 @@ async fn run(connection: quinn::Connection, args: &Args) -> Result<(), AppError>
         );
     }
 
-    let timesync = client_time_sync(&mut control).await?;
+    // Several rounds, best (lowest-RTT) sample: the first exchange after
+    // the handshake has been seen to take hundreds of ms on this machine,
+    // which would put every cross-clock latency figure off by that much.
+    let rounds = timesync::client_time_sync_rounds(&mut control, timesync::DEFAULT_TIME_SYNC_ROUNDS).await?;
+    let timesync = timesync::best_of(&rounds).expect("at least one round");
     eprintln!(
-        "TimeSync: offset_us={} rtt_us={}",
-        timesync.offset_us, timesync.rtt_us
+        "TimeSync: offset_us={} rtt_us={} (best of {} rounds; rtts: {})",
+        timesync.offset_us,
+        timesync.rtt_us,
+        rounds.len(),
+        rounds.iter().map(|r| r.rtt_us.to_string()).collect::<Vec<_>>().join(",")
     );
 
     let (intro, mut frame_reader) = tokio::time::timeout(
@@ -1018,6 +1025,7 @@ impl VideoSink {
                 &timestamps,
                 Some(timing.dequeue_ts),
                 timing.presented,
+                offset_us,
             );
             let feedback = feedback_session::build_transport_feedback(
                 &entry.header,
@@ -1276,8 +1284,19 @@ struct WindowTiming {
     presented: bool,
 }
 
-/// Running counters printed on shutdown (and every 300 displayed frames),
-/// so a long run leaves a one-line verdict in the log.
+/// Running counters and latency samples, printed on shutdown (and every
+/// 300 displayed frames), so a long run leaves a verdict in the log.
+///
+/// The latency breakdown is the Stage 3 re-measurement of what
+/// `sardp::measurement` (M6) measured with the per-frame `ffmpeg`
+/// pipeline (DR-036): server-side `encode` (`encode_done_ts -
+/// capture_ts`, both server clock), `transport` (encode done -> bytes
+/// received here), client-side `queue`/`decode`/`present`, and the full
+/// `glass_to_glass` (capture -> presented). Client timestamps are moved
+/// onto the server clock with the TimeSync offset, exactly as
+/// `build_transport_feedback` does for `client_queue_delay_us` -- so the
+/// numbers are only as good as TimeSync (RTT/2 uncertainty; ~0.2ms on
+/// the LAN used for the recorded runs).
 #[derive(Default)]
 struct FrameStats {
     received: u64,
@@ -1292,14 +1311,29 @@ struct FrameStats {
     not_presented: u64,
     resets: u64,
     bytes: u64,
-    /// receive -> decode done (what `TransportFeedback` reports as the
-    /// decode delay; includes queueing in window mode).
-    decode_us_total: u64,
-    /// Window mode: receive -> picked up by the display thread.
-    queue_us_total: u64,
-    display_us_total: u64,
-    max_decode_us: u64,
     idr: u64,
+    /// Per-displayed-frame samples, in microseconds.
+    encode_us: Vec<u64>,
+    transport_us: Vec<u64>,
+    /// Window mode only: receive -> picked up by the display thread.
+    queue_us: Vec<u64>,
+    /// Decoder time proper (window mode: after dequeue; log mode: the
+    /// whole ffmpeg round trip).
+    decode_us: Vec<u64>,
+    present_us: Vec<u64>,
+    glass_to_glass_us: Vec<u64>,
+}
+
+/// `(avg, p50, p95, max)` of a sample set, all in the samples' unit.
+fn summarize(samples: &[u64]) -> (u64, u64, u64, u64) {
+    if samples.is_empty() {
+        return (0, 0, 0, 0);
+    }
+    let mut sorted = samples.to_vec();
+    sorted.sort_unstable();
+    let percentile = |p: usize| sorted[(sorted.len() - 1) * p / 100];
+    let avg = sorted.iter().sum::<u64>() / sorted.len() as u64;
+    (avg, percentile(50), percentile(95), sorted[sorted.len() - 1])
 }
 
 impl FrameStats {
@@ -1310,6 +1344,7 @@ impl FrameStats {
         t: &FrameTimestamps,
         dequeue_ts: Option<u64>,
         presented: bool,
+        offset_us: i64,
     ) {
         self.displayed += 1;
         self.bytes += payload_len as u64;
@@ -1319,22 +1354,36 @@ impl FrameStats {
         if !presented {
             self.not_presented += 1;
         }
-        let decode_us = t.decode_done_ts.saturating_sub(t.receive_ts);
+        let encode_us = header.encode_done_ts.saturating_sub(header.capture_ts);
+        let receive_server = sardp::timesync::to_responder_clock(t.receive_ts, offset_us);
+        let transport_us = receive_server.saturating_sub(header.encode_done_ts);
         let queue_us = dequeue_ts.map(|d| d.saturating_sub(t.receive_ts));
-        let display_us = t.display_ts.saturating_sub(t.decode_done_ts);
-        self.decode_us_total += decode_us;
-        self.queue_us_total += queue_us.unwrap_or(0);
-        self.display_us_total += display_us;
-        self.max_decode_us = self.max_decode_us.max(decode_us);
+        let decode_us = t
+            .decode_done_ts
+            .saturating_sub(dequeue_ts.unwrap_or(t.receive_ts));
+        let present_us = t.display_ts.saturating_sub(t.decode_done_ts);
+        let display_server = sardp::timesync::to_responder_clock(t.display_ts, offset_us);
+        let glass_to_glass_us = display_server.saturating_sub(header.capture_ts);
+
+        self.encode_us.push(encode_us);
+        self.transport_us.push(transport_us);
+        if let Some(q) = queue_us {
+            self.queue_us.push(q);
+        }
+        self.decode_us.push(decode_us);
+        self.present_us.push(present_us);
+        self.glass_to_glass_us.push(glass_to_glass_us);
+
         match queue_us {
             Some(queue_us) => println!(
-                "frame generation={} frame_id={} idr={} bytes={} capture_ts={} queue_us={} decode_us={} present_us={} presented={}",
+                "frame generation={} frame_id={} idr={} bytes={} capture_ts={} encode_us={} transport_us={} queue_us={} decode_us={} present_us={} presented={} glass_to_glass_us={}",
                 header.generation, header.frame_id, header.is_idr(), payload_len, header.capture_ts,
-                queue_us, decode_us - queue_us, display_us, presented
+                encode_us, transport_us, queue_us, decode_us, present_us, presented, glass_to_glass_us
             ),
             None => println!(
-                "frame generation={} frame_id={} idr={} bytes={} capture_ts={} decode_us={} present_us={}",
-                header.generation, header.frame_id, header.is_idr(), payload_len, header.capture_ts, decode_us, display_us
+                "frame generation={} frame_id={} idr={} bytes={} capture_ts={} encode_us={} transport_us={} decode_us={} present_us={} glass_to_glass_us={}",
+                header.generation, header.frame_id, header.is_idr(), payload_len, header.capture_ts,
+                encode_us, transport_us, decode_us, present_us, glass_to_glass_us
             ),
         }
         if self.displayed.is_multiple_of(300) {
@@ -1343,9 +1392,8 @@ impl FrameStats {
     }
 
     fn print_summary(&self) {
-        let avg = |total: u64| total.checked_div(self.displayed).unwrap_or(0);
         eprintln!(
-            "stats: received={} displayed={} (idr={}, not_presented={}) stale_generation={} no_output={} resets={} bytes={} avg_queue_us={} avg_decode_us={} max_decode_us={} avg_present_us={}",
+            "stats: received={} displayed={} (idr={}, not_presented={}) stale_generation={} no_output={} resets={} bytes={}",
             self.received,
             self.displayed,
             self.idr,
@@ -1354,11 +1402,20 @@ impl FrameStats {
             self.no_output,
             self.resets,
             self.bytes,
-            avg(self.queue_us_total),
-            avg(self.decode_us_total),
-            self.max_decode_us,
-            avg(self.display_us_total),
         );
+        let row = |name: &str, samples: &[u64]| {
+            let (avg, p50, p95, max) = summarize(samples);
+            eprintln!(
+                "latency {name:<15} n={:<5} avg={avg:>7}us p50={p50:>7}us p95={p95:>7}us max={max:>7}us",
+                samples.len()
+            );
+        };
+        row("encode", &self.encode_us);
+        row("transport", &self.transport_us);
+        row("queue", &self.queue_us);
+        row("decode", &self.decode_us);
+        row("present", &self.present_us);
+        row("glass_to_glass", &self.glass_to_glass_us);
     }
 }
 
@@ -1426,7 +1483,7 @@ async fn process_frame(
                 decode_done_ts,
                 display_ts,
             };
-            stats.record_displayed(&header, payload_len, &timestamps, None, true);
+            stats.record_displayed(&header, payload_len, &timestamps, None, true, offset_us);
             let feedback = feedback_session::build_transport_feedback(
                 &header,
                 payload_len,

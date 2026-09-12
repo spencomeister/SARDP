@@ -8,7 +8,7 @@ PoCブリーフのPhase 1〜3 + Task 14(spencomeister/SARDP#1)の実装を通じ
 
 ### A. `SessionStore`のexpireタイマーの競合
 
-`suspend_and_store`(`src/bin/sardp-server.rs`)が`RECONNECT_GRACE_PERIOD`(300秒)後に`SessionStore`からエントリを削除するバックグラウンドタスクを積んでいましたが、当初は`SessionStore::expire(session_id)`という「session_idに対して現在何が入っていようと無条件に消す」メソッドを呼んでいました。
+`suspend_and_store`(`sardp-cli/src/bin/sardp-server.rs`)が`RECONNECT_GRACE_PERIOD`(300秒)後に`SessionStore`からエントリを削除するバックグラウンドタスクを積んでいましたが、当初は`SessionStore::expire(session_id)`という「session_idに対して現在何が入っていようと無条件に消す」メソッドを呼んでいました。
 
 suspend→reconnect→再suspendという流れが起きると、最初のsuspend用に積んだ古いタイマーが、2回目のsuspendによってまだ有効な猶予期間中にあるエントリを誤って削除してしまう競合がありました。
 
@@ -20,7 +20,7 @@ suspend→reconnect→再suspendという流れが起きると、最初のsuspen
 
 `permission_set::bit::FILE_UP`/`FILE_DOWN`は定義済みでしたが、`sardp-server`の`FileTransferRequest`処理はこれらを一切チェックせず、権限の有無に関わらず`file_handle`を発行していました。VIEW権限には同種のゲートがあった(`permission_sm.is_granted(bit::VIEW)`)のに、ファイル転送では見落としていました。
 
-**修正**: `FileTransferRequest`受信時に、`direction`に応じて`FILE_UP`/`FILE_DOWN`が`Granted`かを確認し、`Granted`でなければ`FileTransferReject`で応答するようにしました(`src/bin/sardp-server.rs`)。`PermissionSm::state()`を使って`Draining`(段階的revoke中)と`NotGranted`を区別し、前者は`POLICY_PERMISSION_REVOKED`、後者は`POLICY_PERMISSION_DENIED`を返します(仕様4.5の表の区別に合わせています)。
+**修正**: `FileTransferRequest`受信時に、`direction`に応じて`FILE_UP`/`FILE_DOWN`が`Granted`かを確認し、`Granted`でなければ`FileTransferReject`で応答するようにしました(`sardp-cli/src/bin/sardp-server.rs`)。`PermissionSm::state()`を使って`Draining`(段階的revoke中)と`NotGranted`を区別し、前者は`POLICY_PERMISSION_REVOKED`、後者は`POLICY_PERMISSION_DENIED`を返します(仕様4.5の表の区別に合わせています)。
 
 **付随事項**: 当時は下記「D. バイナリ本体が自動テストの対象外だった」という構造的な問題により、専用の自動回帰テストを追加できていませんでした(Dの修正で`PermissionSm::check_gate`としてテスト可能になっています)。また、現状`server_handshake_from_client_hello`が発行する`granted_permissions`には`FILE_UP`/`FILE_DOWN`が含まれていない(`src/handshake.rs`)ため、実バイナリでファイル転送を試すと常に拒否されます。これは意図した保守的挙動ですが、ファイル転送を実際に使う場合は付与ロジック側の対応が別途必要です。
 
@@ -98,11 +98,11 @@ VIEWのみだった管理者stdinトグル機構は`permission_sm::AdminCommand`
 
 ### 2. suspend-on-disconnectの検証パターンが手動テスト1回分に限られている
 
-`is_transport_disconnect`(`src/bin/sardp-server.rs`)は、video送出パス経由の切断を手動でkill -9して初めて漏れ(`ConnError::Video`が未分解だった)に気づいて直したという経緯があり、それ以外の経路(controlストリーム読み取り中、feedback読み取り中、backpressure再オープン中の切断)は実際に切ってみて確認していません。コード上は同じパターンで拾えるはずですが未検証です。
+`is_transport_disconnect`(`sardp-cli/src/bin/sardp-server.rs`)は、video送出パス経由の切断を手動でkill -9して初めて漏れ(`ConnError::Video`が未分解だった)に気づいて直したという経緯があり、それ以外の経路(controlストリーム読み取り中、feedback読み取り中、backpressure再オープン中の切断)は実際に切ってみて確認していません。コード上は同じパターンで拾えるはずですが未検証です。
 
 ### 4. `--session-file`はデモ専用の割り切りで、平文で資格情報相当を保存する
 
-`session_id`/`reconnect_token`/`user_id`を任意パスに平文・パーミッション制御なしで書き出す実装です(`src/bin/sardp-client.rs`)。`reconnect_token`はbearer credential(所持のみで再接続が成立する)なので、このファイルの中身が漏れることは元のセッションを乗っ取られることと同義です。実バイナリ間での再接続の往復を証明する唯一の現実的な手段として追加しましたが、デモ・テスト以外の用途に転用すべきではありません。
+`session_id`/`reconnect_token`/`user_id`を任意パスに平文・パーミッション制御なしで書き出す実装です(`sardp-cli/src/bin/sardp-client.rs`)。`reconnect_token`はbearer credential(所持のみで再接続が成立する)なので、このファイルの中身が漏れることは元のセッションを乗っ取られることと同義です。実バイナリ間での再接続の往復を証明する唯一の現実的な手段として追加しましたが、デモ・テスト以外の用途に転用すべきではありません。
 
 ### 5. クライアント側に自動再接続ロジックがない(サーバーとの非対称性)
 
@@ -223,3 +223,18 @@ d-2のE2E疎通(項目14参照)での観察:
 - **IME**: `ImeComposition`(未確定文字列、`WM_IME_COMPOSITION`の`GCS_COMPSTR`)は送信・受信・ログまでで、サーバー側の注入は未実装(確定文字列は`WM_CHAR`経由で`TextInput`として届くので実用上は打てる)。`ImeModeChange`はクライアントに送る手段(UI)がなく、サーバー側SM(`ImeModeSm`)のユニットテストのみ。
 - **権限の途中変更**: サーバーは`grant-keyboard`/`revoke-keyboard`/`grant-mouse`/`revoke-mouse`の管理コマンドで即時に注入を止められます(`PermissionSm`をイベントごとに参照)。クライアントは接続時点の付与状況でしか送信可否を決めず、後からの付与には反応しません(AUDIO_CAPTUREと同じPoCの割り切り)。E2Eでの動作確認は未実施(ユニットテストとコードレビューのみ)。
 - **未対応**: `Wheel.is_precise`(常にfalse)、マウスの相対移動モード、Alt+Tab等ローカルOSが横取りするキー、Secure Desktop(3W-2)、Pauseキー。
+
+### 18. Stage 3 遅延の再実測(DR-036)で分かったこと: TimeSync の 1 往復は信頼できない、エンコーダ出力の 1 フレーム遅れ
+
+3W-1 完了後に M6 の指標(`transport_us` / `glass_to_glass_us`)を永続パイプラインで再計測しました。結果と方法は `docs/sardp-stage3-latency-measurements.md` にまとめています(要点: `ffmpeg` 起動 ≈190ms → NVENC+DXVA ≈7ms、同一機 LAN 経由の glass-to-glass 中央値 177ms → 9ms、定常 p95 15〜61ms)。計測の過程で見つけて直した実装上の問題が 2 つあります。
+
+- **TimeSync(仕様 2.9)の 1 往復実装はオフセットが数百 ms ずれることがある**: 同一機でも握手直後の最初の往復で RTT 300〜600ms が観測され(2 往復目以降は 1ms 未満。原因は未特定)、その 1 サンプルから求めたオフセットで換算した値は全て無意味でした。これはバックプレッシャの主信号 `client_queue_delay_us`(仕様 2.10)も同じオフセットを使うため、**実運用でも判定を狂わせ得る問題**です。`timesync::client_time_sync` は 8 往復して最小 RTT のサンプルを採用(`best_of`)、サーバーは接続確立時に連続する要求をまとめて答え(`server_respond_time_sync_burst`、200ms の追従猶予)、以後は control ループでも `TimeSyncRequest` に応答するようにしました。仕様 2.9 自体は往復回数を規定していないので仕様変更はしていませんが、実装要件(Part 8)に「複数往復・最小 RTT 採用を SHOULD」として書く価値はあります(未反映)。
+- **NVENC MFT の出力を次フレームの入力時まで回収していなかった**: `encode_frame` が入力直後に「既に準備できている出力」しか取らず、フレーム N の出力はフレーム N+1 の入力時(約 17ms 後)に届いていました。1 キャプチャ間隔を上限に「この入力の出力」を待つ形に変更し、encode の実測は avg 28ms → 7〜10ms、配信遅延も実際に 1 フレーム分縮んでいます。待機中に `METransformNeedInput` を読み捨てると次の入力で 5 秒タイムアウトになる(最初の版で発生)ため、クレジットとして保持します。
+- **未対応**: 立ち上がり 0.7 秒の受信バッファ滞留(クライアントがデコーダ・ウィンドウを作る間に溜まる)、別機・実ネットワークでの再計測、`--display log` 経路は依然 `ffmpeg` 起動込みで 100ms 超/フレーム(比較用に残置)。
+
+### 19. クレート構成の変更: バイナリを `sardp-cli` に分離し、共有ロジックを `sardp` に集約(3M-1 の準備)
+
+macOS 実装の前に、`sardp-win` にあった OS 非依存の部分を `sardp` に移しました: `frame_source`(`EncodedFrame`/`SourceInfo`/`DesktopH264Config`、`FrameWorker`(ワーカースレッド+準備完了待ち+停止/join)と `FrameSender`(有界チャネル+`try_send` によるソース側ドロップ、DR-007))、`h264`(NAL 種別走査、`is_idr_access_unit`、`ParameterSetCache` による SPS/PPS 補完)。`sardp-win` はこれらを使う側になり、ユニットテスト(NAL 5 件、ワーカー 6 件)は `cargo test --lib` で OS を問わず走ります。
+
+このとき `sardp`(コア)が `sardp-win` に依存していた(`sardp-server`/`sardp-client` がコアクレートの `src/bin` にあったため)ことが循環依存になるので、**バイナリを新パッケージ `sardp-cli/` に移動**しました。`target/debug/sardp-server.exe` 等のパスは変わりません。ワークスペースの `default-members` は `.`(コア)と `sardp-cli` で、Windows 専用クレートは `--workspace` または `-p` で明示ビルドします(Linux でもコア+バイナリはそのままビルド・テストできる構成)。この機では Linux 向けの `cargo check --target x86_64-unknown-linux-gnu` が `ring` の C コンパイラ要件で止まるため、Linux 上での実行確認は未実施です(移した箇所に `cfg` 依存はありません)。
+

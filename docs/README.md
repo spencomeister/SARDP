@@ -1,6 +1,6 @@
 # docs/ — SARDP 設計文書の索引
 
-Secure Adaptive Remote Desktop Protocol(SARDP)の仕様・設計経緯・実装計画をまとめたディレクトリです。実装は `src/`(コアクレート `sardp`)、`sardp-win/`(Windows OS統合)、`tools/`(検証用PoC)にあり、既知の課題は リポジトリ直下の `KNOWN_ISSUES.md` に集約しています。
+Secure Adaptive Remote Desktop Protocol(SARDP)の仕様・設計経緯・実装計画をまとめたディレクトリです。実装は `src/`(コアクレート `sardp`、OS非依存)、`sardp-cli/`(`sardp-server`/`sardp-client` バイナリ)、`sardp-win/`(Windows OS統合)、`tools/`(検証用PoC)にあり、既知の課題は リポジトリ直下の `KNOWN_ISSUES.md` に集約しています。
 
 ## 読む順番
 
@@ -18,7 +18,10 @@ Secure Adaptive Remote Desktop Protocol(SARDP)の仕様・設計経緯・実装�
 3. **[sardp-stage3-os-integration-roadmap.md](sardp-stage3-os-integration-roadmap.md) — Stage 3(実OS統合)ロードマップ**
    Windows → macOS → Debian(GNOME)の順で、実キャプチャ・ハードウェアエンコード・入力注入・無人アクセスを段階的に進める計画と受け入れ基準。3W-1(Windows 在席)から着手し、各サブマイルストーン完了ごとに立ち止まって報告する運用です。3W-1 の実装は `sardp-win/` と `tools/dxgi-capture-poc/` に対応します。
 
-4. **[SARDP_MessageSchema.md](SARDP_MessageSchema.md) — メッセージスキーマ v0.1(設計経緯つき)**
+4. **[sardp-stage3-latency-measurements.md](sardp-stage3-latency-measurements.md) — Stage 3 遅延実測(DR-036 の再計測)**
+   永続エンコーダ/デコーダ・パイプラインでの `encode` / `transport` / `glass_to_glass` の実測値と方法、M6 当時の `ffmpeg` 起動経路との比較、計測で見つけた実装上の問題(TimeSync の往復回数、エンコーダ出力の回収タイミング)。
+
+5. **[SARDP_MessageSchema.md](SARDP_MessageSchema.md) — メッセージスキーマ v0.1(設計経緯つき)**
    ワイヤフォーマットの草案と、採用案・棄却案とその理由の記録(設計史ジャーナル)。現行の定義は規範仕様 v0.3 が優先します。「なぜこの形になったか」を知りたいときにだけ参照してください。
 
 ## 文書間の対応関係
@@ -30,6 +33,7 @@ Secure Adaptive Remote Desktop Protocol(SARDP)の仕様・設計経緯・実装�
 | PoC でどこまで実装するか、何を省略したか | PoC ブリーフ |
 | 実OS(Windows/macOS/Linux)対応の順序と制約 | Stage 3 ロードマップ、規範仕様 Part 7 |
 | 実装で判明した環境依存の問題・未対応事項 | `../KNOWN_ISSUES.md` |
+| 遅延の実測値(Part 8 目標との距離) | Stage 3 遅延実測 |
 | PoC ツール(DXGI / MFT / SendInput)の使い方と落とし穴 | `../tools/dxgi-capture-poc/README.md` |
 
 ## 表記

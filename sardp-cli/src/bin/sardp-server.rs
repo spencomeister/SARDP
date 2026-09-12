@@ -624,7 +624,14 @@ async fn handle_connection(
         );
     }
 
-    sardp::timesync::server_respond_time_sync(&mut ctx.control).await?;
+    // The client runs several TimeSync rounds and keeps the best one
+    // (`timesync::best_of`); answer them all before moving on.
+    let time_sync_rounds = sardp::timesync::server_respond_time_sync_burst(
+        &mut ctx.control,
+        Duration::from_millis(200),
+    )
+    .await?;
+    eprintln!("[{peer}] answered {time_sync_rounds} TimeSync round(s)");
 
     // The frame source outlives every generation of this session (the
     // desktop one owns the capture thread and the encoder's state).
@@ -887,6 +894,13 @@ async fn run_active_session(
             control_msg = control_reader.read_envelope(sardp::StreamKind::Control.max_envelope_length()) => {
                 let (type_raw, payload) = control_msg?;
                 last_activity = tokio::time::Instant::now();
+                if type_raw == messages::type_id::TIME_SYNC_REQUEST {
+                    // Spec 2.9: TimeSync can run at any time (and SHOULD be
+                    // answered ahead of other control traffic).
+                    let response = sardp::timesync::answer_time_sync_request(type_raw, &payload)?;
+                    write_control(control_send, messages::type_id::TIME_SYNC_RESPONSE, &messages::encode(&response)).await?;
+                    continue;
+                }
                 if type_raw == messages::type_id::SESSION_CLOSE {
                     let close: SessionClose = messages::decode(&payload).unwrap_or(SessionClose { reason: ReasonCode::NONE });
                     eprintln!("[{peer}] client sent SessionClose (reason {:?}), closing", close.reason);

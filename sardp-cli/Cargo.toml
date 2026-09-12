@@ -1,0 +1,22 @@
+[package]
+name = "sardp-cli"
+version = "0.1.0"
+edition = "2024"
+description = "SARDP PoC reference binaries (sardp-server / sardp-client)"
+
+# The binaries sit above both the core crate and the OS-integration
+# crates so that `sardp-win` (and, later, the macOS/Linux crates) can
+# depend on `sardp` for the shared types and H.264 helpers without a
+# dependency cycle. Nothing here is `unsafe`; the OS crates wrap that.
+
+[dependencies]
+sardp = { path = ".." }
+ed25519-dalek = { version = "3.0.0", features = ["rand_core"] }
+quinn = "0.11.11"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "io-std", "io-util", "signal", "sync", "time"] }
+
+[target.'cfg(windows)'.dependencies]
+sardp-win = { path = "../sardp-win" }
+
+[lints.rust]
+unsafe_code = "forbid"

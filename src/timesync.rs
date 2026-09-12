@@ -30,10 +30,19 @@ pub enum TimeSyncError {
     UnexpectedType(u16),
 }
 
-/// Client side: sends `TimeSyncRequest`, waits for `TimeSyncResponse`, and
-/// computes the result. `t4` (spec 2.9: never on the wire) is this
-/// function's own clock read on receiving the response.
-pub async fn client_time_sync(
+/// How many rounds [`client_time_sync`] runs. One exchange is at the mercy
+/// of whatever the two sides happen to be doing at that instant (the
+/// first control-stream exchange after the handshake was measured at
+/// 300-600ms RTT on a single machine, versus well under a millisecond for
+/// the rounds after it); the round with the smallest RTT has the least
+/// asymmetric queueing in it and so the most trustworthy offset -- the
+/// same reasoning NTP clients apply.
+pub const DEFAULT_TIME_SYNC_ROUNDS: usize = 8;
+
+/// Client side: one `TimeSyncRequest`/`TimeSyncResponse` exchange. `t4`
+/// (spec 2.9: never on the wire) is this function's own clock read on
+/// receiving the response.
+pub async fn client_time_sync_once(
     control: &mut ControlChannel,
 ) -> Result<TimeSyncResult, TimeSyncError> {
     let t1 = clock::now_us();
@@ -59,6 +68,41 @@ pub async fn client_time_sync(
     Ok(compute(response.t1, response.t2, response.t3, t4))
 }
 
+/// Client side: `rounds` back-to-back exchanges (each waits for its
+/// response before the next request), returned in order. The caller
+/// picks with [`best_of`]. The responder must keep answering for the
+/// whole burst ([`server_respond_time_sync_burst`]).
+pub async fn client_time_sync_rounds(
+    control: &mut ControlChannel,
+    rounds: usize,
+) -> Result<Vec<TimeSyncResult>, TimeSyncError> {
+    let mut results = Vec::with_capacity(rounds);
+    for _ in 0..rounds.max(1) {
+        results.push(client_time_sync_once(control).await?);
+    }
+    Ok(results)
+}
+
+/// Client side: [`DEFAULT_TIME_SYNC_ROUNDS`] rounds, best sample.
+pub async fn client_time_sync(
+    control: &mut ControlChannel,
+) -> Result<TimeSyncResult, TimeSyncError> {
+    let rounds = client_time_sync_rounds(control, DEFAULT_TIME_SYNC_ROUNDS).await?;
+    Ok(best_of(&rounds).expect("at least one round"))
+}
+
+/// The sample to trust: the one with the smallest RTT (ties: the later
+/// one). `None` for an empty slice.
+pub fn best_of(rounds: &[TimeSyncResult]) -> Option<TimeSyncResult> {
+    rounds
+        .iter()
+        .copied()
+        .fold(None, |best: Option<TimeSyncResult>, r| match best {
+            Some(b) if b.rtt_us < r.rtt_us => Some(b),
+            _ => Some(r),
+        })
+}
+
 /// Server side: reads one `TimeSyncRequest` and replies with
 /// `TimeSyncResponse`.
 pub async fn server_respond_time_sync(control: &mut ControlChannel) -> Result<(), TimeSyncError> {
@@ -67,17 +111,18 @@ pub async fn server_respond_time_sync(control: &mut ControlChannel) -> Result<()
         .read_envelope(StreamKind::Control.max_envelope_length())
         .await
         .map_err(TimeSyncError::Read)?;
-    let t2 = clock::now_us();
-    if type_raw != messages::type_id::TIME_SYNC_REQUEST {
-        return Err(TimeSyncError::UnexpectedType(type_raw));
-    }
-    let request: TimeSyncRequest = messages::decode(&payload).map_err(TimeSyncError::Decode)?;
-    let t3 = clock::now_us();
-    let response = TimeSyncResponse {
-        t1: request.t1,
-        t2,
-        t3,
-    };
+    respond_to_time_sync_request(control, type_raw, &payload).await
+}
+
+/// Server side: answers an already-read `TimeSyncRequest` Envelope
+/// (`t2` is taken now, so call this as soon as the Envelope is in hand --
+/// spec 2.9 SHOULD: respond ahead of other control traffic).
+pub async fn respond_to_time_sync_request(
+    control: &mut ControlChannel,
+    type_raw: u16,
+    payload: &[u8],
+) -> Result<(), TimeSyncError> {
+    let response = answer_time_sync_request(type_raw, payload)?;
     write_envelope(
         &mut control.send,
         messages::type_id::TIME_SYNC_RESPONSE,
@@ -86,6 +131,59 @@ pub async fn server_respond_time_sync(control: &mut ControlChannel) -> Result<()
     .await
     .map_err(TimeSyncError::Write)?;
     Ok(())
+}
+
+/// The `TimeSyncResponse` for a just-read `TimeSyncRequest` Envelope
+/// (`t2`/`t3` are taken here), for a caller that writes to the control
+/// stream itself (e.g. a server loop sharing its send half).
+pub fn answer_time_sync_request(
+    type_raw: u16,
+    payload: &[u8],
+) -> Result<TimeSyncResponse, TimeSyncError> {
+    let t2 = clock::now_us();
+    if type_raw != messages::type_id::TIME_SYNC_REQUEST {
+        return Err(TimeSyncError::UnexpectedType(type_raw));
+    }
+    let request: TimeSyncRequest = messages::decode(payload).map_err(TimeSyncError::Decode)?;
+    let t3 = clock::now_us();
+    Ok(TimeSyncResponse {
+        t1: request.t1,
+        t2,
+        t3,
+    })
+}
+
+/// Server side, for a client doing [`client_time_sync_rounds`]: answers
+/// the first request, then keeps answering as long as the next request
+/// arrives within `follow_up_gap` of the previous answer. Returns how
+/// many were answered. A client that only ever does one round costs the
+/// server one `follow_up_gap` of waiting here, nothing more; anything
+/// else the client sends inside the gap is a protocol error, since spec
+/// 4.1's Authenticated phase has no other client-initiated control
+/// message this early.
+pub async fn server_respond_time_sync_burst(
+    control: &mut ControlChannel,
+    follow_up_gap: std::time::Duration,
+) -> Result<usize, TimeSyncError> {
+    server_respond_time_sync(control).await?;
+    let mut answered = 1;
+    loop {
+        let next = tokio::time::timeout(
+            follow_up_gap,
+            control
+                .reader
+                .read_envelope(StreamKind::Control.max_envelope_length()),
+        )
+        .await;
+        match next {
+            Ok(Ok((type_raw, payload))) => {
+                respond_to_time_sync_request(control, type_raw, &payload).await?;
+                answered += 1;
+            }
+            Ok(Err(e)) => return Err(TimeSyncError::Read(e)),
+            Err(_elapsed) => return Ok(answered),
+        }
+    }
 }
 
 /// The result of one TimeSync round trip.
@@ -128,6 +226,18 @@ pub fn to_responder_clock(local_ts: u64, offset_us: i64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn best_of_picks_the_smallest_rtt() {
+        let rounds = [
+            TimeSyncResult { offset_us: -300_000, rtt_us: 600_000 },
+            TimeSyncResult { offset_us: -180_000, rtt_us: 400 },
+            TimeSyncResult { offset_us: -180_010, rtt_us: 900 },
+        ];
+        assert_eq!(best_of(&rounds), Some(rounds[1]));
+        assert_eq!(best_of(&[]), None);
+        assert_eq!(best_of(&rounds[..1]), Some(rounds[0]));
+    }
 
     #[test]
     fn zero_offset_zero_rtt_when_clocks_are_identical_and_instantaneous() {

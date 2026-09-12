@@ -6,6 +6,12 @@
 //! only ever sees [`DesktopH264Source`] and plain owned byte buffers, and
 //! `sardp-client` only [`H264DisplayWindow`] and timing reports.
 //!
+//! What is *not* Windows-specific is in the core crate and only used from
+//! here: the frame/config types and the worker-thread + source-side-drop
+//! pattern (`sardp::frame_source`), and the H.264 NAL unit handling that
+//! keeps IDRs self-contained despite unreliable encoder metadata
+//! (`sardp::h264`). A macOS/Linux crate implements the same shape.
+//!
 //! Server side ([`desktop_h264`]): the capture/encode pipeline validated
 //! standalone in `tools/dxgi-capture-poc` (3W-1-a/b) -- DXGI
 //! `AcquireNextFrame` -> GPU-side BGRA->NV12 via `ID3D11VideoProcessor` ->
@@ -29,10 +35,11 @@ pub mod display;
 pub mod inject;
 pub mod keymap;
 
-pub use desktop_h264::{
-    Clock, DesktopH264Config, DesktopH264Source, EncodedFrame, SourceInfo, WinCaptureError,
-};
+pub use desktop_h264::{DesktopH264Source, WinCaptureError};
 pub use display::{
     DisplayConfig, FrameTiming, H264DisplayWindow, SubmittedFrame, WinDisplayError, WindowInput,
 };
 pub use inject::{INJECTED_EXTRA_INFO, InjectCommand, InjectorConfig, InputInjector};
+// Shared with the other platforms; re-exported so 3W-1-d-2-era callers
+// (`sardp_win::Clock` etc.) keep working.
+pub use sardp::frame_source::{Clock, DesktopH264Config, EncodedFrame, SourceError, SourceInfo};

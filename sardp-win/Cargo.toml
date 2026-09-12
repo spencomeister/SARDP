@@ -9,6 +9,7 @@ description = "Windows OS integration for SARDP (Stage 3): DXGI desktop capture 
 # exported here.
 
 [dependencies]
+sardp = { path = ".." }
 dxgi-capture-poc = { path = "../tools/dxgi-capture-poc" }
 tokio = { version = "1.53.1", features = ["sync"] }
 windows = { version = "0.62.2", features = [

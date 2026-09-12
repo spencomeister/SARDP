@@ -898,7 +898,6 @@ dependencies = [
  "rand",
  "rcgen",
  "rustls-pemfile",
- "sardp-win",
  "serde",
  "serde_bytes",
  "sha2",
@@ -907,10 +906,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "sardp-cli"
+version = "0.1.0"
+dependencies = [
+ "ed25519-dalek",
+ "quinn",
+ "sardp",
+ "sardp-win",
+ "tokio",
+]
+
+[[package]]
 name = "sardp-win"
 version = "0.1.0"
 dependencies = [
  "dxgi-capture-poc",
+ "sardp",
  "tokio",
  "windows",
 ]
