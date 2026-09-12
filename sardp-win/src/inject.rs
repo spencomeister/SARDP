@@ -20,11 +20,11 @@ use std::time::Duration;
 
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY,
-    KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, KEYEVENTF_UNICODE, MOUSEEVENTF_ABSOLUTE,
-    MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN,
-    MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP,
-    MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT,
-    MOUSE_EVENT_FLAGS, SendInput, VIRTUAL_KEY,
+    KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, KEYEVENTF_UNICODE, MOUSE_EVENT_FLAGS,
+    MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
+    MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN,
+    MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN,
+    MOUSEEVENTF_XUP, MOUSEINPUT, SendInput, VIRTUAL_KEY,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
@@ -57,15 +57,27 @@ pub mod modifier {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InjectCommand {
     /// A physical key by USB HID usage.
-    Key { hid_usage: u32, down: bool },
+    Key {
+        hid_usage: u32,
+        down: bool,
+    },
     /// Committed text (`TextInput`), typed as Unicode.
     Text(String),
     /// Pointer position in pixels relative to the captured output's
     /// top-left corner.
-    MouseMove { x: i32, y: i32 },
-    MouseButton { button: u8, down: bool },
+    MouseMove {
+        x: i32,
+        y: i32,
+    },
+    MouseButton {
+        button: u8,
+        down: bool,
+    },
     /// `WHEEL_DELTA` (120) units, positive = up / right.
-    Wheel { dx: i16, dy: i16 },
+    Wheel {
+        dx: i16,
+        dy: i16,
+    },
 }
 
 #[derive(Debug, Clone)]

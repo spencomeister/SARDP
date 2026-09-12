@@ -8,9 +8,9 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use sardp::input_session::{
-    open_input_stream, send_ime_composition, send_ime_mode_change, send_key_event,
-    send_mouse_button, send_mouse_move, send_text_input, send_wheel, InputMessage,
-    InputReceiver, ReadInputError,
+    InputMessage, InputReceiver, ReadInputError, open_input_stream, send_ime_composition,
+    send_ime_mode_change, send_key_event, send_mouse_button, send_mouse_move, send_text_input,
+    send_wheel,
 };
 use sardp::messages::{
     ImeComposition, ImeMode, ImeModeChange, InputHeader, KeyEvent, MouseButton, MouseMove,
@@ -109,8 +109,12 @@ async fn every_input_message_type_round_trips_over_the_input_stream() {
 
     send_key_event(&mut send, &key).await.expect("send key");
     send_text_input(&mut send, &text).await.expect("send text");
-    send_ime_composition(&mut send, &ime).await.expect("send ime");
-    send_mouse_move(&mut send, &mouse_move).await.expect("send move");
+    send_ime_composition(&mut send, &ime)
+        .await
+        .expect("send ime");
+    send_mouse_move(&mut send, &mouse_move)
+        .await
+        .expect("send move");
     send_mouse_button(&mut send, &mouse_button)
         .await
         .expect("send button");
@@ -119,7 +123,9 @@ async fn every_input_message_type_round_trips_over_the_input_stream() {
         .await
         .expect("send mode change");
 
-    let mut receiver = InputReceiver::accept(&server).await.expect("accept input stream");
+    let mut receiver = InputReceiver::accept(&server)
+        .await
+        .expect("accept input stream");
     assert_eq!(
         receiver.read_message().await.expect("read key"),
         InputMessage::Key(key)
@@ -162,7 +168,9 @@ async fn accept_rejects_a_non_input_stream_kind() {
     let mut send = client.open_uni().await.expect("open uni");
     let mut prologue_bytes = Vec::new();
     prologue::encode(StreamKind::Feedback, 1, 0, &mut prologue_bytes);
-    send.write_all(&prologue_bytes).await.expect("write prologue");
+    send.write_all(&prologue_bytes)
+        .await
+        .expect("write prologue");
 
     let result = InputReceiver::accept(&server).await;
     assert!(matches!(result, Err(ReadInputError::WrongStreamKind)));

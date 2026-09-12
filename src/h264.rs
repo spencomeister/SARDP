@@ -299,7 +299,9 @@ mod tests {
 
     #[test]
     fn nal_unit_types_handles_both_start_code_lengths() {
-        let buf = [0, 0, 0, 1, 0x67, 0xAA, 0, 0, 1, 0x68, 0xBB, 0, 0, 0, 1, 0x65, 0xCC];
+        let buf = [
+            0, 0, 0, 1, 0x67, 0xAA, 0, 0, 1, 0x68, 0xBB, 0, 0, 0, 1, 0x65, 0xCC,
+        ];
         assert_eq!(nal_unit_types(&buf), vec![7, 8, 5]);
         assert_eq!(nal_unit_types(&[0, 0, 0, 0]), Vec::<u8>::new());
         assert_eq!(nal_unit_types(&[]), Vec::<u8>::new());

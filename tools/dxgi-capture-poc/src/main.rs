@@ -9,19 +9,21 @@ use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use windows::core::Interface;
 use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Direct3D11::{
-    ID3D11Device, ID3D11DeviceContext, ID3D11Resource, ID3D11Texture2D, D3D11_CPU_ACCESS_READ,
-    D3D11_CREATE_DEVICE_FLAG, D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE, D3D11_TEXTURE2D_DESC,
-    D3D11_USAGE_STAGING,
+    D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_FLAG, D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE,
+    D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING, ID3D11Device, ID3D11DeviceContext, ID3D11Resource,
+    ID3D11Texture2D,
 };
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
-use windows::Win32::Graphics::Dxgi::{IDXGIResource, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO};
+use windows::Win32::Graphics::Dxgi::{
+    DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO, IDXGIResource,
+};
+use windows::core::Interface;
 
 use dxgi_capture_poc::capture::{
-    create_d3d11_device, create_output_duplication, primary_display_refresh_interval,
-    read_dirty_rects, read_move_rect_count, FrameGuard,
+    FrameGuard, create_d3d11_device, create_output_duplication, primary_display_refresh_interval,
+    read_dirty_rects, read_move_rect_count,
 };
 
 /// 1フレーム取得を待つ最大時間(ms)。これを超えると「変化なし」としてリトライする。
@@ -40,8 +42,8 @@ fn main() -> windows::core::Result<()> {
     // 変化があった時だけAcquireNextFrameが返るため、上限を外しても無変化時の負荷は
     // 増えない。実ディスプレイのリフレッシュレートまで許容するようにする。
     let min_frame_interval = primary_display_refresh_interval();
-    let max_frames = (TARGET_SESSION_DURATION.as_secs_f64() / min_frame_interval.as_secs_f64())
-        .ceil() as u32;
+    let max_frames =
+        (TARGET_SESSION_DURATION.as_secs_f64() / min_frame_interval.as_secs_f64()).ceil() as u32;
 
     println!("[dxgi-capture-poc] output directory: {}", out_dir.display());
     println!("[dxgi-capture-poc] log file: {}", log_path.display());
@@ -64,8 +66,9 @@ fn main() -> windows::core::Result<()> {
         let mut frame_info = DXGI_OUTDUPL_FRAME_INFO::default();
         let mut resource: Option<IDXGIResource> = None;
 
-        let acquire_result =
-            unsafe { duplication.AcquireNextFrame(ACQUIRE_TIMEOUT_MS, &mut frame_info, &mut resource) };
+        let acquire_result = unsafe {
+            duplication.AcquireNextFrame(ACQUIRE_TIMEOUT_MS, &mut frame_info, &mut resource)
+        };
 
         match acquire_result {
             Ok(()) => {}
@@ -98,7 +101,14 @@ fn main() -> windows::core::Result<()> {
 
         saved_frames += 1;
         let elapsed_since_start = start.elapsed();
-        log_frame_info(&mut log, saved_frames, &frame_info, &dirty_rects, move_rect_count, elapsed_since_start);
+        log_frame_info(
+            &mut log,
+            saved_frames,
+            &frame_info,
+            &dirty_rects,
+            move_rect_count,
+            elapsed_since_start,
+        );
         println!(
             "[dxgi-capture-poc] frame {saved_frames}/{max_frames}: dirty_rects={} move_rects={} accumulated_frames={} last_present_qpc={} elapsed={:.3}s",
             dirty_rects.len(),

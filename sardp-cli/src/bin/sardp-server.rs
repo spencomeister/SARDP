@@ -93,7 +93,10 @@ enum CaptureMode {
 /// for the session's lifetime (the desktop source owns a capture thread
 /// and the encoder's state, so it must outlive every generation).
 enum FrameSource {
-    Synthetic { width: u32, height: u32 },
+    Synthetic {
+        width: u32,
+        height: u32,
+    },
     #[cfg(windows)]
     Desktop(sardp_win::DesktopH264Source),
 }
@@ -159,7 +162,11 @@ async fn send_sourced_frame(
     height: u32,
     frame: &SourcedFrame,
 ) -> Result<(), ConnError> {
-    let flags = if frame.is_idr { messages::VIDEO_FRAME_FLAG_IDR } else { 0 };
+    let flags = if frame.is_idr {
+        messages::VIDEO_FRAME_FLAG_IDR
+    } else {
+        0
+    };
     video_session::send_video_frame(
         video_send,
         generation,
@@ -636,7 +643,14 @@ async fn handle_connection(
     // The frame source outlives every generation of this session (the
     // desktop one owns the capture thread and the encoder's state).
     let (mut frame_source, width, height, fps, profile, tier) = match capture.mode {
-        CaptureMode::Synthetic => (FrameSource::Synthetic { width, height }, width, height, fps, 66u16, 4u8),
+        CaptureMode::Synthetic => (
+            FrameSource::Synthetic { width, height },
+            width,
+            height,
+            fps,
+            66u16,
+            4u8,
+        ),
         #[cfg(windows)]
         CaptureMode::Desktop => {
             let clock: sardp_win::Clock = Arc::new(clock::now_us);
@@ -652,14 +666,27 @@ async fn handle_connection(
                 info.width,
                 info.height,
                 info.fps,
-                if capture.all_idr { "all-IDR (--all-idr)" } else { "IDR + P-frames" }
+                if capture.all_idr {
+                    "all-IDR (--all-idr)"
+                } else {
+                    "IDR + P-frames"
+                }
             );
             // Main profile (what the hardware MFT negotiates), Tier 3
             // (hardware 4:2:0, no QP map yet -- spec Part 6).
-            (FrameSource::Desktop(source), info.width, info.height, f64::from(info.fps), 77u16, 3u8)
+            (
+                FrameSource::Desktop(source),
+                info.width,
+                info.height,
+                f64::from(info.fps),
+                77u16,
+                3u8,
+            )
         }
         #[cfg(not(windows))]
-        CaptureMode::Desktop => unreachable!("--capture desktop is rejected at argument parsing off Windows"),
+        CaptureMode::Desktop => {
+            unreachable!("--capture desktop is rejected at argument parsing off Windows")
+        }
     };
 
     // Input injection (spec 2.12, 3W-1-d-4) goes to the real desktop only
@@ -1224,14 +1251,21 @@ impl InputInjection {
     /// `PermissionSm` (a revoke drops events from that moment on, spec
     /// 4.5); `Err` only for protocol violations (spec 4.4.1's forbidden
     /// messages), which end the session.
-    fn handle(&mut self, message: InputMessage, permission_sm: &PermissionSm) -> Result<(), ConnError> {
+    fn handle(
+        &mut self,
+        message: InputMessage,
+        permission_sm: &PermissionSm,
+    ) -> Result<(), ConnError> {
         let peer = self.peer;
         let keyboard = permission_sm.is_granted(bit::INPUT_KEYBOARD);
         let mouse = permission_sm.is_granted(bit::INPUT_MOUSE);
         let mut not_granted = |what: &str, id: u64| {
             self.dropped_not_granted += 1;
             if self.dropped_not_granted.is_power_of_two() {
-                eprintln!("[{peer}] dropped {what} event {id}: permission not granted ({} so far)", self.dropped_not_granted);
+                eprintln!(
+                    "[{peer}] dropped {what} event {id}: permission not granted ({} so far)",
+                    self.dropped_not_granted
+                );
             }
         };
         match message {
@@ -1270,7 +1304,10 @@ impl InputInjection {
                     not_granted("text", text.header.event_id);
                     return Ok(());
                 }
-                eprintln!("[{peer}] text event {}: {:?}", text.header.event_id, text.text);
+                eprintln!(
+                    "[{peer}] text event {}: {:?}",
+                    text.header.event_id, text.text
+                );
                 self.emit(SinkEvent::Text(text.text));
             }
             InputMessage::ImeComposition(composition) => {
@@ -1294,7 +1331,10 @@ impl InputInjection {
                 }
                 self.mouse_moves += 1;
                 if self.mouse_moves <= 3 || self.mouse_moves.is_multiple_of(100) {
-                    eprintln!("[{peer}] mouse move event {}: ({}, {})", m.header.event_id, m.x, m.y);
+                    eprintln!(
+                        "[{peer}] mouse move event {}: ({}, {})",
+                        m.header.event_id, m.x, m.y
+                    );
                 }
                 self.emit(SinkEvent::MouseMove { x: m.x, y: m.y });
             }
@@ -1320,7 +1360,10 @@ impl InputInjection {
                     not_granted("wheel", w.header.event_id);
                     return Ok(());
                 }
-                eprintln!("[{peer}] wheel event {}: dx={} dy={}", w.header.event_id, w.dx, w.dy);
+                eprintln!(
+                    "[{peer}] wheel event {}: dx={} dy={}",
+                    w.header.event_id, w.dx, w.dy
+                );
                 self.emit(SinkEvent::Wheel { dx: w.dx, dy: w.dy });
             }
         }
@@ -1333,11 +1376,21 @@ impl InputInjection {
         if releases.is_empty() {
             return;
         }
-        eprintln!("[{}] releasing {} pressed key(s)/button(s)", self.peer, releases.len());
+        eprintln!(
+            "[{}] releasing {} pressed key(s)/button(s)",
+            self.peer,
+            releases.len()
+        );
         for release in releases {
             match release {
-                Release::Key(hid_usage) => self.emit(SinkEvent::Key { hid_usage, down: false }),
-                Release::Button(button) => self.emit(SinkEvent::MouseButton { button, down: false }),
+                Release::Key(hid_usage) => self.emit(SinkEvent::Key {
+                    hid_usage,
+                    down: false,
+                }),
+                Release::Button(button) => self.emit(SinkEvent::MouseButton {
+                    button,
+                    down: false,
+                }),
             }
         }
     }
@@ -1353,7 +1406,9 @@ impl InputInjection {
             #[cfg(windows)]
             InputSink::Windows(injector) => {
                 let command = match event {
-                    SinkEvent::Key { hid_usage, down } => sardp_win::InjectCommand::Key { hid_usage, down },
+                    SinkEvent::Key { hid_usage, down } => {
+                        sardp_win::InjectCommand::Key { hid_usage, down }
+                    }
                     SinkEvent::Text(text) => sardp_win::InjectCommand::Text(text),
                     SinkEvent::MouseMove { x, y } => sardp_win::InjectCommand::MouseMove { x, y },
                     SinkEvent::MouseButton { button, down } => {
@@ -1374,7 +1429,11 @@ impl Drop for InputInjection {
         self.release_all();
         eprintln!(
             "[{}] input summary: injected={} skipped_character_keys={} dropped_not_granted={} mouse_moves={}",
-            self.peer, self.injected, self.skipped_character_keys, self.dropped_not_granted, self.mouse_moves
+            self.peer,
+            self.injected,
+            self.skipped_character_keys,
+            self.dropped_not_granted,
+            self.mouse_moves
         );
     }
 }
@@ -1532,7 +1591,9 @@ async fn open_generation(
         // encoder prepends the negotiated sequence header when needed, so
         // this firing means that fallback broke -- worth a loud log rather
         // than a silent bad stream.
-        eprintln!("warning: IDR opening generation {generation} is not self-contained (no SPS/PPS before the IDR slice)");
+        eprintln!(
+            "warning: IDR opening generation {generation} is not self-contained (no SPS/PPS before the IDR slice)"
+        );
     }
     let (send, _sm) = video_session::open_video_instance(
         connection,

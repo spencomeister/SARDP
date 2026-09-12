@@ -525,14 +525,19 @@ async fn run(connection: quinn::Connection, args: &Args) -> Result<(), AppError>
     // Several rounds, best (lowest-RTT) sample: the first exchange after
     // the handshake has been seen to take hundreds of ms on this machine,
     // which would put every cross-clock latency figure off by that much.
-    let rounds = timesync::client_time_sync_rounds(&mut control, timesync::DEFAULT_TIME_SYNC_ROUNDS).await?;
+    let rounds =
+        timesync::client_time_sync_rounds(&mut control, timesync::DEFAULT_TIME_SYNC_ROUNDS).await?;
     let timesync = timesync::best_of(&rounds).expect("at least one round");
     eprintln!(
         "TimeSync: offset_us={} rtt_us={} (best of {} rounds; rtts: {})",
         timesync.offset_us,
         timesync.rtt_us,
         rounds.len(),
-        rounds.iter().map(|r| r.rtt_us.to_string()).collect::<Vec<_>>().join(",")
+        rounds
+            .iter()
+            .map(|r| r.rtt_us.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
     );
 
     let (intro, mut frame_reader) = tokio::time::timeout(
@@ -581,12 +586,21 @@ async fn run(connection: quinn::Connection, args: &Args) -> Result<(), AppError>
             stream_size.0,
             stream_size.1
         );
-        Some(InputForwarder::new(send, granted_permissions, stream_size, args.window_size))
+        Some(InputForwarder::new(
+            send,
+            granted_permissions,
+            stream_size,
+            args.window_size,
+        ))
     } else {
         if window_input.is_some() {
             eprintln!(
                 "input forwarding off ({})",
-                if args.input { "no input permission granted" } else { "--input off" }
+                if args.input {
+                    "no input permission granted"
+                } else {
+                    "--input off"
+                }
             );
             window_input = None;
         }
@@ -883,7 +897,9 @@ async fn accept_next_generation(
             // has been fully read (a slow decoder keeps the backpressure
             // tripping); that just means yet another generation follows.
             Ok(Err(VideoError::Read(StreamReadError::Read(quinn::ReadError::Reset(code))))) => {
-                eprintln!("new video Instance was reset (code {code}) before it started; waiting for the next one");
+                eprintln!(
+                    "new video Instance was reset (code {code}) before it started; waiting for the next one"
+                );
                 continue;
             }
             Ok(Err(e)) => return Err(e.into()),
@@ -892,7 +908,9 @@ async fn accept_next_generation(
                     "no new video Instance within {:?} after the reset",
                     timeouts::SESSION_SETUP_TIMEOUT
                 );
-                return Err(AppError::Violation(ReasonCode::PROTOCOL_VIDEO_CONFIGURING_TIMEOUT));
+                return Err(AppError::Violation(
+                    ReasonCode::PROTOCOL_VIDEO_CONFIGURING_TIMEOUT,
+                ));
             }
         }
     }
@@ -940,11 +958,15 @@ impl VideoSink {
                     width: args.window_size.0,
                     height: args.window_size.1,
                 };
-                let window = sardp_win::H264DisplayWindow::open(config, std::sync::Arc::new(clock::now_us))
-                    .map_err(|e| AppError::Display(e.to_string()))?;
+                let window =
+                    sardp_win::H264DisplayWindow::open(config, std::sync::Arc::new(clock::now_us))
+                        .map_err(|e| AppError::Display(e.to_string()))?;
                 eprintln!(
                     "display: window {}x{} (hardware H.264 decode, stream {}x{})",
-                    args.window_size.0, args.window_size.1, encoder_config.width, encoder_config.height
+                    args.window_size.0,
+                    args.window_size.1,
+                    encoder_config.width,
+                    encoder_config.height
                 );
                 Ok(Self::Window {
                     window,
@@ -1001,9 +1023,9 @@ impl VideoSink {
             // reported one in the queue never produced output (the decoder
             // needed more input, or it was dropped inside the window) and
             // gets no feedback.
-            let position = pending
-                .iter()
-                .position(|p| p.header.generation == timing.generation && p.header.frame_id == timing.frame_id);
+            let position = pending.iter().position(|p| {
+                p.header.generation == timing.generation && p.header.frame_id == timing.frame_id
+            });
             let Some(position) = position else {
                 eprintln!(
                     "timing for unknown frame generation={} frame_id={}",
@@ -1036,7 +1058,13 @@ impl VideoSink {
             );
             feedback_session::send_transport_feedback(feedback_send, &feedback).await?;
         }
-        let _ = (&timing, &*stats, &*feedback_send, offset_us, target_latency_us);
+        let _ = (
+            &timing,
+            &*stats,
+            &*feedback_send,
+            offset_us,
+            target_latency_us,
+        );
         Ok(())
     }
 }
@@ -1159,7 +1187,10 @@ impl InputForwarder {
                     header: self.header(),
                     text,
                 };
-                eprintln!("input: text event {} {:?}", event.header.event_id, event.text);
+                eprintln!(
+                    "input: text event {} {:?}",
+                    event.header.event_id, event.text
+                );
                 input_session::send_text_input(&mut self.send, &event).await?;
             }
             WindowInput::ImeComposition { text, caret } => {
@@ -1189,7 +1220,10 @@ impl InputForwarder {
                 };
                 self.mouse_moves += 1;
                 if self.mouse_moves <= 3 || self.mouse_moves.is_multiple_of(100) {
-                    eprintln!("input: mouse move event {} -> ({x}, {y})", event.header.event_id);
+                    eprintln!(
+                        "input: mouse move event {} -> ({x}, {y})",
+                        event.header.event_id
+                    );
                 }
                 input_session::send_mouse_move(&mut self.send, &event).await?;
             }
@@ -1222,7 +1256,10 @@ impl InputForwarder {
                     dy,
                     is_precise: false,
                 };
-                eprintln!("input: wheel event {} dx={dx} dy={dy}", event.header.event_id);
+                eprintln!(
+                    "input: wheel event {} dx={dx} dy={dy}",
+                    event.header.event_id
+                );
                 input_session::send_wheel(&mut self.send, &event).await?;
             }
             WindowInput::FocusLost => {
@@ -1333,7 +1370,12 @@ fn summarize(samples: &[u64]) -> (u64, u64, u64, u64) {
     sorted.sort_unstable();
     let percentile = |p: usize| sorted[(sorted.len() - 1) * p / 100];
     let avg = sorted.iter().sum::<u64>() / sorted.len() as u64;
-    (avg, percentile(50), percentile(95), sorted[sorted.len() - 1])
+    (
+        avg,
+        percentile(50),
+        percentile(95),
+        sorted[sorted.len() - 1],
+    )
 }
 
 impl FrameStats {
@@ -1377,13 +1419,31 @@ impl FrameStats {
         match queue_us {
             Some(queue_us) => println!(
                 "frame generation={} frame_id={} idr={} bytes={} capture_ts={} encode_us={} transport_us={} queue_us={} decode_us={} present_us={} presented={} glass_to_glass_us={}",
-                header.generation, header.frame_id, header.is_idr(), payload_len, header.capture_ts,
-                encode_us, transport_us, queue_us, decode_us, present_us, presented, glass_to_glass_us
+                header.generation,
+                header.frame_id,
+                header.is_idr(),
+                payload_len,
+                header.capture_ts,
+                encode_us,
+                transport_us,
+                queue_us,
+                decode_us,
+                present_us,
+                presented,
+                glass_to_glass_us
             ),
             None => println!(
                 "frame generation={} frame_id={} idr={} bytes={} capture_ts={} encode_us={} transport_us={} decode_us={} present_us={} glass_to_glass_us={}",
-                header.generation, header.frame_id, header.is_idr(), payload_len, header.capture_ts,
-                encode_us, transport_us, decode_us, present_us, glass_to_glass_us
+                header.generation,
+                header.frame_id,
+                header.is_idr(),
+                payload_len,
+                header.capture_ts,
+                encode_us,
+                transport_us,
+                decode_us,
+                present_us,
+                glass_to_glass_us
             ),
         }
         if self.displayed.is_multiple_of(300) {
@@ -1467,7 +1527,11 @@ async fn process_frame(
                     timecode_us: Some(timecode),
                 },
             );
-            debug_assert_eq!(outcome, SubmitOutcome::Displayed, "gated by would_display above");
+            debug_assert_eq!(
+                outcome,
+                SubmitOutcome::Displayed,
+                "gated by would_display above"
+            );
             let display_ts = clock::now_us();
             println!(
                 "frame generation={} frame_id={} idr={} timecode_us={} capture_ts={} bytes={}",
@@ -1517,8 +1581,15 @@ async fn process_frame(
             // tracks; decode/present timing arrives via
             // `next_window_timing` and is what the feedback reports.
             let outcome = display.submit_frame(&header, DisplayedFrame { timecode_us: None });
-            debug_assert_eq!(outcome, SubmitOutcome::Displayed, "gated by would_display above");
-            pending.push_back(PendingFeedback { header, payload_len });
+            debug_assert_eq!(
+                outcome,
+                SubmitOutcome::Displayed,
+                "gated by would_display above"
+            );
+            pending.push_back(PendingFeedback {
+                header,
+                payload_len,
+            });
             if pending.len() > 64 && pending.len().is_power_of_two() {
                 eprintln!(
                     "window decoder behind: {} frames queued (newest generation={} frame_id={})",

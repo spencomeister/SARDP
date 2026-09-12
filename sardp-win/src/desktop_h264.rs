@@ -15,8 +15,8 @@
 
 use std::collections::VecDeque;
 use std::mem::ManuallyDrop;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use sardp::frame_source::{
@@ -25,47 +25,49 @@ use sardp::frame_source::{
 };
 use sardp::h264::{self, ParameterSetCache};
 
-use windows::core::{Interface, PWSTR};
 use windows::Win32::Graphics::Direct3D11::{
-    ID3D11Device, ID3D11DeviceContext, ID3D11Multithread, ID3D11Resource, ID3D11Texture2D,
-    ID3D11VideoContext, ID3D11VideoDevice, ID3D11VideoProcessor, ID3D11VideoProcessorInputView,
-    ID3D11VideoProcessorOutputView, D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE,
-    D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_CREATE_DEVICE_VIDEO_SUPPORT, D3D11_TEX2D_VPIV,
-    D3D11_TEX2D_VPOV, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
-    D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE, D3D11_VIDEO_PROCESSOR_CONTENT_DESC,
+    D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+    D3D11_CREATE_DEVICE_VIDEO_SUPPORT, D3D11_TEX2D_VPIV, D3D11_TEX2D_VPOV, D3D11_TEXTURE2D_DESC,
+    D3D11_USAGE_DEFAULT, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE, D3D11_VIDEO_PROCESSOR_CONTENT_DESC,
     D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC, D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0,
     D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC, D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0,
     D3D11_VIDEO_PROCESSOR_STREAM, D3D11_VIDEO_USAGE_PLAYBACK_NORMAL,
-    D3D11_VPIV_DIMENSION_TEXTURE2D, D3D11_VPOV_DIMENSION_TEXTURE2D,
+    D3D11_VPIV_DIMENSION_TEXTURE2D, D3D11_VPOV_DIMENSION_TEXTURE2D, ID3D11Device,
+    ID3D11DeviceContext, ID3D11Multithread, ID3D11Resource, ID3D11Texture2D, ID3D11VideoContext,
+    ID3D11VideoDevice, ID3D11VideoProcessor, ID3D11VideoProcessorInputView,
+    ID3D11VideoProcessorOutputView,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_NV12, DXGI_RATIONAL, DXGI_SAMPLE_DESC,
 };
 use windows::Win32::Graphics::Dxgi::{
-    IDXGIResource, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO,
+    DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO, IDXGIResource,
 };
 use windows::Win32::Media::MediaFoundation::{
-    ICodecAPI, IMFActivate, IMFDXGIDeviceManager, IMFMediaEvent, IMFMediaEventGenerator,
-    IMFMediaType, IMFSample, IMFTransform, MFCreateDXGIDeviceManager, MFCreateDXGISurfaceBuffer,
-    MFCreateMediaType, MFCreateSample, MFShutdown, MFStartup, MFTEnumEx, MFMediaType_Video,
-    MFSampleExtension_CleanPoint, MFVideoFormat_H264, MFVideoFormat_NV12,
-    MFVideoInterlace_Progressive, CODECAPI_AVEncMPVGOPSize, CODECAPI_AVEncVideoForceKeyFrame,
-    METransformHaveOutput, METransformNeedInput, MFT_CATEGORY_VIDEO_ENCODER,
-    MFT_ENUM_FLAG_HARDWARE, MFT_ENUM_FLAG_SORTANDFILTER, MFT_ENUM_FLAG_SYNCMFT,
-    MFT_FRIENDLY_NAME_Attribute, MFT_MESSAGE_COMMAND_DRAIN, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
-    MFT_MESSAGE_NOTIFY_END_OF_STREAM, MFT_MESSAGE_NOTIFY_END_STREAMING,
-    MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_MESSAGE_SET_D3D_MANAGER, MFT_OUTPUT_DATA_BUFFER,
-    MFT_REGISTER_TYPE_INFO, MF_EVENT_FLAG_NO_WAIT, MF_E_TRANSFORM_NEED_MORE_INPUT,
-    MF_MT_AVG_BITRATE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE,
-    MF_MT_MAJOR_TYPE, MF_MT_MPEG_SEQUENCE_HEADER, MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE,
-    MF_TRANSFORM_ASYNC_UNLOCK, MF_VERSION, MFSTARTUP_FULL,
+    CODECAPI_AVEncMPVGOPSize, CODECAPI_AVEncVideoForceKeyFrame, ICodecAPI, IMFActivate,
+    IMFDXGIDeviceManager, IMFMediaEvent, IMFMediaEventGenerator, IMFMediaType, IMFSample,
+    IMFTransform, METransformHaveOutput, METransformNeedInput, MF_E_TRANSFORM_NEED_MORE_INPUT,
+    MF_EVENT_FLAG_NO_WAIT, MF_MT_AVG_BITRATE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE,
+    MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_MPEG_SEQUENCE_HEADER, MF_MT_PIXEL_ASPECT_RATIO,
+    MF_MT_SUBTYPE, MF_TRANSFORM_ASYNC_UNLOCK, MF_VERSION, MFCreateDXGIDeviceManager,
+    MFCreateDXGISurfaceBuffer, MFCreateMediaType, MFCreateSample, MFMediaType_Video,
+    MFSTARTUP_FULL, MFSampleExtension_CleanPoint, MFShutdown, MFStartup,
+    MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_FLAG_HARDWARE, MFT_ENUM_FLAG_SORTANDFILTER,
+    MFT_ENUM_FLAG_SYNCMFT, MFT_FRIENDLY_NAME_Attribute, MFT_MESSAGE_COMMAND_DRAIN,
+    MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, MFT_MESSAGE_NOTIFY_END_OF_STREAM,
+    MFT_MESSAGE_NOTIFY_END_STREAMING, MFT_MESSAGE_NOTIFY_START_OF_STREAM,
+    MFT_MESSAGE_SET_D3D_MANAGER, MFT_OUTPUT_DATA_BUFFER, MFT_REGISTER_TYPE_INFO, MFTEnumEx,
+    MFVideoFormat_H264, MFVideoFormat_NV12, MFVideoInterlace_Progressive,
 };
-use windows::Win32::System::Com::{CoInitializeEx, CoTaskMemFree, CoUninitialize, COINIT_MULTITHREADED};
+use windows::Win32::System::Com::{
+    COINIT_MULTITHREADED, CoInitializeEx, CoTaskMemFree, CoUninitialize,
+};
 use windows::Win32::System::Variant::VARIANT;
+use windows::core::{Interface, PWSTR};
 
 use dxgi_capture_poc::capture::{
-    create_d3d11_device, create_output_duplication, duplicated_output_desktop_rect,
-    primary_display_refresh_interval, FrameGuard,
+    FrameGuard, create_d3d11_device, create_output_duplication, duplicated_output_desktop_rect,
+    primary_display_refresh_interval,
 };
 
 /// Kept for callers written against the 3W-1-d-2 API; the type itself now
@@ -153,15 +155,16 @@ fn run_worker(
 ) -> Result<(), String> {
     let e = |ctx: &str, err: windows::core::Error| format!("{ctx}: {err}");
 
-    let (device, context) = create_d3d11_device(
-        D3D11_CREATE_DEVICE_VIDEO_SUPPORT | D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-    )
-    .map_err(|err| e("D3D11CreateDevice", err))?;
-    let multithread: ID3D11Multithread = device.cast().map_err(|err| e("ID3D11Multithread", err))?;
+    let (device, context) =
+        create_d3d11_device(D3D11_CREATE_DEVICE_VIDEO_SUPPORT | D3D11_CREATE_DEVICE_BGRA_SUPPORT)
+            .map_err(|err| e("D3D11CreateDevice", err))?;
+    let multithread: ID3D11Multithread =
+        device.cast().map_err(|err| e("ID3D11Multithread", err))?;
     let _ = unsafe { multithread.SetMultithreadProtected(true) };
 
     let device_manager = create_device_manager(&device).map_err(|err| e("device manager", err))?;
-    let duplication = create_output_duplication(&device).map_err(|err| e("DuplicateOutput", err))?;
+    let duplication =
+        create_output_duplication(&device).map_err(|err| e("DuplicateOutput", err))?;
     let origin = match duplicated_output_desktop_rect(&device) {
         Ok(rect) => (rect.left, rect.top),
         Err(err) => {
@@ -198,7 +201,10 @@ fn run_worker(
             Ok(()) => {}
             Err(err) if err.code() == DXGI_ERROR_WAIT_TIMEOUT => continue,
             Err(err) if err.code() == DXGI_ERROR_ACCESS_LOST => {
-                return Err(e("AcquireNextFrame (access lost; display mode change/lock screen?)", err));
+                return Err(e(
+                    "AcquireNextFrame (access lost; display mode change/lock screen?)",
+                    err,
+                ));
             }
             Err(err) => return Err(e("AcquireNextFrame", err)),
         }
@@ -235,7 +241,10 @@ fn run_worker(
                 // A completely static desktop produces no presents; the
                 // first real frame (and so the Instance's first IDR) waits
                 // for the next desktop update.
-                eprintln!("[sardp-win] no desktop image update yet after {:?}", start.elapsed());
+                eprintln!(
+                    "[sardp-win] no desktop image update yet after {:?}",
+                    start.elapsed()
+                );
                 warned_no_image = true;
             }
             continue;
@@ -256,11 +265,17 @@ fn run_worker(
         if stats.encoded.is_multiple_of(600) {
             eprintln!(
                 "[sardp-win] capture: acquired={} encoded={} pointer_only={} paced_out={} dropped_by_consumer={}",
-                stats.acquired, stats.encoded, stats.pointer_only, stats.paced_out, ctx.frames.dropped()
+                stats.acquired,
+                stats.encoded,
+                stats.pointer_only,
+                stats.paced_out,
+                ctx.frames.dropped()
             );
         }
         let resource = resource.expect("AcquireNextFrame succeeded without a resource");
-        let texture: ID3D11Texture2D = resource.cast().map_err(|err| e("frame texture cast", err))?;
+        let texture: ID3D11Texture2D = resource
+            .cast()
+            .map_err(|err| e("frame texture cast", err))?;
 
         if encoder.is_none() {
             let mut desc = D3D11_TEXTURE2D_DESC::default();
@@ -372,7 +387,10 @@ impl VideoConverter {
             MipLevels: 1,
             ArraySize: 1,
             Format: DXGI_FORMAT_B8G8R8A8_UNORM,
-            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
             Usage: D3D11_USAGE_DEFAULT,
             BindFlags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
             CPUAccessFlags: 0,
@@ -566,7 +584,9 @@ impl Encoder {
                 eprintln!("[sardp-win] CODECAPI_AVEncMPVGOPSize={gop_size} rejected: {err}");
             }
         } else {
-            eprintln!("[sardp-win] encoder MFT has no ICodecAPI; GOP size left at the driver default");
+            eprintln!(
+                "[sardp-win] encoder MFT has no ICodecAPI; GOP size left at the driver default"
+            );
         }
 
         let output_type = unsafe {
@@ -606,7 +626,8 @@ impl Encoder {
             fps,
             parameter_sets: ParameterSetCache::new(),
             pending_capture_ts: VecDeque::new(),
-            output_wait: Duration::from_micros(1_000_000 / u64::from(fps.max(1))).max(Duration::from_millis(20)),
+            output_wait: Duration::from_micros(1_000_000 / u64::from(fps.max(1)))
+                .max(Duration::from_millis(20)),
             need_input_credits: 0,
             last_pts_100ns: None,
             input_count: 0,
@@ -642,7 +663,8 @@ impl Encoder {
         };
         self.last_pts_100ns = Some(pts);
 
-        let buffer = unsafe { MFCreateDXGISurfaceBuffer(&ID3D11Texture2D::IID, texture, 0, false)? };
+        let buffer =
+            unsafe { MFCreateDXGISurfaceBuffer(&ID3D11Texture2D::IID, texture, 0, false)? };
         let sample: IMFSample = unsafe { MFCreateSample()? };
         unsafe {
             sample.AddBuffer(&buffer)?;
@@ -751,7 +773,10 @@ impl Encoder {
         };
         self.output_count += 1;
         let encode_done_ts = clock();
-        let capture_ts = self.pending_capture_ts.pop_front().unwrap_or(encode_done_ts);
+        let capture_ts = self
+            .pending_capture_ts
+            .pop_front()
+            .unwrap_or(encode_done_ts);
 
         let annex_b = sample_bytes(&sample)?;
         // MFSampleExtension_CleanPoint proved unreliable on the validated
@@ -796,7 +821,10 @@ impl Encoder {
             return Ok(());
         }
         self.finished = true;
-        unsafe { self.transform.ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0)? };
+        unsafe {
+            self.transform
+                .ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0)?
+        };
         // Nobody consumes drained output at shutdown; just bound the wait.
         let deadline = Instant::now() + Duration::from_secs(2);
         while self.output_count < self.input_count && Instant::now() < deadline {
@@ -811,8 +839,12 @@ impl Encoder {
             }
         }
         unsafe {
-            let _ = self.transform.ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
-            let _ = self.transform.ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0);
+            let _ = self
+                .transform
+                .ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
+            let _ = self
+                .transform
+                .ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0);
         }
         Ok(())
     }

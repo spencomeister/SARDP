@@ -17,8 +17,8 @@
 //!   unbounded on the sending side. Drops are counted and logged at
 //!   powers of two.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -325,7 +325,10 @@ mod tests {
         assert!(second > first, "frames arrive in production order");
         let stop = worker.stop_flag();
         drop(worker);
-        assert!(stop.load(Ordering::SeqCst), "drop requests a stop and joins");
+        assert!(
+            stop.load(Ordering::SeqCst),
+            "drop requests a stop and joins"
+        );
     }
 
     #[tokio::test]
@@ -333,11 +336,8 @@ mod tests {
         // Producer fills the channel far faster than the consumer reads;
         // it must keep running (DR-007: drop at the source) and count.
         let (done_tx, done_rx) = std::sync::mpsc::channel::<u64>();
-        let mut worker = FrameWorker::<u64, ()>::spawn(
-            "test-burst",
-            2,
-            Duration::from_secs(5),
-            move |ctx| {
+        let mut worker =
+            FrameWorker::<u64, ()>::spawn("test-burst", 2, Duration::from_secs(5), move |ctx| {
                 ctx.report_ready(());
                 let start = Instant::now();
                 for n in 0..1000u64 {
@@ -345,26 +345,38 @@ mod tests {
                         break;
                     }
                 }
-                assert!(start.elapsed() < Duration::from_secs(1), "send never blocks");
+                assert!(
+                    start.elapsed() < Duration::from_secs(1),
+                    "send never blocks"
+                );
                 let _ = done_tx.send(ctx.frames.dropped());
                 Ok(())
-            },
-        )
-        .expect("spawn");
-        let dropped = done_rx.recv_timeout(Duration::from_secs(5)).expect("producer finished");
-        assert!(dropped >= 998 - 2, "almost everything was dropped, got {dropped}");
+            })
+            .expect("spawn");
+        let dropped = done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("producer finished");
+        assert!(
+            dropped >= 998 - 2,
+            "almost everything was dropped, got {dropped}"
+        );
         // The consumer still gets what was queued, in order, then the end.
         let a = worker.next().await.expect("queued frame");
         let b = worker.next().await.expect("queued frame");
         assert!(b > a);
-        assert_eq!(worker.next().await, None, "channel closes when the body returns");
+        assert_eq!(
+            worker.next().await,
+            None,
+            "channel closes when the body returns"
+        );
     }
 
     #[test]
     fn init_failure_is_reported_to_the_spawner() {
-        let result = FrameWorker::<u64, ()>::spawn("test-fail", 4, Duration::from_secs(5), |_ctx| {
-            Err("no capture device".to_string())
-        });
+        let result =
+            FrameWorker::<u64, ()>::spawn("test-fail", 4, Duration::from_secs(5), |_ctx| {
+                Err("no capture device".to_string())
+            });
         assert_eq!(
             result.err(),
             Some(SourceError::Init("no capture device".into()))
@@ -373,7 +385,8 @@ mod tests {
 
     #[test]
     fn a_body_that_exits_before_ready_is_an_init_failure() {
-        let result = FrameWorker::<u64, ()>::spawn("test-early", 4, Duration::from_secs(5), |_ctx| Ok(()));
+        let result =
+            FrameWorker::<u64, ()>::spawn("test-early", 4, Duration::from_secs(5), |_ctx| Ok(()));
         assert!(matches!(result.err(), Some(SourceError::Init(_))));
     }
 
@@ -400,12 +413,13 @@ mod tests {
 
     #[tokio::test]
     async fn a_failure_after_ready_closes_the_channel() {
-        let mut worker = FrameWorker::<u64, ()>::spawn("test-late-fail", 4, Duration::from_secs(5), |ctx| {
-            ctx.report_ready(());
-            ctx.frames.send(1);
-            Err("display lost".to_string())
-        })
-        .expect("spawn succeeds: the failure comes after readiness");
+        let mut worker =
+            FrameWorker::<u64, ()>::spawn("test-late-fail", 4, Duration::from_secs(5), |ctx| {
+                ctx.report_ready(());
+                ctx.frames.send(1);
+                Err("display lost".to_string())
+            })
+            .expect("spawn succeeds: the failure comes after readiness");
         assert_eq!(worker.next().await, Some(1));
         assert_eq!(worker.next().await, None);
     }

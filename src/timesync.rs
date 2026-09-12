@@ -230,9 +230,18 @@ mod tests {
     #[test]
     fn best_of_picks_the_smallest_rtt() {
         let rounds = [
-            TimeSyncResult { offset_us: -300_000, rtt_us: 600_000 },
-            TimeSyncResult { offset_us: -180_000, rtt_us: 400 },
-            TimeSyncResult { offset_us: -180_010, rtt_us: 900 },
+            TimeSyncResult {
+                offset_us: -300_000,
+                rtt_us: 600_000,
+            },
+            TimeSyncResult {
+                offset_us: -180_000,
+                rtt_us: 400,
+            },
+            TimeSyncResult {
+                offset_us: -180_010,
+                rtt_us: 900,
+            },
         ];
         assert_eq!(best_of(&rounds), Some(rounds[1]));
         assert_eq!(best_of(&[]), None);

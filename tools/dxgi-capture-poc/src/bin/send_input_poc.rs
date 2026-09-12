@@ -21,17 +21,19 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{HWND, LPARAM, POINT, RECT, WPARAM};
-use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentProcessId, GetCurrentThreadId};
+use windows::Win32::System::Threading::{
+    AttachThreadInput, GetCurrentProcessId, GetCurrentThreadId,
+};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_KEYUP,
-    KEYEVENTF_UNICODE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
-    MOUSEEVENTF_MOVE, MOUSEEVENTF_VIRTUALDESK, MOUSEINPUT,
+    INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE,
+    MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MOVE,
+    MOUSEEVENTF_VIRTUALDESK, MOUSEINPUT, SendInput,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumChildWindows, EnumWindows, GetCursorPos, GetForegroundWindow, GetSystemMetrics,
-    GetWindowRect, GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible, SendMessageW,
-    SetForegroundWindow, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
-    SM_YVIRTUALSCREEN, WM_GETTEXT, WM_GETTEXTLENGTH,
+    GetWindowRect, GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible, SM_CXVIRTUALSCREEN,
+    SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SendMessageW, SetForegroundWindow,
+    WM_GETTEXT, WM_GETTEXTLENGTH,
 };
 
 const DEMO_TEXT: &str = "SARDP 3W-1-c: SendInputによる入力注入テスト / Hello from Rust!";
@@ -49,7 +51,9 @@ fn main() -> windows::core::Result<()> {
     let hwnd = wait_for_notepad_window(Duration::from_secs(5))
         .expect("notepad window did not appear within timeout");
     let title = window_text(hwnd);
-    println!("[send-input-poc] found notepad window: hwnd={hwnd:?} launcher_pid={launcher_pid} title=\"{title}\"");
+    println!(
+        "[send-input-poc] found notepad window: hwnd={hwnd:?} launcher_pid={launcher_pid} title=\"{title}\""
+    );
 
     // --- マウス: 対象ウィンドウの矩形内の座標へSendInputで移動し、クリックする ---
     // スクリーン中央ではなく対象ウィンドウの内側を狙うことで、ウィンドウの位置に
@@ -67,7 +71,10 @@ fn main() -> windows::core::Result<()> {
 
     let mut pos = POINT::default();
     unsafe { GetCursorPos(&mut pos)? };
-    println!("[send-input-poc] cursor position after move+click: ({}, {})", pos.x, pos.y);
+    println!(
+        "[send-input-poc] cursor position after move+click: ({}, {})",
+        pos.x, pos.y
+    );
 
     // --- フォーカス確認: SetForegroundWindowの戻り値は信用せず、実際に
     // GetForegroundWindow()が対象ウィンドウを指すまで確認する。確認できなければ
@@ -136,11 +143,12 @@ fn ensure_foreground(hwnd: HWND, timeout: Duration) -> bool {
         let foreground_thread = GetWindowThreadProcessId(current_foreground, None);
         let target_thread = GetWindowThreadProcessId(hwnd, None);
 
-        let attached_to_foreground = if foreground_thread != current_thread && foreground_thread != 0 {
-            AttachThreadInput(current_thread, foreground_thread, true).as_bool()
-        } else {
-            false
-        };
+        let attached_to_foreground =
+            if foreground_thread != current_thread && foreground_thread != 0 {
+                AttachThreadInput(current_thread, foreground_thread, true).as_bool()
+            } else {
+                false
+            };
         let attached_to_target = if target_thread != current_thread && target_thread != 0 {
             AttachThreadInput(current_thread, target_thread, true).as_bool()
         } else {
@@ -359,7 +367,8 @@ unsafe extern "system" fn enum_child_proc(hwnd: HWND, lparam: LPARAM) -> windows
 }
 
 fn window_text_via_message(hwnd: HWND) -> String {
-    let len = unsafe { SendMessageW(hwnd, WM_GETTEXTLENGTH, Some(WPARAM(0)), Some(LPARAM(0))) }.0 as usize;
+    let len = unsafe { SendMessageW(hwnd, WM_GETTEXTLENGTH, Some(WPARAM(0)), Some(LPARAM(0))) }.0
+        as usize;
     if len == 0 {
         return String::new();
     }

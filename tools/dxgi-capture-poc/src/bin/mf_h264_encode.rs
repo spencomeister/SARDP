@@ -19,45 +19,45 @@ use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use windows::core::{Interface, GUID, HSTRING, PWSTR};
 use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Direct3D11::{
-    ID3D11Device, ID3D11DeviceContext, ID3D11Multithread, ID3D11Resource, ID3D11Texture2D,
-    ID3D11VideoContext, ID3D11VideoDevice, ID3D11VideoProcessor, ID3D11VideoProcessorInputView,
-    ID3D11VideoProcessorOutputView, D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE,
-    D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_CREATE_DEVICE_VIDEO_SUPPORT, D3D11_TEX2D_VPIV,
-    D3D11_TEX2D_VPOV, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
-    D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE, D3D11_VIDEO_PROCESSOR_CONTENT_DESC,
+    D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+    D3D11_CREATE_DEVICE_VIDEO_SUPPORT, D3D11_TEX2D_VPIV, D3D11_TEX2D_VPOV, D3D11_TEXTURE2D_DESC,
+    D3D11_USAGE_DEFAULT, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE, D3D11_VIDEO_PROCESSOR_CONTENT_DESC,
     D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC, D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC,
     D3D11_VIDEO_PROCESSOR_STREAM, D3D11_VIDEO_USAGE_PLAYBACK_NORMAL,
-    D3D11_VPIV_DIMENSION_TEXTURE2D, D3D11_VPOV_DIMENSION_TEXTURE2D,
+    D3D11_VPIV_DIMENSION_TEXTURE2D, D3D11_VPOV_DIMENSION_TEXTURE2D, ID3D11Device,
+    ID3D11DeviceContext, ID3D11Multithread, ID3D11Resource, ID3D11Texture2D, ID3D11VideoContext,
+    ID3D11VideoDevice, ID3D11VideoProcessor, ID3D11VideoProcessorInputView,
+    ID3D11VideoProcessorOutputView,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_NV12, DXGI_RATIONAL, DXGI_SAMPLE_DESC,
 };
 use windows::Win32::Graphics::Dxgi::{
-    IDXGIResource, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO,
+    DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO, IDXGIResource,
 };
 use windows::Win32::Media::MediaFoundation::{
     IMFActivate, IMFDXGIDeviceManager, IMFMediaEvent, IMFMediaEventGenerator, IMFMediaType,
-    IMFSample, IMFSinkWriter, IMFTransform, MFCreateDXGIDeviceManager, MFCreateDXGISurfaceBuffer,
-    MFCreateMediaType, MFCreateSample, MFCreateSinkWriterFromURL, MFShutdown, MFStartup,
-    MFTEnumEx, MFMediaType_Video, MFVideoFormat_H264, MFVideoFormat_NV12,
-    MFVideoInterlace_Progressive, MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_FLAG_HARDWARE,
-    MFT_ENUM_FLAG_SORTANDFILTER, MFT_ENUM_FLAG_SYNCMFT, MFT_FRIENDLY_NAME_Attribute,
-    MFT_MESSAGE_COMMAND_DRAIN, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, MFT_MESSAGE_NOTIFY_END_OF_STREAM,
-    MFT_MESSAGE_NOTIFY_END_STREAMING, MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_MESSAGE_SET_D3D_MANAGER,
-    MFT_OUTPUT_DATA_BUFFER, MFT_REGISTER_TYPE_INFO, MF_EVENT_FLAG_NO_WAIT,
-    MF_E_TRANSFORM_NEED_MORE_INPUT, MF_MT_AVG_BITRATE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE,
-    MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE,
-    MF_TRANSFORM_ASYNC_UNLOCK, MF_VERSION, MFSTARTUP_FULL, METransformHaveOutput,
-    METransformNeedInput,
+    IMFSample, IMFSinkWriter, IMFTransform, METransformHaveOutput, METransformNeedInput,
+    MF_E_TRANSFORM_NEED_MORE_INPUT, MF_EVENT_FLAG_NO_WAIT, MF_MT_AVG_BITRATE, MF_MT_FRAME_RATE,
+    MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_PIXEL_ASPECT_RATIO,
+    MF_MT_SUBTYPE, MF_TRANSFORM_ASYNC_UNLOCK, MF_VERSION, MFCreateDXGIDeviceManager,
+    MFCreateDXGISurfaceBuffer, MFCreateMediaType, MFCreateSample, MFCreateSinkWriterFromURL,
+    MFMediaType_Video, MFSTARTUP_FULL, MFShutdown, MFStartup, MFT_CATEGORY_VIDEO_ENCODER,
+    MFT_ENUM_FLAG_HARDWARE, MFT_ENUM_FLAG_SORTANDFILTER, MFT_ENUM_FLAG_SYNCMFT,
+    MFT_FRIENDLY_NAME_Attribute, MFT_MESSAGE_COMMAND_DRAIN, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
+    MFT_MESSAGE_NOTIFY_END_OF_STREAM, MFT_MESSAGE_NOTIFY_END_STREAMING,
+    MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_MESSAGE_SET_D3D_MANAGER, MFT_OUTPUT_DATA_BUFFER,
+    MFT_REGISTER_TYPE_INFO, MFTEnumEx, MFVideoFormat_H264, MFVideoFormat_NV12,
+    MFVideoInterlace_Progressive,
 };
-use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
+use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoUninitialize};
+use windows::core::{GUID, HSTRING, Interface, PWSTR};
 
 use dxgi_capture_poc::capture::{
-    create_d3d11_device, create_output_duplication, primary_display_refresh_interval,
-    read_dirty_rects, read_move_rect_count, FrameGuard,
+    FrameGuard, create_d3d11_device, create_output_duplication, primary_display_refresh_interval,
+    read_dirty_rects, read_move_rect_count,
 };
 
 const ACQUIRE_TIMEOUT_MS: u32 = 500;
@@ -94,8 +94,8 @@ fn run() -> windows::core::Result<()> {
     // 増えない。実ディスプレイのリフレッシュレートまで許容するようにする。
     let min_frame_interval = primary_display_refresh_interval();
     let nominal_fps = (1.0 / min_frame_interval.as_secs_f64()).round().max(1.0) as u32;
-    let max_frames = (TARGET_SESSION_DURATION.as_secs_f64() / min_frame_interval.as_secs_f64())
-        .ceil() as u32;
+    let max_frames =
+        (TARGET_SESSION_DURATION.as_secs_f64() / min_frame_interval.as_secs_f64()).ceil() as u32;
 
     println!("[mf-h264-encode] output: {}", mp4_path.display());
     println!("[mf-h264-encode] log: {}", log_path.display());
@@ -106,9 +106,8 @@ fn run() -> windows::core::Result<()> {
     writeln!(log, "# 3W-1-b Media Foundation H.264 hardware encode log").ok();
     writeln!(log, "# started_at={:?}", SystemTime::now()).ok();
 
-    let (device, context) = create_d3d11_device(
-        D3D11_CREATE_DEVICE_VIDEO_SUPPORT | D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-    )?;
+    let (device, context) =
+        create_d3d11_device(D3D11_CREATE_DEVICE_VIDEO_SUPPORT | D3D11_CREATE_DEVICE_BGRA_SUPPORT)?;
 
     // MFの内部ワーカースレッドが同じD3D11デバイスへアクセスするため、保護を有効化する
     // (Microsoft文書がD3D11デバイスをMFに渡す際の前提条件として明記している)。
@@ -307,7 +306,10 @@ impl VideoConverter {
             MipLevels: 1,
             ArraySize: 1,
             Format: DXGI_FORMAT_B8G8R8A8_UNORM,
-            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
             Usage: D3D11_USAGE_DEFAULT,
             BindFlags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
             CPUAccessFlags: 0,
@@ -349,12 +351,13 @@ impl VideoConverter {
         let input_view_desc = D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC {
             FourCC: 0,
             ViewDimension: D3D11_VPIV_DIMENSION_TEXTURE2D,
-            Anonymous: windows::Win32::Graphics::Direct3D11::D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0 {
-                Texture2D: D3D11_TEX2D_VPIV {
-                    MipSlice: 0,
-                    ArraySlice: 0,
+            Anonymous:
+                windows::Win32::Graphics::Direct3D11::D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0 {
+                    Texture2D: D3D11_TEX2D_VPIV {
+                        MipSlice: 0,
+                        ArraySlice: 0,
+                    },
                 },
-            },
         };
         let mut input_view: Option<ID3D11VideoProcessorInputView> = None;
         unsafe {
@@ -370,9 +373,10 @@ impl VideoConverter {
         let dst_resource: ID3D11Resource = nv12.cast()?;
         let output_view_desc = D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC {
             ViewDimension: D3D11_VPOV_DIMENSION_TEXTURE2D,
-            Anonymous: windows::Win32::Graphics::Direct3D11::D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0 {
-                Texture2D: D3D11_TEX2D_VPOV { MipSlice: 0 },
-            },
+            Anonymous:
+                windows::Win32::Graphics::Direct3D11::D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0 {
+                    Texture2D: D3D11_TEX2D_VPOV { MipSlice: 0 },
+                },
         };
         let mut output_view: Option<ID3D11VideoProcessorOutputView> = None;
         unsafe {
@@ -416,8 +420,12 @@ impl VideoConverter {
             ..Default::default()
         };
         unsafe {
-            self.video_context
-                .VideoProcessorBlt(&self.processor, &self.output_view, 0, &[stream])?;
+            self.video_context.VideoProcessorBlt(
+                &self.processor,
+                &self.output_view,
+                0,
+                &[stream],
+            )?;
         }
         Ok(&self.nv12)
     }
@@ -521,7 +529,11 @@ impl Encoder {
         })
     }
 
-    fn encode_frame(&mut self, texture: &ID3D11Texture2D, timestamp: Duration) -> windows::core::Result<()> {
+    fn encode_frame(
+        &mut self,
+        texture: &ID3D11Texture2D,
+        timestamp: Duration,
+    ) -> windows::core::Result<()> {
         let pts = duration_to_100ns(timestamp);
         let duration = match self.last_pts_100ns {
             Some(prev) => (pts - prev).max(1),
@@ -529,7 +541,8 @@ impl Encoder {
         };
         self.last_pts_100ns = Some(pts);
 
-        let buffer = unsafe { MFCreateDXGISurfaceBuffer(&ID3D11Texture2D::IID, texture, 0, false)? };
+        let buffer =
+            unsafe { MFCreateDXGISurfaceBuffer(&ID3D11Texture2D::IID, texture, 0, false)? };
         let sample: IMFSample = unsafe { MFCreateSample()? };
         unsafe {
             sample.AddBuffer(&buffer)?;
@@ -591,7 +604,9 @@ impl Encoder {
                     self.output_count += 1;
                     self.forward_sample(&sample)?;
                 } else {
-                    eprintln!("[mf-h264-encode] ProcessOutput ok but pSample=None (status=0x{status:08X})");
+                    eprintln!(
+                        "[mf-h264-encode] ProcessOutput ok but pSample=None (status=0x{status:08X})"
+                    );
                 }
                 Ok(())
             }
@@ -636,7 +651,10 @@ impl Encoder {
             "[mf-h264-encode] draining; {}/{} samples produced so far",
             self.output_count, self.input_count
         );
-        unsafe { self.transform.ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0)? };
+        unsafe {
+            self.transform
+                .ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0)?
+        };
 
         // 入力1フレームにつき出力1サンプル(Bフレーム無し)が来るはずなので、
         // 提出した入力数ぶんの出力が揃った時点で完了とみなす。これが主判定。
@@ -671,8 +689,16 @@ impl Encoder {
             self.output_count, self.input_count
         );
 
-        unsafe { self.transform.ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0).ok() };
-        unsafe { self.transform.ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0).ok() };
+        unsafe {
+            self.transform
+                .ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0)
+                .ok()
+        };
+        unsafe {
+            self.transform
+                .ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0)
+                .ok()
+        };
 
         if let Some(muxer) = self.muxer.as_mut() {
             muxer.finalize()?;

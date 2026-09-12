@@ -285,7 +285,13 @@ pub async fn accept_video_instance(
     connection: &quinn::Connection,
 ) -> Result<(VideoInstanceIntro, VideoFrameReader), VideoError> {
     let (intro, reader) = accept_intro(connection).await?;
-    Ok((intro, VideoFrameReader { reader, pending_header: None }))
+    Ok((
+        intro,
+        VideoFrameReader {
+            reader,
+            pending_header: None,
+        },
+    ))
 }
 
 /// Reads an Instance's `VideoFrame`s (spec 4.3.2 Streaming/Congested row)

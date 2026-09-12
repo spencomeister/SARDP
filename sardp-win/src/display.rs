@@ -15,50 +15,53 @@
 //! at all -- the earlier per-frame `ffmpeg` decoder could only ever handle
 //! self-contained IDRs.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
 use tokio::sync::mpsc;
 
-use windows::core::{Interface, PCWSTR};
-use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, LPARAM, LRESULT, RECT, WAIT_OBJECT_0, WPARAM};
-use windows::Win32::System::Threading::WaitForSingleObject;
+use windows::Win32::Foundation::{
+    CloseHandle, HANDLE, HWND, LPARAM, LRESULT, RECT, WAIT_OBJECT_0, WPARAM,
+};
 use windows::Win32::Graphics::Direct3D11::{
-    ID3D11Device, ID3D11DeviceContext, ID3D11Multithread, ID3D11Resource, ID3D11Texture2D,
-    ID3D11VideoContext, ID3D11VideoDevice, ID3D11VideoProcessor, ID3D11VideoProcessorEnumerator,
-    ID3D11VideoProcessorInputView, ID3D11VideoProcessorOutputView, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-    D3D11_CREATE_DEVICE_VIDEO_SUPPORT, D3D11_TEX2D_VPIV, D3D11_TEX2D_VPOV,
-    D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE, D3D11_VIDEO_PROCESSOR_CONTENT_DESC,
+    D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_CREATE_DEVICE_VIDEO_SUPPORT, D3D11_TEX2D_VPIV,
+    D3D11_TEX2D_VPOV, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE, D3D11_VIDEO_PROCESSOR_CONTENT_DESC,
     D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC, D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0,
     D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC, D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0,
     D3D11_VIDEO_PROCESSOR_STREAM, D3D11_VIDEO_USAGE_PLAYBACK_NORMAL,
-    D3D11_VPIV_DIMENSION_TEXTURE2D, D3D11_VPOV_DIMENSION_TEXTURE2D,
+    D3D11_VPIV_DIMENSION_TEXTURE2D, D3D11_VPOV_DIMENSION_TEXTURE2D, ID3D11Device,
+    ID3D11DeviceContext, ID3D11Multithread, ID3D11Resource, ID3D11Texture2D, ID3D11VideoContext,
+    ID3D11VideoDevice, ID3D11VideoProcessor, ID3D11VideoProcessorEnumerator,
+    ID3D11VideoProcessorInputView, ID3D11VideoProcessorOutputView,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_ALPHA_MODE_IGNORE, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_RATIONAL, DXGI_SAMPLE_DESC,
 };
 use windows::Win32::Graphics::Dxgi::{
-    IDXGIDevice, IDXGIFactory2, IDXGISwapChain1, IDXGISwapChain2, DXGI_SCALING_STRETCH,
-    DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT,
-    DXGI_SWAP_EFFECT_FLIP_DISCARD, DXGI_USAGE_RENDER_TARGET_OUTPUT,
+    DXGI_SCALING_STRETCH, DXGI_SWAP_CHAIN_DESC1,
+    DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT, DXGI_SWAP_EFFECT_FLIP_DISCARD,
+    DXGI_USAGE_RENDER_TARGET_OUTPUT, IDXGIDevice, IDXGIFactory2, IDXGISwapChain1, IDXGISwapChain2,
 };
 use windows::Win32::Media::MediaFoundation::{
     CODECAPI_AVLowLatencyMode, ICodecAPI, IMFActivate, IMFDXGIBuffer, IMFDXGIDeviceManager,
-    IMFMediaType, IMFSample, IMFTransform, MF_LOW_LATENCY,
-    MFCreateDXGIDeviceManager, MFCreateMediaType, MFCreateMemoryBuffer, MFCreateSample, MFShutdown,
-    MFStartup, MFTEnumEx, MFMediaType_Video, MFVideoFormat_H264, MFVideoFormat_NV12,
-    MFVideoInterlace_Progressive, MFT_CATEGORY_VIDEO_DECODER, MFT_ENUM_FLAG_SORTANDFILTER,
-    MFT_ENUM_FLAG_SYNCMFT, MFT_FRIENDLY_NAME_Attribute, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
+    IMFMediaType, IMFSample, IMFTransform, MF_E_TRANSFORM_NEED_MORE_INPUT,
+    MF_E_TRANSFORM_STREAM_CHANGE, MF_LOW_LATENCY, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE,
+    MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE, MF_VERSION, MFCreateDXGIDeviceManager, MFCreateMediaType,
+    MFCreateMemoryBuffer, MFCreateSample, MFMediaType_Video, MFSTARTUP_FULL, MFShutdown, MFStartup,
+    MFT_CATEGORY_VIDEO_DECODER, MFT_ENUM_FLAG_SORTANDFILTER, MFT_ENUM_FLAG_SYNCMFT,
+    MFT_FRIENDLY_NAME_Attribute, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
     MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_MESSAGE_SET_D3D_MANAGER, MFT_OUTPUT_DATA_BUFFER,
-    MFT_OUTPUT_STREAM_PROVIDES_SAMPLES, MFT_REGISTER_TYPE_INFO, MF_E_TRANSFORM_NEED_MORE_INPUT,
-    MF_E_TRANSFORM_STREAM_CHANGE, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE,
-    MF_MT_SUBTYPE, MF_VERSION, MFSTARTUP_FULL,
+    MFT_OUTPUT_STREAM_PROVIDES_SAMPLES, MFT_REGISTER_TYPE_INFO, MFTEnumEx, MFVideoFormat_H264,
+    MFVideoFormat_NV12, MFVideoInterlace_Progressive,
 };
-use windows::Win32::System::Com::{CoInitializeEx, CoTaskMemFree, CoUninitialize, COINIT_MULTITHREADED};
-use windows::Win32::System::Variant::VARIANT;
+use windows::Win32::System::Com::{
+    COINIT_MULTITHREADED, CoInitializeEx, CoTaskMemFree, CoUninitialize,
+};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::Threading::WaitForSingleObject;
+use windows::Win32::System::Variant::VARIANT;
 use windows::Win32::UI::Input::Ime::{
     GCS_COMPSTR, GCS_CURSORPOS, HIMC, ImmGetCompositionStringW, ImmGetContext, ImmReleaseContext,
 };
@@ -66,22 +69,23 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, ReleaseCapture, SetCapture, VK_CONTROL, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    AdjustWindowRect, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-    GetMessageExtraInfo, GetWindowLongPtrW, PeekMessageW, PostQuitMessage, RegisterClassW,
-    SetWindowLongPtrW, ShowWindow, TranslateMessage, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT,
-    GWLP_USERDATA, MSG, PM_REMOVE, SW_SHOW, WM_CHAR, WM_CLOSE, WM_DESTROY, WM_IME_COMPOSITION,
+    AdjustWindowRect, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CreateWindowExW, DefWindowProcW,
+    DestroyWindow, DispatchMessageW, GWLP_USERDATA, GetMessageExtraInfo, GetWindowLongPtrW, MSG,
+    PM_REMOVE, PeekMessageW, PostQuitMessage, RegisterClassW, SW_SHOW, SetWindowLongPtrW,
+    ShowWindow, TranslateMessage, WM_CHAR, WM_CLOSE, WM_DESTROY, WM_IME_COMPOSITION,
     WM_IME_ENDCOMPOSITION, WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS,
     WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE,
     WM_MOUSEWHEEL, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSCHAR, WM_SYSKEYDOWN, WM_SYSKEYUP,
-    WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW, WS_CAPTION, WS_EX_LEFT, WS_MINIMIZEBOX,
-    WS_OVERLAPPED, WS_SYSMENU, WS_VISIBLE,
+    WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW, WS_CAPTION, WS_EX_LEFT, WS_MINIMIZEBOX, WS_OVERLAPPED,
+    WS_SYSMENU, WS_VISIBLE,
 };
+use windows::core::{Interface, PCWSTR};
 
 use dxgi_capture_poc::capture::create_d3d11_device;
 
-use sardp::frame_source::Clock;
-use crate::inject::{button, modifier, INJECTED_EXTRA_INFO};
+use crate::inject::{INJECTED_EXTRA_INFO, button, modifier};
 use crate::keymap;
+use sardp::frame_source::Clock;
 
 /// Input the user gave the window (3W-1-d-4), in window client-area
 /// pixels; the client maps positions to the stream's pixel space and
@@ -102,12 +106,26 @@ pub enum WindowInput {
     Text(String),
     /// In-progress IME composition (`WM_IME_COMPOSITION`); empty text
     /// when the composition ends.
-    ImeComposition { text: String, caret: u16 },
-    MouseMove { x: i32, y: i32 },
+    ImeComposition {
+        text: String,
+        caret: u16,
+    },
+    MouseMove {
+        x: i32,
+        y: i32,
+    },
     /// `button` per `inject::button`.
-    MouseButton { button: u8, down: bool, x: i32, y: i32 },
+    MouseButton {
+        button: u8,
+        down: bool,
+        x: i32,
+        y: i32,
+    },
     /// `WHEEL_DELTA` (120) units.
-    Wheel { dx: i16, dy: i16 },
+    Wheel {
+        dx: i16,
+        dy: i16,
+    },
     /// The window lost keyboard focus: whatever the client reported as
     /// held down should be released on the remote side.
     FocusLost,
@@ -262,7 +280,9 @@ impl H264DisplayWindow {
             let shared = shared.clone();
             std::thread::Builder::new()
                 .name("sardp-win-display".into())
-                .spawn(move || worker_main(config, clock, rx, timing_tx, input_tx, ready_tx, shared))
+                .spawn(move || {
+                    worker_main(config, clock, rx, timing_tx, input_tx, ready_tx, shared)
+                })
                 .map_err(|e| WinDisplayError::Init(format!("spawn display thread: {e}")))?
         };
 
@@ -275,7 +295,7 @@ impl H264DisplayWindow {
             Err(_) => {
                 return Err(WinDisplayError::Init(
                     "display thread did not become ready within 15s".into(),
-                ))
+                ));
             }
         }
 
@@ -348,7 +368,15 @@ fn worker_main(
     }
 
     let mut ready_tx = Some(ready_tx);
-    if let Err(e) = run_worker(config, clock, rx, timing_tx, input_tx, &mut ready_tx, &shared) {
+    if let Err(e) = run_worker(
+        config,
+        clock,
+        rx,
+        timing_tx,
+        input_tx,
+        &mut ready_tx,
+        &shared,
+    ) {
         if let Some(ready) = ready_tx.take() {
             let _ = ready.send(Err(e));
         } else {
@@ -427,13 +455,14 @@ fn run_worker(
     unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, state as isize) };
     let _user_data = UserDataGuard { hwnd, state };
 
-    let (device, context) = create_d3d11_device(
-        D3D11_CREATE_DEVICE_VIDEO_SUPPORT | D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-    )
-    .map_err(|err| e("D3D11CreateDevice", err))?;
-    let multithread: ID3D11Multithread = device.cast().map_err(|err| e("ID3D11Multithread", err))?;
+    let (device, context) =
+        create_d3d11_device(D3D11_CREATE_DEVICE_VIDEO_SUPPORT | D3D11_CREATE_DEVICE_BGRA_SUPPORT)
+            .map_err(|err| e("D3D11CreateDevice", err))?;
+    let multithread: ID3D11Multithread =
+        device.cast().map_err(|err| e("ID3D11Multithread", err))?;
     let _ = unsafe { multithread.SetMultithreadProtected(true) };
-    let video_device: ID3D11VideoDevice = device.cast().map_err(|err| e("ID3D11VideoDevice", err))?;
+    let video_device: ID3D11VideoDevice =
+        device.cast().map_err(|err| e("ID3D11VideoDevice", err))?;
     let video_context: ID3D11VideoContext =
         context.cast().map_err(|err| e("ID3D11VideoContext", err))?;
 
@@ -588,13 +617,19 @@ impl Presenter {
             // Present only if the swap chain can take it right now;
             // otherwise the frame stays decoded-but-unshown (it may still
             // be a reference for the next one) and the newer frame wins.
-            let ready =
-                unsafe { WaitForSingleObject(*frame_latency_waitable, 0) } == WAIT_OBJECT_0;
+            let ready = unsafe { WaitForSingleObject(*frame_latency_waitable, 0) } == WAIT_OBJECT_0;
             trace(format!(
                 "decoded texture subresource={subresource}, swap chain ready={ready}"
             ));
             if ready {
-                present_nv12(video_device, video_context, swap_chain, decoder, &texture, subresource)?;
+                present_nv12(
+                    video_device,
+                    video_context,
+                    swap_chain,
+                    decoder,
+                    &texture,
+                    subresource,
+                )?;
                 trace("presented");
             }
             let display_ts = clock();
@@ -683,7 +718,10 @@ impl Presenter {
             OutputHeight: self.window_height,
             Usage: D3D11_VIDEO_USAGE_PLAYBACK_NORMAL,
         };
-        let enumerator = unsafe { self.video_device.CreateVideoProcessorEnumerator(&content_desc)? };
+        let enumerator = unsafe {
+            self.video_device
+                .CreateVideoProcessorEnumerator(&content_desc)?
+        };
         let processor = unsafe { self.video_device.CreateVideoProcessor(&enumerator, 0)? };
 
         Ok(Decoder {
@@ -695,7 +733,6 @@ impl Presenter {
             frames_decoded: 0,
         })
     }
-
 }
 
 /// NV12 (decoder surface, possibly one slice of a texture array) ->
@@ -896,7 +933,10 @@ fn create_swap_chain(
         Height: height,
         Format: DXGI_FORMAT_B8G8R8A8_UNORM,
         Stereo: false.into(),
-        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
         BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
         BufferCount: 2,
         Scaling: DXGI_SCALING_STRETCH,
@@ -1154,7 +1194,10 @@ fn read_composition(hwnd: HWND) -> Option<(String, u16)> {
             buf.truncate(written as usize / 2);
         }
         let caret = unsafe { ImmGetCompositionStringW(himc, GCS_CURSORPOS, None, 0) }.max(0);
-        Some((String::from_utf16_lossy(&buf), caret.min(i32::from(u16::MAX)) as u16))
+        Some((
+            String::from_utf16_lossy(&buf),
+            caret.min(i32::from(u16::MAX)) as u16,
+        ))
     })();
     let _ = unsafe { ImmReleaseContext(hwnd, himc) };
     result
