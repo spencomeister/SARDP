@@ -304,3 +304,61 @@ sardp-server 側の設計要件として:
   で該当ペインを開いて誘導する(モーダルは当てにできない、20 番)。
 - **「権限待ち」を終端状態にしない**。許可後の反映にはプロセスの再起動が必要なので、
   再起動を促すか、自分で exec し直す経路を用意する。
+
+### 23. 3M-1-b: VideoToolbox のエンコードはプロセス外で走る。解放漏れを in-process の指標では検出できない
+
+`VTCompressionSession` の実体は同一プロセス内ではなく **`VTEncoderXPCService`**(VideoToolbox.framework の
+XPCServices)で動きます。エンコード中に確認:
+
+```
+17539 .../VideoToolbox.framework/Versions/A/XPCServices/VTEncoderXPCService.xpc/...
+```
+
+このため、3W-1 で使ったような「起動・停止を繰り返して RSS / スレッド数 / FD 数を見る」リーク検査は
+**VideoToolbox 側の解放漏れに対して無力**です。実際に対照実験として
+`VTCompressionSessionInvalidate` を意図的に外して 10 サイクル回しましたが、
+RSS(約 33.9MB)・スレッド数(18)・FD 数(20)・`VTEncoderXPCService` のプロセス数
+(いずれもピーク baseline+1、終了後 baseline に復帰)のすべてで**差が出ませんでした**。
+ARC の解放だけでもセッションは畳まれているように見えます。
+
+- `sardp-mac/examples/desktop_source.rs --cycles N` はこの検査を行いますが、上記のとおり
+  **「各解放呼び出しが効いていること」の証明にはなりません**。証明できるのは
+  「再起動を繰り返してもパイプラインが in-process の資源を溜めないこと」までです。
+- `VTCompressionSessionInvalidate` はドキュメント上の teardown 手順なので、
+  観測できないとしても無条件に呼んでいます(規約に従うのであって、この機が罰してくれるからではない)。
+- **未対応**: XPC サービス側の資源を観測する手段(`footprint`/`vmmap` を
+  `VTEncoderXPCService` に対して取る等)は未整備。長時間稼働での再検証が要ります。
+
+### 24. 3M-1-b: エンコード遅延の実測 — 3420x2224 で p50 16〜18ms
+
+`sardp-mac` の `DesktopH264Source` で計測した capture→encode-done(同一の単調時計):
+
+| 条件 | p50 | p95 | 最大 |
+| --- | --- | --- | --- |
+| 3420x2224(内蔵ディスプレイのネイティブ)、8Mbps、High profile | 16〜18ms | 22〜26ms | 31〜39ms |
+
+Windows(NVENC)の 7〜10ms より大きいですが、画素数が約 3.7 倍(7.6MP)であることを考えると
+概ね妥当です。フレーム間隔が 100ms 以上空く場面でも遅延は 16ms 前後で一定だったので、
+DR-036 で Windows が踏んだ「フレーム N の出力を N+1 の入力時まで回収しない」型の
+1 フレーム遅れではなく、素のエンコード時間です。
+
+含意: Part 8 の目標(LAN 50ms)に対してエンコードだけで 16ms を使います。3M-1-d で M6 の
+測定ハーネスを回すときは、**ネイティブ解像度のまま配信するのか、`SCStreamConfiguration.width/height`
+で縮小するのか**を判断材料込みで決める必要があります(現在の実装はネイティブ固定)。
+
+### 25. `cargo:rustc-link-arg` は依存クレートに伝播しない(Swift ランタイムの rpath)
+
+`tools/sck-capture-poc/build.rs` が出す `cargo:rustc-link-lib` / `-search` は依存クレートの
+バイナリまで届きますが、`cargo:rustc-link-arg` は**それを出したパッケージにしか適用されません**。
+Swift ランタイムは SDK の `.tbd` 経由でリンクされ、install name が `@rpath/libswift*.dylib` のため、
+rpath が無いバイナリは起動時に落ちます:
+
+```
+dyld[16971]: Library not loaded: @rpath/libswift_Concurrency.dylib
+  Reason: no LC_RPATH's found
+```
+
+`sardp-mac/build.rs` に `-Wl,-rpath,/usr/lib/swift` を 1 行足して解決しています。
+**シムをリンクするバイナリクレートはすべてこの 1 行が要ります** — 3M-1-d で macOS を
+`sardp-cli` に結線するときも同じです。
+

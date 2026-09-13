@@ -2,11 +2,18 @@
 name = "sck-capture-poc"
 version = "0.1.0"
 edition = "2024"
-description = "3M-1-a: ScreenCaptureKit capture PoC (TCC flow + frames to disk) via a Swift shim"
+description = "3M-1-a/b: the macOS OS boundary -- ScreenCaptureKit capture and VideoToolbox H.264 encode behind a C ABI, plus the PoC binaries that validate them"
 build = "build.rs"
 
 # Like tools/dxgi-capture-poc on Windows: the inherently-unsafe OS boundary
-# (here: the C ABI exported by shim/SckShim.swift) lives outside the core
-# `sardp` crate, which keeps `unsafe_code = "forbid"`.
+# (here: the C ABI exported by shim/*.swift) lives outside the core `sardp`
+# crate, which keeps `unsafe_code = "forbid"`. `sardp-mac` is the safe
+# product crate built on top, as `sardp-win` is on dxgi-capture-poc.
 
 [dependencies]
+# The NAL-unit handling that keeps IDRs self-contained despite unreliable
+# encoder metadata is platform-independent and already lives in the core
+# crate; the encode PoC checks its output with it rather than growing a
+# second copy. `sardp` never depends back on an OS crate (that is why the
+# binaries moved to `sardp-cli`), so this cannot cycle.
+sardp = { path = "../.." }

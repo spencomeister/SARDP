@@ -8,15 +8,27 @@
 # .app launched by `open` (LaunchServices) is its own responsible process,
 # which is what sardp-server will be when launched as a LaunchAgent.
 #
-# usage: make-app.sh [--release] [--no-run] [-- <poc args...>]
+# usage: make-app.sh [--package P] [--bin NAME | --example NAME] [--release]
+#                    [--no-run] [-- <args...>]
+#
+# The bundle identifier stays the same whichever binary is packaged, so one
+# Screen Recording grant covers all of them: the designated requirement is
+# `identifier ... and certificate leaf = H"..."`, and neither half changes
+# when the executable inside does.
 set -euo pipefail
 cd "$(dirname "$0")"
 export PATH="$HOME/.local/share/mise/shims:$PATH"
 
 profile=debug
 run=1
+pkg=sck-capture-poc
+kind=bin
+binname=sck-capture-poc
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --package) pkg="$2"; shift 2 ;;
+    --bin) kind=bin; binname="$2"; shift 2 ;;
+    --example) kind=example; binname="$2"; shift 2 ;;
     --release) profile=release; shift ;;
     --no-run) run=0; shift ;;
     --) shift; break ;;
@@ -24,14 +36,19 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [[ $profile == release ]]; then cargo build --release -p sck-capture-poc; else cargo build -p sck-capture-poc; fi
-bin="$(cargo metadata --format-version 1 --no-deps | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')/$profile/sck-capture-poc"
+build=(cargo build -p "$pkg" "--$kind" "$binname")
+# An `if`, not `[[ ... ]] && ...`: under `set -e` a false AND-list as the
+# last command would abort the script.
+if [[ $profile == release ]]; then build+=(--release); fi
+"${build[@]}"
+target="$(cargo metadata --format-version 1 --no-deps | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')"
+if [[ $kind == example ]]; then bin="$target/$profile/examples/$binname"; else bin="$target/$profile/$binname"; fi
 
 bundle_id="${SARDP_BUNDLE_ID:-io.sardp.sck-capture-poc}"
-app="$(dirname "$bin")/SckCapturePoC.app"
+app="$target/$profile/SckCapturePoC.app"
 rm -rf "$app"
 mkdir -p "$app/Contents/MacOS"
-cp "$bin" "$app/Contents/MacOS/sck-capture-poc"
+cp "$bin" "$app/Contents/MacOS/$binname"
 cat > "$app/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -39,7 +56,7 @@ cat > "$app/Contents/Info.plist" <<EOF
 <dict>
   <key>CFBundleIdentifier</key><string>$bundle_id</string>
   <key>CFBundleName</key><string>SckCapturePoC</string>
-  <key>CFBundleExecutable</key><string>sck-capture-poc</string>
+  <key>CFBundleExecutable</key><string>$binname</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleVersion</key><string>1</string>
   <key>CFBundleShortVersionString</key><string>0.1</string>

@@ -1,8 +1,10 @@
-# sck-capture-poc (3M-1-a)
+# sck-capture-poc (3M-1-a / 3M-1-b)
 
 `docs/sardp-stage3-os-integration-roadmap.md`のmacOS 3M-1: 在席キャプチャ・エンコード基盤の
-単体疎通確認。Windowsの`tools/dxgi-capture-poc`と同じ位置づけで、SARDP本体(`sardp`クレート)とは
-接続しない独立したCargoプロジェクト(ワークスペースのメンバーだが`default-members`には含めない)。
+単体疎通確認と、その**OS境界そのもの**。Windowsの`tools/dxgi-capture-poc`と同じ位置づけで、
+`unsafe`な部分(Swiftシムが公開するC ABI)はすべてここに閉じ込め、安全なAPIだけを
+`sardp-mac`(Windowsの`sardp-win`に相当)が使う。ワークスペースのメンバーだが
+`default-members`には含めない。
 
 ## 方針: Swiftシム + C ABI
 
@@ -22,8 +24,15 @@ NSStringキーのCMSampleBuffer attachment)なので、ロードマップの判�
 - `src/shim.rs`: 安全なRustラッパー。`Session`が`Drop`で`sardp_sck_stop`を呼ぶ。
 - `src/main.rs`: PoC本体(下記)。
 
-VideoToolbox(3M-1-b)も同じシムに載せる予定(C APIだが、CMSampleBuffer/CMFormatDescriptionの
-扱いがSwift側で完結する方が短い)。CGEvent(3M-1-c)は純粋なC APIなのでRustから直接呼ぶ案も残す。
+- `shim/VtEncoder.swift`: VideoToolboxに触れる唯一の場所(3M-1-b)。SCKが作った
+  `CVPixelBuffer`をそのまま`VTCompressionSession`に渡し(コピーなし、色変換なし)、
+  **Annex-B**に直したアクセスユニットをCコールバックで返す。`src/vt.rs`が安全なラッパーで、
+  `Encoder`が`Drop`でflush→invalidate→releaseする。
+- SCKのフレームコールバックは`CVPixelBufferRef`も渡す(コールバックの間だけ有効)。
+  NV12は平面フォーマットで単一のベースアドレスを持たないので、`bgra`はNULLになり
+  `pixel_buffer`だけが意味を持つ。BGRAはピクセルが欲しい呼び出し側用。
+
+CGEvent(3M-1-c)は純粋なC APIなのでRustから直接呼ぶ案も残す。
 
 ## バイナリ
 
@@ -34,7 +43,15 @@ VideoToolbox(3M-1-b)も同じシムに載せる予定(C APIだが、CMSampleBuff
   - `--frames N` 保存枚数(既定10)、`--fps N` 最小フレーム間隔の逆数(既定10)、
     `--no-request` 権限ダイアログを出さない、`--wait-secs N` 権限待ち上限、
     `--force-sck` CGのpreflight/要求を飛ばしてSCK自身に権限を判断させる、`--cursor`。
+- **`vt_h264_encode`**: 3M-1-b。メインディスプレイをNV12でキャプチャ→VideoToolboxで
+  H.264エンコード→Annex-Bを`.h264`に書き出す。「バイトが出た」以上のことを確認する:
+  ハードウェアエンコーダが実際に使われたか(セッションから読み戻す)、すべてのIDRが
+  自己完結しているか(仕様2.10、`sardp::h264`で判定)、入出力とエンコーダ自身のドロップの収支。
+  - `--frames N` `--fps N` `--bitrate BPS` `--all-idr` `--idr-every N` `--out FILE`
 - **`make-app.sh`**: ビルド結果を最小の`.app`バンドルに包んで署名し、`open`で起動する。
+  `--package P` / `--bin N` / `--example N`で対象を選べる(`sardp-mac`のexampleも包める)。
+  バンドルIDは常に同じなので、**画面収録の許可は1回で全バイナリに効く**
+  (指定要件が`identifier ... and certificate leaf`で、中の実行ファイルが変わっても両方変わらない)。
   **TCCの検証はこの経路でのみ意味がある**(下記)。署名IDは既定で`SARDP Dev Signing`
   (自己署名、下記4節)。`SARDP_SIGN_IDENTITY=-`で明示的にad-hocにできるが、**ad-hoc署名は
   既存のTCC許可を破壊する**ので通常は使わない。
@@ -44,6 +61,11 @@ export PATH="$HOME/.local/share/mise/shims:$PATH"   # このマシンのRustはm
 cargo build -p sck-capture-poc
 tools/sck-capture-poc/make-app.sh -- --frames 5          # .app化 → 署名 → open → ログ表示
 tools/sck-capture-poc/make-app.sh --no-run              # ビルドと署名だけ
+
+# 3M-1-b: エンコードPoC と、sardp-mac の DesktopH264Source 疎通確認
+tools/sck-capture-poc/make-app.sh --bin vt_h264_encode -- --frames 90 --out /tmp/out.h264
+tools/sck-capture-poc/make-app.sh --package sardp-mac --example desktop_source -- --cycles 6
+ffprobe -v error -select_streams v -show_entries frame=pict_type -of csv=p=0 /tmp/out.h264 | sort | uniq -c
 ```
 
 `captures/`は実画面を含むため`.gitignore`で除外している。
@@ -195,6 +217,53 @@ let displayTimeNs = UInt64(max(0, displayTime) * 1_000_000_000.0)  // ← Swift�
 値がuptimeと一致することで裏が取れる。
 
 3W-1と同じ教訓の別形: **OSが返すメタデータの単位を推測しない**。
+
+## VideoToolboxエンコード疎通の結果(3M-1-b、2026-09-13)
+
+`vt_h264_encode`(90フレーム、`--fps 30 --idr-every 30`、内蔵ディスプレイ 3420x2224px):
+
+```
+VideoToolbox session ready; hardware encoder in use: true
+frame 1: 213522 bytes, idr=true self_contained=true capture->encode=31323us nal_types=[7, 8, 6, 5]
+frame 2:  37333 bytes, idr=false ...                                        nal_types=[1]
+encoder: inputs=90 outputs=90 dropped_by_encoder=0 callback_errors=0 hardware=true
+capture->encode-done: p50=16355us p95=22218us max=31323us
+IDRs: 3 (not self-contained: 0); encoder's sync flag disagreed with the NAL units: 0
+```
+
+`ffprobe`で検証: `h264 / High / 3420x2224 / yuv420p`、3 I + 87 P(Bフレームなし =
+`AllowFrameReordering=false`が効いている)、`ffmpeg -f null -`でデコードエラーなし。
+
+`sardp-mac`の`DesktopH264Source`経由(`examples/desktop_source.rs`)でも同じ結果で、
+`request_idr()`で要求したIDRが`nal_types=[7, 8, 6, 5]`(SPS/PPS込み)で出ることを確認済み。
+readyまで103〜158ms、drop完了まで24〜50ms。
+
+### VideoToolbox固有で気をつけた点
+
+- **SPS/PPSはビットストリームに入らない**。VideoToolboxはパラメータセットを
+  format descriptionにしか置かないので、IDRのバイト列だけでは単体デコードできない
+  (仕様2.10違反)。シムが`CMVideoFormatDescriptionGetH264ParameterSetAtIndex`から
+  取り出してAnnex-Bで別途通知し、`sardp::h264::ParameterSetCache`が前置する。
+  Windowsの`MF_MT_MPEG_SEQUENCE_HEADER`と同じ役割。
+- **出力はAVCC(長さ前置)**。4バイト(可変、`nalUnitHeaderLength`)の長さをスタートコードに
+  書き換えている。長さが壊れていればそこで打ち切る(バッファ外を読まない)。
+- **`CMBlockBuffer`は連続とは限らない**。`CMBlockBufferIsRangeContiguous`で確認し、
+  必要なときだけ`CMBlockBufferCreateContiguous`でコピーする。
+- **ハードウェアかどうかは要求ではなく結果を読む**。
+  `EnableHardwareAcceleratedVideoEncoder`は要求にすぎないので、
+  `kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder`を読み戻して報告する。
+- **`EncodeFrame`が`noErr`でもフレームは出ないことがある**。`infoFlagsOut`の
+  `frameDropped`と、非同期コールバック側の`status`の両方を数えている。
+- **キーフレーム判定はバイト列で行う**。`kCMSampleAttachmentKey_NotSync`はヒントとして
+  渡すだけで、`sardp::h264::is_idr_access_unit`が決める(3W-1-bでMFTのフラグが
+  信用できなかったのと同じ扱い)。実測では両者の不一致は0件だったが、判定は変えていない。
+- **プロパティ適用失敗の扱いを分けている**。`AllowFrameReordering`(と全IDRモードの
+  `MaxKeyFrameInterval`)は正しさに関わるので失敗したらセッションを破棄して返す。
+  それ以外は警告してエンコーダの既定に任せる。
+- **解放は全経路で**。`VTCompressionSessionCreate`が成功した後にプロパティ設定が
+  失敗しても`invalidate`してから返す。`deinit`が最後の砦。ただし
+  **解放漏れの検出はこのマシンではできない**(KNOWN_ISSUES #23: エンコードは
+  `VTEncoderXPCService`でプロセス外実行されるため)。
 
 ## このマシン固有のメモ
 

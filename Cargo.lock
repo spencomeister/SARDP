@@ -917,6 +917,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "sardp-mac"
+version = "0.1.0"
+dependencies = [
+ "sardp",
+ "sck-capture-poc",
+ "tokio",
+]
+
+[[package]]
 name = "sardp-win"
 version = "0.1.0"
 dependencies = [
@@ -938,6 +947,9 @@ dependencies = [
 [[package]]
 name = "sck-capture-poc"
 version = "0.1.0"
+dependencies = [
+ "sardp",
+]
 
 [[package]]
 name = "security-framework"

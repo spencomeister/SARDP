@@ -25,6 +25,12 @@ import ScreenCaptureKit
 /// SCK delivers (including `idle`/`blank` frames that carry no new image;
 /// then `bgra` is NULL and width/height/stride are 0).
 ///
+/// `pixel_buffer` is the frame's `CVPixelBufferRef`, valid only for the
+/// duration of the call: hand it to `sardp_vt_encoder_encode` to encode
+/// without a copy. `bgra` is the mapped 32BGRA bytes and is NULL for a
+/// planar format (NV12), which has no single base address -- an NV12
+/// stream is for the encoder, a BGRA one for a caller that wants pixels.
+///
 /// `dirty` points at `dirty_count * 4` doubles: x, y, w, h of each dirty
 /// rect in *points* (the stream's content coordinate space, origin
 /// top-left of the captured display). `content_scale`/`scale_factor` are
@@ -40,7 +46,8 @@ public typealias SardpSckFrameCallback = @convention(c) (
     _ dirty: UnsafePointer<Double>?,
     _ dirty_count: UInt32,
     _ content_scale: Double,
-    _ scale_factor: Double
+    _ scale_factor: Double,
+    _ pixel_buffer: UnsafeMutableRawPointer?
 ) -> Void
 
 /// Called (once) if the stream stops on its own with an error.
@@ -131,20 +138,31 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else {
             dirtyScratch.withUnsafeBufferPointer { d in
                 onFrame(ctx, nil, 0, 0, 0, Int32(statusRaw), displayTimeNs,
-                        d.baseAddress, dirtyCount, contentScale, scaleFactor)
+                        d.baseAddress, dirtyCount, contentScale, scaleFactor, nil)
+            }
+            return
+        }
+        let width = UInt32(CVPixelBufferGetWidth(pixelBuffer))
+        let height = UInt32(CVPixelBufferGetHeight(pixelBuffer))
+        let handle = Unmanaged.passUnretained(pixelBuffer).toOpaque()
+        // Only a packed format has a single base address worth mapping;
+        // for a planar one (NV12 -> VideoToolbox) mapping it would be
+        // wasted work, so the callback gets the buffer handle alone.
+        if CVPixelBufferIsPlanar(pixelBuffer) {
+            dirtyScratch.withUnsafeBufferPointer { d in
+                onFrame(ctx, nil, width, height, 0, Int32(statusRaw), displayTimeNs,
+                        d.baseAddress, dirtyCount, contentScale, scaleFactor, handle)
             }
             return
         }
         CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
         defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
-        let width = UInt32(CVPixelBufferGetWidth(pixelBuffer))
-        let height = UInt32(CVPixelBufferGetHeight(pixelBuffer))
         let stride = UInt32(CVPixelBufferGetBytesPerRow(pixelBuffer))
         let base = CVPixelBufferGetBaseAddress(pixelBuffer)?
             .assumingMemoryBound(to: UInt8.self)
         dirtyScratch.withUnsafeBufferPointer { d in
             onFrame(ctx, base, width, height, stride, Int32(statusRaw), displayTimeNs,
-                    d.baseAddress, dirtyCount, contentScale, scaleFactor)
+                    d.baseAddress, dirtyCount, contentScale, scaleFactor, handle)
         }
     }
 
@@ -154,7 +172,7 @@ final class Session: NSObject, SCStreamOutput, SCStreamDelegate {
     }
 }
 
-private func putError(_ buf: UnsafeMutablePointer<CChar>?, _ len: Int, _ msg: String) {
+func putError(_ buf: UnsafeMutablePointer<CChar>?, _ len: Int, _ msg: String) {
     guard let buf = buf, len > 0 else { return }
     let bytes = Array(msg.utf8.prefix(len - 1))
     for (i, b) in bytes.enumerated() { buf[i] = CChar(bitPattern: b) }

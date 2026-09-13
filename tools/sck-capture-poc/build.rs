@@ -62,6 +62,11 @@ fn main() {
     println!("cargo:rustc-link-lib=static=SardpSckShim");
     // Swift runtime: the .tbd stubs are in the SDK, the dylibs in /usr/lib/swift.
     println!("cargo:rustc-link-search=native={sdk}/usr/lib/swift");
+    // NOTE: `-l`/`-L` directives reach dependent crates' binaries, but a
+    // link *arg* does not -- it applies only to this package. A binary in
+    // another crate that links this shim therefore needs its own
+    // `-Wl,-rpath,/usr/lib/swift` (see `sardp-mac/build.rs`), or it dies
+    // at launch with "Library not loaded: @rpath/libswift*.dylib".
     println!("cargo:rustc-link-arg=-Wl,-rpath,/usr/lib/swift");
     for lib in [
         "swiftCore",
@@ -72,6 +77,7 @@ fn main() {
         "swiftDarwin",
         "swiftCoreGraphics",
         "swiftCoreMedia",
+        "swiftVideoToolbox",
         "swiftCoreImage",
         "swiftXPC",
         "swiftIOKit",
@@ -82,6 +88,7 @@ fn main() {
     }
     for fw in [
         "ScreenCaptureKit",
+        "VideoToolbox",
         "CoreMedia",
         "CoreVideo",
         "CoreGraphics",

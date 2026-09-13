@@ -12,15 +12,15 @@
 //!    writes them as sequential BMPs plus a `frames.log` with the SCK
 //!    per-frame metadata (status, dirty rects, display time).
 
-mod shim;
-
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use shim::{DirtyRect, FrameRef, FrameSink, FrameStatus, PixelFormat, Session, StartError};
+use sck_capture_poc::shim::{
+    self, DirtyRect, FrameRef, FrameSink, FrameStatus, PixelFormat, Session, StartError,
+};
 
 struct Args {
     frames: usize,
@@ -175,7 +175,7 @@ fn write_bmp(
     for y in (0..height as usize).rev() {
         row.clear();
         let src = &bgra[y * stride as usize..y * stride as usize + width as usize * 4];
-        for px in src.chunks_exact(4) {
+        for px in src.as_chunks::<4>().0 {
             row.extend_from_slice(&px[..3]);
         }
         row.extend_from_slice(&pad);
@@ -248,7 +248,7 @@ fn main() {
         std::thread::sleep(Duration::from_secs(2));
         polls += 1;
         granted = shim::preflight_screen_capture_access();
-        if polls % 5 == 0 || granted {
+        if polls.is_multiple_of(5) || granted {
             log(&format!(
                 "waiting for screen recording permission... preflight={granted} ({}s left)",
                 deadline.saturating_duration_since(Instant::now()).as_secs()
@@ -373,7 +373,7 @@ fn main() {
                 path.file_name().unwrap().to_string_lossy(),
                 t.elapsed()
             ));
-        } else if total <= 20 || total % 50 == 0 {
+        } else if total <= 20 || total.is_multiple_of(50) {
             log(&line);
         }
     }

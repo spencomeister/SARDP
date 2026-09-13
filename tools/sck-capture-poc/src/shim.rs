@@ -6,6 +6,7 @@
 
 use std::ffi::{CStr, c_char, c_void};
 use std::fmt;
+use std::marker::PhantomData;
 
 /// `SCFrameStatus` as delivered in the sample buffer attachments.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,6 +54,26 @@ pub struct FrameRef<'a> {
     pub dirty: &'a [DirtyRect],
     pub content_scale: f64,
     pub scale_factor: f64,
+    /// The frame's pixel buffer. `None` for a status frame with no image.
+    pub pixel_buffer: Option<PixelBufferRef<'a>>,
+}
+
+/// A borrowed `CVPixelBufferRef`. ScreenCaptureKit only guarantees it for
+/// the duration of the frame callback, so the lifetime is the enclosing
+/// [`FrameRef`]'s: the borrow checker is what stops it being stashed and
+/// used after the callback returns. Hand it to
+/// [`crate::vt::Encoder::encode`] to encode without a copy.
+#[derive(Debug, Clone, Copy)]
+pub struct PixelBufferRef<'a> {
+    ptr: *mut c_void,
+    _frame: PhantomData<&'a ()>,
+}
+
+impl PixelBufferRef<'_> {
+    /// The raw `CVPixelBufferRef`, for the FFI call that consumes it.
+    pub(crate) fn as_ptr(self) -> *mut c_void {
+        self.ptr
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -107,6 +128,7 @@ type RawFrameCb = unsafe extern "C" fn(
     dirty_count: u32,
     content_scale: f64,
     scale_factor: f64,
+    pixel_buffer: *mut c_void,
 );
 type RawStoppedCb = unsafe extern "C" fn(ctx: *mut c_void, message: *const c_char);
 
@@ -199,6 +221,7 @@ impl Session {
             dirty_count: u32,
             content_scale: f64,
             scale_factor: f64,
+            pixel_buffer: *mut c_void,
         ) {
             let sink = unsafe { &mut *(ctx as *mut S) };
             let bgra = if bgra.is_null() || height == 0 || stride == 0 {
@@ -210,7 +233,9 @@ impl Session {
                 Vec::new()
             } else {
                 let raw = unsafe { std::slice::from_raw_parts(dirty, dirty_count as usize * 4) };
-                raw.chunks_exact(4)
+                raw.as_chunks::<4>()
+                    .0
+                    .iter()
                     .map(|c| DirtyRect {
                         x: c[0],
                         y: c[1],
@@ -219,6 +244,10 @@ impl Session {
                     })
                     .collect()
             };
+            let pixel_buffer = (!pixel_buffer.is_null()).then_some(PixelBufferRef {
+                ptr: pixel_buffer,
+                _frame: PhantomData,
+            });
             sink.on_frame(FrameRef {
                 bgra,
                 width,
@@ -229,6 +258,7 @@ impl Session {
                 dirty: &dirty,
                 content_scale,
                 scale_factor,
+                pixel_buffer,
             });
         }
         unsafe extern "C" fn stopped_tramp<S: FrameSink>(ctx: *mut c_void, message: *const c_char) {
