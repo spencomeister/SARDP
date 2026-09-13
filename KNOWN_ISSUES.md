@@ -408,3 +408,80 @@ dyld[16971]: Library not loaded: @rpath/libswift_Concurrency.dylib
 このタグはWindowsの`dwExtraInfo`と同じ役割で、3M-1-d で同一マシンのループバックE2Eを組むときに
 クライアント側がエコーループを断つのにも使います。
 
+### 28. 3M-1-d: sardp-cli への結線。プラットフォーム分岐の置き場所と、権限が片方だけ無い状態
+
+`sardp-server` は `#[cfg(windows)]` を macOS 用に複製するのではなく、**`use sardp_win as os` /
+`use sardp_mac as os` の別名 1 箇所**にまとめました。`sardp-win` と `sardp-mac` が意図的に
+同じ形の API(`DesktopH264Source`、`InjectCommand`、…)を出しているので、配線はほぼ 1 回書けば済みます。
+分岐条件そのものは `sardp-cli/build.rs` が出す `desktop_capture` cfg で、Linux(3G-1)を足すときは
+build.rs の 1 行だけです。
+
+本当に違う 2 箇所だけを関数に閉じ込めています:
+
+- `desktop_profile_tier()`: Windows は Main(77)、macOS は High(100)。ハードウェアエンコーダが
+  実際に出すプロファイルが違うため。Tier はどちらも 3。
+- `start_input_sink()`: `SendInput` は権限不要で失敗しない(`Self` を返す)のに対し、`CGEvent` は
+  アクセシビリティが要る(`Result` を返す)。
+
+**権限が片方だけ無い状態を設計上の状態として扱っています。** macOS では画面収録と
+アクセシビリティが独立なので、「映像は出るが入力は注入できない」は実際に起こります。
+その場合は接続を失敗させず `InputSink::Unavailable(reason)` にし、入力イベントが来たときに
+理由を出します。`InputSink::Log`(合成映像)と区別しているのは、**黙って捨てると
+クライアントのメッセージが届いていないように見える**からです。閲覧のみのセッションは
+アクセシビリティが無くても有用なので、接続ごと落とすのは過剰と判断しました。
+
+#### ループバック E2E の結果(2026-09-13)
+
+macOS のクライアントには入力を生む GUI がまだ無いので、`sardp-client --input-script` を足しました
+(移動 → クリック → ダブルクリック → ドラッグ → Shift+a → テキスト → ホイールの固定列)。
+安全のため `sardp-mac/examples/input_guard.rs` を先に起動します。これは**フィルタモードの
+イベントタップ**を持ち、`kCGEventSourceUserData` が `SARD` のイベントだけをアプリに届く前に
+破棄します(タグの無い実ユーザー入力は素通し)。タグはイベント側に乗るのでプロセスをまたいで効きます。
+
+```
+tools/sck-capture-poc/make-app.sh --app-name SardpGuard  --package sardp-mac --example input_guard --no-run
+tools/sck-capture-poc/make-app.sh --app-name SardpServer --package sardp-cli --bin sardp-server  --no-run
+open -n --stdout guard.log  --stderr guard.log  target/debug/SardpGuard.app  --args --secs 120
+open -n --stdout server.log --stderr server.log target/debug/SardpServer.app --args \
+    --capture desktop --all-idr --bind 127.0.0.1:4455 --cert-out /tmp/cert.pem
+./target/debug/sardp-client --server 127.0.0.1:4455 --trust-cert /tmp/cert.pem --input-script
+```
+
+サーバー側:
+
+```
+desktop capture started: 3420x2224 @ 60Hz, hardware H.264 profile 100, all-IDR (--all-idr)
+input injection: CGEvent, output origin (0, 0) pt, scale 2, text char delay 50ms
+input summary: injected=24 skipped_character_keys=2 dropped_not_granted=0 mouse_moves=4
+encoder: inputs=4085 outputs=4085 dropped_by_encoder=0 dropped_by_consumer=48
+connection ended cleanly
+```
+
+ガード側(実際に OS に届いたもの): 注入イベント 47 件を破棄、実ユーザーのイベント 363 件は素通し。
+内訳が計算どおりに閉じます:
+
+| 種別 | 件数 | 由来 |
+| --- | --- | --- |
+| mouseMoved | 5 | 明示的な移動 1 + ボタン押下前の位置決め 4 |
+| leftMouseDragged | 7 | ドラッグ中の明示的移動 3 + ボタン解放前の位置決め 4(押下中なのでドラッグになる) |
+| leftMouseDown / Up | 4 / 4 | クリック 3 + ドラッグ 1 |
+| flagsChanged | 2 | Shift の押下/解放(修飾キーは `flagsChanged` として届く、#27) |
+| keyDown / keyUp | 12 / 12 | テキスト "SARDP 3M-1-d" の 12 書記素クラスタ |
+| scrollWheel | 1 | ホイール 1 ノッチ |
+
+サーバーが `MouseButton` の直前に必ず位置決めの `MouseMove` を出す(「クライアントが見た場所に
+クリックを落とす」ため)ので、ボタンが押されている間の位置決めが `leftMouseDragged` になります。
+これは `sardp-mac::InputState` の「ボタン押下中の移動はドラッグ」規則がサーバーの実際の
+イベント列に対して意図どおり働いていることの確認でもあります。
+
+**`skipped_character_keys=2`**: スクリプトが送った `a` の押下/解放はサーバーが意図的に
+注入していません。仕様 4.4.1 / DR-025 の「IME が CLIENT_SIDE のとき、文字は `TextInput` が
+MUST の供給源で、合成中の生 `KeyEvent` を重ねて送ってはならない」に従った挙動です
+(修飾キーの Shift は文字キーではないので注入されています)。E2E が偶然この規則を踏んで、
+正しく効いていることが確認できました。
+
+遅延の実測は `docs/sardp-stage3-latency-measurements.md` の macOS 節に記録しています。
+要点: `transport` p50 6.6ms に対し `decode` p50 53.8ms が支配的で、これは
+`--display log`(フレームごとの `ffmpeg` 起動)のコストです。**macOS 版の永続デコーダ・
+クライアントが無いため、Windows の構成 A と同じ土俵での比較はまだできません。**
+

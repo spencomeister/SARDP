@@ -3,11 +3,12 @@ name = "sardp-cli"
 version = "0.1.0"
 edition = "2024"
 description = "SARDP PoC reference binaries (sardp-server / sardp-client)"
+build = "build.rs"
 
 # The binaries sit above both the core crate and the OS-integration
-# crates so that `sardp-win` (and, later, the macOS/Linux crates) can
-# depend on `sardp` for the shared types and H.264 helpers without a
-# dependency cycle. Nothing here is `unsafe`; the OS crates wrap that.
+# crates so that `sardp-win` / `sardp-mac` (and, later, Linux) can depend
+# on `sardp` for the shared types and H.264 helpers without a dependency
+# cycle. Nothing here is `unsafe`; the OS crates wrap that.
 
 [dependencies]
 sardp = { path = ".." }
@@ -17,6 +18,9 @@ tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "io-std",
 
 [target.'cfg(windows)'.dependencies]
 sardp-win = { path = "../sardp-win" }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+sardp-mac = { path = "../sardp-mac" }
 
 [lints.rust]
 unsafe_code = "forbid"

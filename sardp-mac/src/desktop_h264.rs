@@ -54,6 +54,7 @@ pub type MacCaptureError = SourceError;
 pub struct DesktopH264Source {
     worker: FrameWorker<EncodedFrame, SourceInfo>,
     force_idr: Arc<AtomicBool>,
+    backing_scale: f64,
 }
 
 impl DesktopH264Source {
@@ -71,11 +72,31 @@ impl DesktopH264Source {
                 move |ctx| run_worker(config, clock, ctx, force_idr),
             )?
         };
-        Ok(Self { worker, force_idr })
+        // `SourceInfo` is pixels (it is what the wire carries) while
+        // `CGEvent` works in points, so anything injecting into this
+        // output needs the ratio too -- see `backing_scale`.
+        let backing_scale = shim::main_display_info()
+            .map(|d| f64::from(d.pixels_w) / d.points_w)
+            .unwrap_or(1.0);
+        Ok(Self {
+            worker,
+            force_idr,
+            backing_scale,
+        })
     }
 
     pub fn info(&self) -> SourceInfo {
         *self.worker.info()
+    }
+
+    /// Pixels per point of the captured display: 2.0 on a Retina screen.
+    ///
+    /// [`SourceInfo`] deliberately stays in pixels -- that is what the
+    /// protocol carries and what every platform reports -- but macOS
+    /// input injection is in points, so `sardp_mac::InjectorConfig.scale`
+    /// wants this (KNOWN_ISSUES #27).
+    pub fn backing_scale(&self) -> f64 {
+        self.backing_scale
     }
 
     /// Next encoded frame, or `None` once the worker has stopped (an error

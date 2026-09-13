@@ -912,6 +912,7 @@ dependencies = [
  "ed25519-dalek",
  "quinn",
  "sardp",
+ "sardp-mac",
  "sardp-win",
  "tokio",
 ]

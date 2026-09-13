@@ -8,8 +8,13 @@
 # .app launched by `open` (LaunchServices) is its own responsible process,
 # which is what sardp-server will be when launched as a LaunchAgent.
 #
-# usage: make-app.sh [--package P] [--bin NAME | --example NAME] [--release]
-#                    [--no-run] [-- <args...>]
+# usage: make-app.sh [--package P] [--bin NAME | --example NAME]
+#                    [--app-name NAME] [--release] [--no-run] [-- <args...>]
+#
+# --app-name makes a *separate* bundle with the same identifier, so two
+# signed binaries (say a server and a guard) can run side by side without
+# overwriting each other. TCC matches on the designated requirement --
+# identifier plus certificate -- not on the path, so one grant covers both.
 #
 # The bundle identifier stays the same whichever binary is packaged, so one
 # Screen Recording grant covers all of them: the designated requirement is
@@ -24,8 +29,10 @@ run=1
 pkg=sck-capture-poc
 kind=bin
 binname=sck-capture-poc
+appname=SckCapturePoC
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --app-name) appname="$2"; shift 2 ;;
     --package) pkg="$2"; shift 2 ;;
     --bin) kind=bin; binname="$2"; shift 2 ;;
     --example) kind=example; binname="$2"; shift 2 ;;
@@ -45,7 +52,7 @@ target="$(cargo metadata --format-version 1 --no-deps | python3 -c 'import json,
 if [[ $kind == example ]]; then bin="$target/$profile/examples/$binname"; else bin="$target/$profile/$binname"; fi
 
 bundle_id="${SARDP_BUNDLE_ID:-io.sardp.sck-capture-poc}"
-app="$target/$profile/SckCapturePoC.app"
+app="$target/$profile/$appname.app"
 rm -rf "$app"
 mkdir -p "$app/Contents/MacOS"
 cp "$bin" "$app/Contents/MacOS/$binname"
@@ -55,7 +62,7 @@ cat > "$app/Contents/Info.plist" <<EOF
 <plist version="1.0">
 <dict>
   <key>CFBundleIdentifier</key><string>$bundle_id</string>
-  <key>CFBundleName</key><string>SckCapturePoC</string>
+  <key>CFBundleName</key><string>$appname</string>
   <key>CFBundleExecutable</key><string>$binname</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleVersion</key><string>1</string>

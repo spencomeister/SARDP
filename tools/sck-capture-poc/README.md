@@ -56,6 +56,7 @@ NSStringキーのCMSampleBuffer attachment)なので、ロードマップの判�
   - `--frames N` `--fps N` `--bitrate BPS` `--all-idr` `--idr-every N` `--out FILE`
 - **`make-app.sh`**: ビルド結果を最小の`.app`バンドルに包んで署名し、`open`で起動する。
   `--package P` / `--bin N` / `--example N`で対象を選べる(`sardp-mac`のexampleも包める)。
+  `--app-name N`で別バンドルにできる(同じIDのまま複数を同時に動かす用)。
   バンドルIDは常に同じなので、**画面収録の許可は1回で全バイナリに効く**
   (指定要件が`identifier ... and certificate leaf`で、中の実行ファイルが変わっても両方変わらない)。
   **TCCの検証はこの経路でのみ意味がある**(下記)。署名IDは既定で`SARDP Dev Signing`
@@ -75,7 +76,14 @@ ffprobe -v error -select_streams v -show_entries frame=pict_type -of csv=p=0 /tm
 
 # 3M-1-c: 入力注入。利用中のマシンで回しても安全(下記「安全に回す仕掛け」)
 tools/sck-capture-poc/make-app.sh --package sardp-mac --example input_e2e
+
+# 3M-1-d: sardp-cli のループバックE2E。--app-name で別バンドルにすると、
+# 同じバンドルID・同じ署名のまま複数の署名済みバイナリを同時に動かせる
+# (TCCの照合は指定要件で行われ、パスは見ないので許可は1回で足りる)
+tools/sck-capture-poc/make-app.sh --app-name SardpServer --package sardp-cli \
+    --bin sardp-server --no-run
 ```
+手順の全体と結果はKNOWN_ISSUES #28。
 
 `captures/`は実画面を含むため`.gitignore`で除外している。
 
