@@ -362,3 +362,49 @@ dyld[16971]: Library not loaded: @rpath/libswift_Concurrency.dylib
 **シムをリンクするバイナリクレートはすべてこの 1 行が要ります** — 3M-1-d で macOS を
 `sardp-cli` に結線するときも同じです。
 
+### 26. 3M-1-c: アクセシビリティは画面収録とは別のTCCゲートで、こちらはプロンプトが出る
+
+`CGEvent`でイベントを注入するには**アクセシビリティ(kTCCServiceAccessibility)**の許可が要ります。
+画面収録(kTCCServiceScreenCapture)とは完全に独立で、片方があってももう片方は要求し直しになります。
+
+画面収録と違い(#20)、こちらは`AXIsProcessTrustedWithOptions`でプロンプトが出ます
+(3M-1-a で`universalAccessAuthWarn`が461x181のダイアログを出すことを確認済み)。
+ただし到達点は同じで、`Update Access Record: kTCCServiceAccessibility ... to Denied (System Set)`
+が書かれてシステム設定の一覧に未チェックで載り、ユーザーがチェックを入れて許可されます。
+
+- `InputInjector::start`は`AXIsProcessTrusted()`を見て**起動時に失敗**します。
+  黙って落とされるイベントを投げ続けるより、呼び出し側が誘導できる形で失敗する方がよいという判断
+  (`CGEvent.post`には「システムに捨てられた」を伝える経路がありません)。
+  Windows の`SendInput`は権限不要なので、`sardp_win::InputInjector::start`が`Self`を返すのに対し
+  macOS 版は`Result`を返します。この非対称は本質的なものです。
+- **未計測**: 実行中のプロセスが許可の付与を検知できるか。画面収録では検知できないと実測しました(#22)が、
+  アクセシビリティでは測っていません。起動し直せば効くことだけ確認済みです。
+
+### 27. 3M-1-c: macOS の入力注入で、Windows と同じに書くと壊れるところ
+
+`sardp-mac::inject`が`sardp_win::inject`の直訳になっていない理由。いずれも
+`sardp-mac/examples/input_e2e.rs`がセッションイベントタップで実測して確認しています。
+
+| 事象 | 実測 |
+| --- | --- |
+| **修飾キーは状態であって打鍵ではない** | Command↓→a↓と送っても、`a`のイベント自身が`flags`にCommandを持っていなければショートカットにならない。`InputState`が押下中の修飾キーを追跡し、**すべての**イベント(マウスも含む)にflagsを付ける。実測: `keyDown key=0x00 flags=0x20100008`(NonCoalesced\|Command\|左Commandデバイスビット) |
+| **修飾キーは`flagsChanged`として届く** | Command の仮想キーコードで`keyDown`/`keyUp`をpostすると、macOS 側が`flagsChanged`(type 12, keycode 55)に変換して配送する。`flagsChanged`だけを見ているアプリにもちゃんと届く |
+| **ボタンを押したままの移動はドラッグ** | `mouseMoved`をpostしても多くのアプリはドラッグしない。押下中のボタンに応じて`leftMouseDragged`等に変える必要がある。実測: 押下中の3回の移動がすべて`leftMouseDragged`、`mouseMoved`は0件 |
+| **ダブルクリックにはクリック数が要る** | `leftMouseDown`を2回送るだけでは2回のシングルクリック。2回目に`kCGMouseEventClickState = 2`が要る。実測: 2回目が`click=2` |
+| **座標はポイント、キャプチャはピクセル** | キャプチャは3420x2224px、`CGEvent`は1710x1112pt。`InjectorConfig.scale`で割る。実測: ピクセル(1710,1112)→ポイント(855.0,556.0)、ウィンドウサーバの報告値と一致 |
+| **返ってくるflagsは送ったflagsではない** | ウィンドウサーバが`kCGEventFlagMaskNonCoalesced`(0x20000000)を必ずORする。flagsの比較はマスクしてから行うこと |
+| **左右の修飾キーの区別** | `kCGEventFlagMask*`だけでは左右が区別できない。IOKitの`NX_DEVICEL*/R*`ビット(0x1〜0x2000)を併せて立てる |
+
+**キーマップ**: `sardp-mac::keymap`はHID usage↔macOS仮想キーコード。macOSに対応キーが無いものは
+意図的に未マップにしています(Print Screen / Scroll Lock / Pause / Application / F21-F24、
+およびPC JISの カタカナひらがな・変換・無変換)。Apple JISキーボードは英数/かなをLANG2/LANG1
+(HID 0x91/0x90)として報告するのでそちらをマップしており、PC JISの3キーを無理に割り当てると
+双方向で曖昧になるため入れていません。
+
+**検証を安全に回す仕掛け**: `input_e2e`はイベントタップを**フィルタモード**で開き、
+自プロセスのタグ(`kCGEventSourceUserData` = `SARD`)が付いたイベントだけをアプリに届く前に破棄します。
+タグの無いイベント(実ユーザーの入力)は必ず素通しです。カーソル移動だけは意図的に通し
+(ピクセル→ポイント変換をウィンドウサーバ相手に検証する唯一の方法のため)、終了時に元の位置へ戻します。
+このタグはWindowsの`dwExtraInfo`と同じ役割で、3M-1-d で同一マシンのループバックE2Eを組むときに
+クライアント側がエコーループを断つのにも使います。
+

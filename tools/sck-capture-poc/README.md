@@ -32,7 +32,13 @@ NSStringキーのCMSampleBuffer attachment)なので、ロードマップの判�
   NV12は平面フォーマットで単一のベースアドレスを持たないので、`bgra`はNULLになり
   `pixel_buffer`だけが意味を持つ。BGRAはピクセルが欲しい呼び出し側用。
 
-CGEvent(3M-1-c)は純粋なC APIなのでRustから直接呼ぶ案も残す。
+- `shim/CgInject.swift`: CGEventとアクセシビリティ(TCC)に触れる唯一の場所(3M-1-c)。
+  純粋なC APIなのでRustから直接呼ぶ案もあったが、`CFRelease`規約をARCに任せられること、
+  `unsafe`をこのクレートに閉じ込める方針が一貫することからSwift側に置いた。
+  **意図的に「馬鹿」な作り**で、言われたイベントをそのままpostするだけ。どの修飾フラグを立てるか、
+  移動をドラッグにするか、クリック数をいくつにするかといった判断はすべて`sardp-mac::inject`側にあり、
+  ディスプレイもTCC許可も無い環境でユニットテストできる。`src/inject.rs`が安全なラッパー。
+  末尾のイベントタップは**検証専用**(下記)。
 
 ## バイナリ
 
@@ -66,6 +72,9 @@ tools/sck-capture-poc/make-app.sh --no-run              # ビルドと署名だ�
 tools/sck-capture-poc/make-app.sh --bin vt_h264_encode -- --frames 90 --out /tmp/out.h264
 tools/sck-capture-poc/make-app.sh --package sardp-mac --example desktop_source -- --cycles 6
 ffprobe -v error -select_streams v -show_entries frame=pict_type -of csv=p=0 /tmp/out.h264 | sort | uniq -c
+
+# 3M-1-c: 入力注入。利用中のマシンで回しても安全(下記「安全に回す仕掛け」)
+tools/sck-capture-poc/make-app.sh --package sardp-mac --example input_e2e
 ```
 
 `captures/`は実画面を含むため`.gitignore`で除外している。
@@ -264,6 +273,48 @@ readyまで103〜158ms、drop完了まで24〜50ms。
   失敗しても`invalidate`してから返す。`deinit`が最後の砦。ただし
   **解放漏れの検出はこのマシンではできない**(KNOWN_ISSUES #23: エンコードは
   `VTEncoderXPCService`でプロセス外実行されるため)。
+
+## 入力注入(CGEvent)とアクセシビリティ権限の結果(3M-1-c、2026-09-13)
+
+`sardp-mac/examples/input_e2e.rs`(`make-app.sh --package sardp-mac --example input_e2e`)。
+spec 2.12のコマンドを入れて、**セッションイベントタップから出てきたものを読み返して**確認する。
+`CGEvent.post`には「システムに捨てられた」を伝える経路が無いので、postの戻り値は当てにしない。
+
+```
+display 3420x2224px = 1710x1112pt at (0, 0); scale 2
+move to pixel (1710, 1112) -> expected point (855.0, 556.0); window server reports (855.0, 556.0)
+  [ok] a click arrives as a down/up pair with click count 1
+  [ok] and lands where the preceding move put the pointer
+  [ok] the second press carries click count 2
+  [ok] moves with the button held arrive as leftMouseDragged
+  [ok] and none of them as a plain mouseMoved
+  [ok] the `a` key-down carries the Command flag
+  [ok] and the left-Command device bit, so left/right are distinguishable
+  [ok] text arrives as keyboard events with no virtual key claimed
+  [ok] and carries no modifier flags (they would turn it into shortcuts)
+  [ok] both a full notch and a partial one produce a scroll
+all input checks passed
+```
+
+Windowsと同じに書くと壊れる箇所(修飾キーは状態、ドラッグ、クリック数、ポイント/ピクセル、
+返ってくるflagsにウィンドウサーバのビットが混ざる)はKNOWN_ISSUES #27に表でまとめてある。
+実測で分かった面白い点として、**Commandの仮想キーコードで`keyDown`をpostすると
+macOS側が`flagsChanged`(type 12)に変換して配送する** — `flagsChanged`だけを見ているアプリにも
+ちゃんと届く。
+
+### 利用中のマシンで安全に回す仕掛け
+
+入力注入のE2E検証は、素直に書くと「今フォーカスのあるアプリに本物のクリックとキーストロークが飛ぶ」。
+そこでイベントタップを**フィルタモード**(`.defaultTap` + `.headInsertEventTap`)で開き、
+自プロセスのタグ(`kCGEventSourceUserData` = `SARD`)が付いたイベントだけを、
+アプリに届く前に破棄している。タグの無いイベント(実ユーザーの入力)は必ず素通し
+(`consumeTagged && userData == SARDP_CG_USER_DATA`のときだけ`nil`を返す)。
+
+カーソル移動だけは意図的に通す。ピクセル→ポイント変換を**このプログラムの外側**の何かと
+突き合わせる唯一の方法だからで、終了時に元の位置へ戻す。
+
+このタグはWindowsの`dwExtraInfo`と同じ役割で、3M-1-dで同一マシンのループバックE2Eを組むときに
+クライアント側がエコーループを断つのにも使う。
 
 ## このマシン固有のメモ
 

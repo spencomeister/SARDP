@@ -19,11 +19,22 @@
 //! VideoToolbox H.264 compression session, with the encoded access units'
 //! Annex-B bytes handed to the caller.
 //!
-//! Client side and input injection (`CGEvent`, 3M-1-c) are still to come.
+//! Input injection ([`inject`], 3M-1-c): spec 2.12 messages -> `CGEvent`
+//! on a dedicated thread, with the HID usage <-> macOS virtual key table
+//! in [`keymap`]. Gated by Accessibility, which is a TCC permission
+//! independent of the Screen Recording one capture needs.
+//!
+//! The client side is still to come.
 
 pub mod desktop_h264;
+pub mod inject;
+pub mod keymap;
 
 pub use desktop_h264::{DesktopH264Source, MacCaptureError};
+pub use inject::{
+    InjectCommand, InjectorClosed, InjectorConfig, InputInjector, InputState, Post,
+    is_accessibility_trusted, request_accessibility_trust,
+};
 // Shared with the other platforms; re-exported so callers can name them
 // without depending on the core crate directly, as `sardp-win` does.
 pub use sardp::frame_source::{Clock, DesktopH264Config, EncodedFrame, SourceError, SourceInfo};
