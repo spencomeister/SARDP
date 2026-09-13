@@ -1,0 +1,12 @@
+[package]
+name = "sck-capture-poc"
+version = "0.1.0"
+edition = "2024"
+description = "3M-1-a: ScreenCaptureKit capture PoC (TCC flow + frames to disk) via a Swift shim"
+build = "build.rs"
+
+# Like tools/dxgi-capture-poc on Windows: the inherently-unsafe OS boundary
+# (here: the C ABI exported by shim/SckShim.swift) lives outside the core
+# `sardp` crate, which keeps `unsafe_code = "forbid"`.
+
+[dependencies]

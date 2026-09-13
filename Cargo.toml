@@ -1,5 +1,5 @@
 [workspace]
-members = ["sardp-cli", "sardp-win", "tools/dxgi-capture-poc"]
+members = ["sardp-cli", "sardp-win", "tools/dxgi-capture-poc", "tools/sck-capture-poc"]
 # What a bare `cargo build`/`cargo test` at the root covers: the core crate
 # and the binaries. The Windows-only crates are built explicitly (or via
 # `--workspace` on Windows) so a Linux checkout still builds and tests.

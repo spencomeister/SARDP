@@ -238,3 +238,69 @@ macOS 実装の前に、`sardp-win` にあった OS 非依存の部分を `sardp
 
 このとき `sardp`(コア)が `sardp-win` に依存していた(`sardp-server`/`sardp-client` がコアクレートの `src/bin` にあったため)ことが循環依存になるので、**バイナリを新パッケージ `sardp-cli/` に移動**しました。`target/debug/sardp-server.exe` 等のパスは変わりません。ワークスペースの `default-members` は `.`(コア)と `sardp-cli` で、Windows 専用クレートは `--workspace` または `-p` で明示ビルドします(Linux でもコア+バイナリはそのままビルド・テストできる構成)。この機では Linux 向けの `cargo check --target x86_64-unknown-linux-gnu` が `ring` の C コンパイラ要件で止まるため、Linux 上での実行確認は未実施です(移した箇所に `cfg` 依存はありません)。
 
+## Stage 3(macOS OS統合、`tools/sck-capture-poc`)関連
+
+3M-1-a(ScreenCaptureKit 疎通)で判明した、SARDP 本体ではなく macOS の TCC(Transparency,
+Consent and Control)側の既知事項です。検証機は macOS 26.6.2 (25G83) / Apple M4、
+Command Line Tools のみ(Xcode なし)、Apple 発行のコード署名 ID は 0 件。
+
+### 20. macOS の画面収録許可はモーダルを出さない。システム設定の一覧への自動登録が唯一の在席経路
+
+`.app` を `open` で起動して(責任プロセスをアプリ自身にして)画面収録を要求しても、
+`CGRequestScreenCaptureAccess()` は即座に false を返し、SCK は 30ms ほどで
+`SCStreamErrorDomain Code=-3801` で失敗します。tccd のログでは `auth_reason=5`(Service Policy)
+で、`display_prompt:` は**一度も呼ばれません**。代わりに
+`Notifying for access kTCCServiceScreenCapture ... to UID: 501` が出て、アプリが
+システム設定 > プライバシーとセキュリティ > 画面とシステムオーディオの収録 の一覧に
+**未チェックで自動登録**されます。ユーザーがチェックを入れると `Allowed (System Set)` が書かれ、
+以後キャプチャできます。ad-hoc 署名・自己署名いずれでも同じです。
+
+当初は「Apple 発行の信頼された証明書がないアプリには TCC がプロンプトを出さない」と考えましたが、
+**これは反証済み**です。同じ自己署名 ID の `.app` から `AVCaptureDevice.requestAccess(for: .audio)`
+を呼ぶと tccd は普通にプロンプトを出します(`display_prompt: called for ... kTCCServiceMicrophone`
+→ `CFUserNotification response: 0x0`)。同一 identity・同一署名・同一配置でサービスだけ変えて
+挙動が変わる以上、これはコード署名の属性ではなく **(identity, service) の組**に対する判定です。
+`NSScreenCaptureUsageDescription` の欠落(それなら `auth_reason=8`)、Hardened Runtime、
+`/Applications` 配下かどうか、MDM・Screen Time ポリシーはいずれも除外済み。詳細と切り分けの
+全量は `tools/sck-capture-poc/README.md` にあります。
+
+- **未確定**: Developer ID で notarize したアプリなら画面収録でもモーダルが出るのか。証明書なしで
+  反証できます — notarize 済みの第三者アプリを `tccutil reset ScreenCapture <bundle id>` してから
+  画面収録を要求させ、`display_prompt: called for ... kTCCServiceScreenCapture` が出るかを見る。
+  出れば identity 依存、出なければ service 依存で確定します。**受け入れ基準「TCC 権限がゼロの
+  状態からの初回起動フローが破綻しない」は、最終的な署名形態(notarize 済み配布物)で再確認が必要**。
+- **検証の残骸**: 切り分けに使った `SwiftTccProbe`(`io.sardp.swift-tcc-probe`、`/private/tmp` 配下)が
+  アクセシビリティの一覧に未チェックで残っています。実体が消えているため `tccutil reset` は
+  "No such bundle identifier" で通りません。システム設定の「−」で削除する必要があります。
+
+### 21. TCC の許可はコード署名にピン留めされる。ad-hoc での再署名は既存の許可を破壊する
+
+ad-hoc 署名の指定要件は `identifier ... and cdhash H"..."` で、ビルドのたびに変わります。さらに
+**証明書署名で許可を得た後に ad-hoc で再署名すると、tccd の `UpdateVerifierData` が保存済みの
+csreq をその時の cdhash へ書き換え**、次のリビルドで
+`Failed to match existing code requirement` となって許可が失われます(一覧にはチェック済みで
+残るのに効かない、という分かりにくい壊れ方をします)。検証中に一度これを踏みました。
+
+対策として自己署名証明書 "SARDP Dev Signing" を使い、指定要件を
+`identifier "io.sardp.sck-capture-poc" and certificate leaf = H"0f7e..."` にしています
+(未信頼のままでも `codesign` は通る)。これはリビルドで変わらないことを実測で確認済み
+(cdhash が変わっても `CGPreflightScreenCaptureAccess = true` のままキャプチャできた)。
+`tools/sck-capture-poc/make-app.sh` は既定でこの証明書を使い、キーチェーンに無ければ失敗します。
+
+配布時の含意: **署名を変えると既存ユーザーの許可が全て失われます**。証明書更新やビルド方式の
+変更時は、ユーザーに再許可を求める導線が要ります。
+
+### 22. 実行中のプロセスは画面収録許可の付与を検知できない(再起動が必要)
+
+`CGPreflightScreenCaptureAccess` を 2 秒ごとにポーリングし続けても、ユーザーがシステム設定で
+チェックを入れた後に true へ変わりませんでした(10 分待って確認。許可自体は tccd のログで
+`Update Access Record: ... to Allowed (System Set)` として書かれている)。プロセスを起動し直すと
+即座に true になります。
+
+sardp-server 側の設計要件として:
+
+- 権限状態は Granted / Denied / Unknown の 3 値で表現する。
+- Denied のときは `open "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"`
+  で該当ペインを開いて誘導する(モーダルは当てにできない、20 番)。
+- **「権限待ち」を終端状態にしない**。許可後の反映にはプロセスの再起動が必要なので、
+  再起動を促すか、自分で exec し直す経路を用意する。
