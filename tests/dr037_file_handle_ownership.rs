@@ -5,7 +5,10 @@
 //! just "does this context_id look like a handle we've issued to anyone",
 //! but "was it issued to *this* connection's own session".
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+mod common;
+
+use common::connect_pair;
+
 use std::time::Duration;
 
 use sardp::file_handle_store::{FileHandleError, FileHandleStore};
@@ -14,40 +17,6 @@ use sardp::file_transfer_session::{
     accept_file_stream_verified_with_timeout, open_file_stream,
 };
 use sardp::messages::FileTransferDirection;
-use sardp::{net, pki};
-
-/// Local bind address for the test endpoints. Defaults to 127.0.0.1, but
-/// honors `SARDP_TEST_BIND_ADDR` (an IPv4 address) so the test can still
-/// run on a machine whose UDP *loopback* is broken while UDP over a real
-/// local interface works (KNOWN_ISSUES.md item 14 -- e.g. set it to the
-/// machine's LAN address). Same override as `stage3w1d_input.rs`.
-fn loopback(port: u16) -> SocketAddr {
-    let ip = std::env::var("SARDP_TEST_BIND_ADDR")
-        .ok()
-        .and_then(|s| s.parse::<Ipv4Addr>().ok())
-        .unwrap_or(Ipv4Addr::LOCALHOST);
-    SocketAddr::new(IpAddr::V4(ip), port)
-}
-
-async fn connect_pair() -> (quinn::Connection, quinn::Connection) {
-    let test_cert = pki::generate_test_certificate("localhost");
-    let server_endpoint = net::server_endpoint(loopback(0), &test_cert);
-    let server_addr = server_endpoint.local_addr().unwrap();
-    let client_endpoint = net::client_endpoint(loopback(0), &test_cert.cert_der);
-
-    let server_accept = tokio::spawn(async move {
-        let incoming = server_endpoint.accept().await.expect("incoming connection");
-        let connection = incoming.await.expect("server-side handshake");
-        (server_endpoint, connection)
-    });
-    let client_connection = client_endpoint
-        .connect(server_addr, "localhost")
-        .expect("valid connect params")
-        .await
-        .expect("client-side handshake");
-    let (_server_endpoint, server_connection) = server_accept.await.unwrap();
-    (client_connection, server_connection)
-}
 
 const TTL: Duration = Duration::from_secs(60);
 

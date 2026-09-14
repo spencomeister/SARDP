@@ -11,11 +11,13 @@
 //! 6. Client builds and sends a `TransportFeedback` using the TimeSync
 //!    offset; server receives and decodes it (spec 2.14).
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+mod common;
 
-use ed25519_dalek::SigningKey;
+use common::handshake_pair;
+
 use sardp::channel_sm::{ChannelSm, ChannelState};
 use sardp::client_display::{ClientDisplay, SubmitOutcome};
+use sardp::clock;
 use sardp::connection_sm::ConnectionState;
 use sardp::decoder::decode_single_frame;
 use sardp::encoder::{encode_single_frame_idr, ffmpeg_available};
@@ -23,45 +25,10 @@ use sardp::feedback_session::{
     FrameTimestamps, build_transport_feedback, open_feedback_stream, read_transport_feedback,
     send_transport_feedback,
 };
-use sardp::handshake::{client_handshake, server_handshake};
 use sardp::messages::{ChromaFormat, Codec, EncoderConfig};
 use sardp::timecode_frame::generate_timecode_frame;
 use sardp::timesync::{client_time_sync, server_respond_time_sync_burst};
 use sardp::video_session::{open_video_instance, read_video_instance_intro};
-use sardp::{clock, net, pki};
-
-/// Local bind address for the test endpoints. Defaults to 127.0.0.1, but
-/// honors `SARDP_TEST_BIND_ADDR` (an IPv4 address) so the test can still
-/// run on a machine whose UDP *loopback* is broken while UDP over a real
-/// local interface works (KNOWN_ISSUES.md item 14 -- e.g. set it to the
-/// machine's LAN address). Same override as `stage3w1d_input.rs`.
-fn loopback(port: u16) -> SocketAddr {
-    let ip = std::env::var("SARDP_TEST_BIND_ADDR")
-        .ok()
-        .and_then(|s| s.parse::<Ipv4Addr>().ok())
-        .unwrap_or(Ipv4Addr::LOCALHOST);
-    SocketAddr::new(IpAddr::V4(ip), port)
-}
-
-async fn connect_pair() -> (quinn::Connection, quinn::Connection) {
-    let test_cert = pki::generate_test_certificate("localhost");
-    let server_endpoint = net::server_endpoint(loopback(0), &test_cert);
-    let server_addr = server_endpoint.local_addr().unwrap();
-    let client_endpoint = net::client_endpoint(loopback(0), &test_cert.cert_der);
-
-    let server_accept = tokio::spawn(async move {
-        let incoming = server_endpoint.accept().await.expect("incoming connection");
-        let connection = incoming.await.expect("server-side handshake");
-        (server_endpoint, connection)
-    });
-    let client_connection = client_endpoint
-        .connect(server_addr, "localhost")
-        .expect("valid connect params")
-        .await
-        .expect("client-side handshake");
-    let (_server_endpoint, server_connection) = server_accept.await.unwrap();
-    (client_connection, server_connection)
-}
 
 #[tokio::test]
 async fn full_session_reaches_active_with_feedback_round_trip() {
@@ -69,27 +36,12 @@ async fn full_session_reaches_active_with_feedback_round_trip() {
         eprintln!("skipping: ffmpeg not found on PATH");
         return;
     }
-    let (client_connection, server_connection) = connect_pair().await;
-
-    // 1. Handshake (M2). `join!` (not sequential `.await`s): client and
-    // server each block on messages only the other side sends, so both
-    // must be driven concurrently.
-    let client_signing_key = SigningKey::from_bytes(&[0x55; 32]);
-    let trusted_public_key = client_signing_key.verifying_key();
-    let (client_handshake_result, server_handshake_result) = tokio::join!(
-        client_handshake(
-            &client_connection,
-            &client_signing_key,
-            "test-client",
-            "alice",
-            "device-1",
-        ),
-        server_handshake(&server_connection, "test-server", &trusted_public_key),
-    );
-    let (_client_outcome, mut client_sm, mut client_control) =
-        client_handshake_result.expect("client handshake succeeds");
-    let (_server_outcome, mut server_sm, mut server_control) =
-        server_handshake_result.expect("server handshake succeeds");
+    // 1. Handshake (M2), driven concurrently on both sides by the shared
+    // helper (client and server each block on messages only the other
+    // side sends).
+    let (client_connection, client, server_connection, server) = handshake_pair(0x55).await;
+    let (mut client_sm, mut client_control) = (client.sm, client.control);
+    let (mut server_sm, mut server_control) = (server.sm, server.control);
 
     // 2. TimeSync (spec 2.9), over the still-open control stream.
     let (client_timesync_result, server_timesync_result) = tokio::join!(

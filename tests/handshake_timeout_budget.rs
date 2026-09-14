@@ -22,45 +22,16 @@
 //! window, proven by its signature no longer accepting a `Duration` to
 //! recompute one from, not by a runtime race.
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+mod common;
+
+use common::connect_pair;
+
 use std::time::Duration;
 
 use sardp::handshake::HandshakeError;
+use sardp::prologue;
 use sardp::reconnection::read_first_control_message;
 use sardp::stream_kind::StreamKind;
-use sardp::{net, pki, prologue};
-
-/// Local bind address for the test endpoints. Defaults to 127.0.0.1, but
-/// honors `SARDP_TEST_BIND_ADDR` (an IPv4 address) so the test can still
-/// run on a machine whose UDP *loopback* is broken while UDP over a real
-/// local interface works (KNOWN_ISSUES.md item 14 -- e.g. set it to the
-/// machine's LAN address). Same override as `stage3w1d_input.rs`.
-fn loopback(port: u16) -> SocketAddr {
-    let ip = std::env::var("SARDP_TEST_BIND_ADDR")
-        .ok()
-        .and_then(|s| s.parse::<Ipv4Addr>().ok())
-        .unwrap_or(Ipv4Addr::LOCALHOST);
-    SocketAddr::new(IpAddr::V4(ip), port)
-}
-
-async fn connect_pair() -> (quinn::Connection, quinn::Connection) {
-    let test_cert = pki::generate_test_certificate("localhost");
-    let server_endpoint = net::server_endpoint(loopback(0), &test_cert);
-    let server_addr = server_endpoint.local_addr().unwrap();
-    let client_endpoint = net::client_endpoint(loopback(0), &test_cert.cert_der);
-
-    let server_accept = tokio::spawn(async move {
-        let incoming = server_endpoint.accept().await.expect("incoming connection");
-        incoming.await.expect("server-side QUIC handshake")
-    });
-    let client_connection = client_endpoint
-        .connect(server_addr, "localhost")
-        .expect("valid connect params")
-        .await
-        .expect("client-side QUIC handshake");
-    let server_connection = server_accept.await.unwrap();
-    (client_connection, server_connection)
-}
 
 /// `establish_connection` computes the shared deadline once and passes it
 /// straight to `read_first_control_message`; an already-elapsed deadline
