@@ -70,8 +70,17 @@ use sardp::{clock, net, netem, pki};
 // suspension points on a general executor.
 static NETEM_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+/// Local bind address for the test endpoints. Defaults to 127.0.0.1, but
+/// honors `SARDP_TEST_BIND_ADDR` (an IPv4 address) so the test can still
+/// run on a machine whose UDP *loopback* is broken while UDP over a real
+/// local interface works (KNOWN_ISSUES.md item 14 -- e.g. set it to the
+/// machine's LAN address). Same override as `stage3w1d_input.rs`.
 fn loopback(port: u16) -> SocketAddr {
-    SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)
+    let ip = std::env::var("SARDP_TEST_BIND_ADDR")
+        .ok()
+        .and_then(|s| s.parse::<Ipv4Addr>().ok())
+        .unwrap_or(Ipv4Addr::LOCALHOST);
+    SocketAddr::new(IpAddr::V4(ip), port)
 }
 
 async fn connect_pair() -> (quinn::Connection, quinn::Connection) {
