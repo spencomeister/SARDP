@@ -485,3 +485,30 @@ MUST の供給源で、合成中の生 `KeyEvent` を重ねて送ってはなら
 `--display log`(フレームごとの `ffmpeg` 起動)のコストです。**macOS 版の永続デコーダ・
 クライアントが無いため、Windows の構成 A と同じ土俵での比較はまだできません。**
 
+
+## 横断的なToDo(次のWindows/macOS実機セッションで着手)
+
+### 29. RAII後始末(`impl Drop`)の共通化: 本体クレートに`DropGuard<F: FnOnce()>`を置き、OS分岐クレート側の一部を置き換える(未着手、要実機ビルド検証)
+
+「正常終了・エラー・panicのどの経路でも必ず解放する」ための`impl Drop`が、OS分岐クレートと検証ツールに個別に書かれています。2026-09-14の調査(spencomeister/SARDP#8の作業中)で数え直した内訳は次のとおりで、参考までに本体側にも`NetemGuard`(`src/netem.rs`)と`sardp-cli/src/bin/sardp-server.rs`の`InputInjection`の2件があります。
+
+| 場所 | `impl Drop`の数 |
+|---|---|
+| `sardp-win` | 5 |
+| `sardp-mac` | 1 |
+| `tools/dxgi-capture-poc` | 3 |
+| `tools/sck-capture-poc` | 4 |
+
+**共通化できる(4件)**: Drop時にクロージャを1回実行するだけの薄い型で、そのまま置き換わるもの。
+- `FrameGuard`(`tools/dxgi-capture-poc/src/capture.rs`): `ReleaseFrame`を呼んで失敗をログするだけ。
+- `Presenter`(`sardp-win/src/display.rs`): `CloseHandle`を1回呼ぶだけ。
+- `UserDataGuard`(`sardp-win/src/display.rs`): `SetWindowLongPtrW`で切り離して`Box::from_raw`を落とすだけ。
+- `NetemGuard`(`src/netem.rs`): `clear()`を呼ぶだけ。本体側なので置き換えの見本にできる。
+
+**専用の小さな型で束ねる方が向く(3件)**: `InputInjector`(`sardp-win`/`sardp-mac`の`inject.rs`)と`H264DisplayWindow`(`sardp-win/src/display.rs`)は「送信側(`tx`)を落として`JoinHandle`をjoinする」パターンが同一。クロージャ型ではなく`WorkerHandle { tx: Option<Sender>, worker: Option<JoinHandle> }`のような「チャネル+スレッド」専用のガードにまとめる。`H264DisplayWindow`だけ`closed`フラグを先に立てる点が差分。
+
+**共通化しない方がよい(6件)**:
+- `tools/sck-capture-poc`の`Injector`・`EventTap`・`Session`・`Encoder`はFFIハンドルの解放で、`EventTap`以降の3つは`drop_sink`関数ポインタで型消去したsinkも解放する。クロージャに包むと生ポインタをキャプチャする`unsafe`が増えるだけで、今の形の方が読みやすい。
+- `Encoder`(`sardp-win/src/desktop_h264.rs`)と`Encoder`・`Muxer`(`tools/dxgi-capture-poc/src/bin/mf_h264_encode.rs`)は「`finished`/`finalized`フラグを見て未完なら`finish()`を呼ぶ」二重呼び出し防止つきで、Dropが型のメソッドと状態を共有する。薄い型には収まらない。
+
+**提案**: 本体クレートに`struct DropGuard<F: FnOnce()>`(`FnMut`より`FnOnce`が自然。`Option<F>`で1回だけ実行)を1つ置き、上の4件を置き換える。スレッド系3件を`WorkerHandle`に束ねるかは任意。対象が`sardp-win`/`sardp-mac`とその検証ツールなので、Linuxのクラウドセッションでは変更をビルドできず、**次にWindows/macOSの実機セッションを開くタイミングで着手する**位置付けとする(このセッションでは記録のみ)。

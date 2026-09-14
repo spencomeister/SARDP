@@ -8,74 +8,27 @@
 //! resetting (spec 4.6, DR-026), the `reconnect_token` is rotated, and
 //! that a wrong/reused token is rejected (`ReconnectRejected`).
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+mod common;
 
-use ed25519_dalek::SigningKey;
+use common::{TestServer, connect_to, handshake};
+
 use sardp::connection_sm::ConnectionState;
-use sardp::handshake::{client_handshake, server_handshake};
 use sardp::messages;
 use sardp::reconnection::{accept_control_prologue, client_reconnect, server_complete_reconnect};
 use sardp::session_store::{SessionStore, SuspendedSession};
 use sardp::stream_kind::StreamKind;
-use sardp::{net, pki};
-
-/// Local bind address for the test endpoints. Defaults to 127.0.0.1, but
-/// honors `SARDP_TEST_BIND_ADDR` (an IPv4 address) so the test can still
-/// run on a machine whose UDP *loopback* is broken while UDP over a real
-/// local interface works (KNOWN_ISSUES.md item 14 -- e.g. set it to the
-/// machine's LAN address). Same override as `stage3w1d_input.rs`.
-fn loopback(port: u16) -> SocketAddr {
-    let ip = std::env::var("SARDP_TEST_BIND_ADDR")
-        .ok()
-        .and_then(|s| s.parse::<Ipv4Addr>().ok())
-        .unwrap_or(Ipv4Addr::LOCALHOST);
-    SocketAddr::new(IpAddr::V4(ip), port)
-}
-
-/// Accepts one incoming connection on `endpoint` (cloned -- `quinn::Endpoint`
-/// is a cheap `Arc`-backed handle, so the same listening socket can accept
-/// more than one connection across a test's lifetime).
-async fn accept_one(endpoint: &quinn::Endpoint) -> quinn::Connection {
-    let incoming = endpoint.accept().await.expect("incoming connection");
-    incoming.await.expect("server-side QUIC handshake")
-}
 
 #[tokio::test]
 async fn reconnect_after_disconnect_resumes_active_with_continued_generation() {
-    let test_cert = pki::generate_test_certificate("localhost");
-    let server_endpoint = net::server_endpoint(loopback(0), &test_cert);
-    let server_addr = server_endpoint.local_addr().unwrap();
-
-    let client_signing_key = SigningKey::from_bytes(&[0x81; 32]);
-    let trusted_public_key = client_signing_key.verifying_key();
+    let server = TestServer::start();
 
     // --- Phase 1: establish the original session and reach Active. ---
-    let client_endpoint_1 = net::client_endpoint(loopback(0), &test_cert.cert_der);
-    let (client_connection_1, server_connection_1) = {
-        let server_endpoint = server_endpoint.clone();
-        let server_accept = tokio::spawn(async move { accept_one(&server_endpoint).await });
-        let client_connection = client_endpoint_1
-            .connect(server_addr, "localhost")
-            .expect("valid connect params")
-            .await
-            .expect("client-side QUIC handshake");
-        (client_connection, server_accept.await.unwrap())
-    };
-
-    let (client_result, server_result) = tokio::join!(
-        client_handshake(
-            &client_connection_1,
-            &client_signing_key,
-            "test-client",
-            "alice",
-            "device-1",
-        ),
-        server_handshake(&server_connection_1, "test-server", &trusted_public_key),
-    );
+    let (client_connection_1, server_connection_1) = connect_to(&server).await;
+    let (client, server_side) = handshake(&client_connection_1, &server_connection_1, 0x81).await;
     let (client_outcome, mut client_sm, _client_control_1) =
-        client_result.expect("client handshake succeeds");
+        (client.outcome, client.sm, client.control);
     let (server_outcome, mut server_sm, _server_control_1) =
-        server_result.expect("server handshake succeeds");
+        (server_side.outcome, server_side.sm, server_side.control);
 
     client_sm.on_channel_live().expect("client reaches Active");
     server_sm.on_channel_live().expect("server reaches Active");
@@ -115,17 +68,7 @@ async fn reconnect_after_disconnect_resumes_active_with_continued_generation() {
 
     // --- Phase 3: reconnect on a brand new QUIC connection within the
     // grace period, using the reconnect_token from the original session. ---
-    let client_endpoint_2 = net::client_endpoint(loopback(0), &test_cert.cert_der);
-    let (client_connection_2, server_connection_2) = {
-        let server_endpoint = server_endpoint.clone();
-        let server_accept = tokio::spawn(async move { accept_one(&server_endpoint).await });
-        let client_connection = client_endpoint_2
-            .connect(server_addr, "localhost")
-            .expect("valid connect params")
-            .await
-            .expect("client-side QUIC handshake");
-        (client_connection, server_accept.await.unwrap())
-    };
+    let (client_connection_2, server_connection_2) = connect_to(&server).await;
 
     let server_side_reconnect = async {
         let (send, mut reader) = accept_control_prologue(&server_connection_2)
@@ -192,36 +135,14 @@ async fn reconnect_after_disconnect_resumes_active_with_continued_generation() {
 
 #[tokio::test]
 async fn reconnect_with_wrong_token_is_rejected() {
-    let test_cert = pki::generate_test_certificate("localhost");
-    let server_endpoint = net::server_endpoint(loopback(0), &test_cert);
-    let server_addr = server_endpoint.local_addr().unwrap();
+    let server = TestServer::start();
 
-    let client_signing_key = SigningKey::from_bytes(&[0x82; 32]);
-    let trusted_public_key = client_signing_key.verifying_key();
-
-    let client_endpoint_1 = net::client_endpoint(loopback(0), &test_cert.cert_der);
-    let (client_connection_1, server_connection_1) = {
-        let server_endpoint = server_endpoint.clone();
-        let server_accept = tokio::spawn(async move { accept_one(&server_endpoint).await });
-        let client_connection = client_endpoint_1
-            .connect(server_addr, "localhost")
-            .expect("valid connect params")
-            .await
-            .expect("client-side QUIC handshake");
-        (client_connection, server_accept.await.unwrap())
-    };
-    let (client_result, server_result) = tokio::join!(
-        client_handshake(
-            &client_connection_1,
-            &client_signing_key,
-            "test-client",
-            "alice",
-            "device-1",
-        ),
-        server_handshake(&server_connection_1, "test-server", &trusted_public_key),
-    );
-    let (client_outcome, mut client_sm, _client_control_1) = client_result.unwrap();
-    let (server_outcome, mut server_sm, _server_control_1) = server_result.unwrap();
+    let (client_connection_1, server_connection_1) = connect_to(&server).await;
+    let (client, server_side) = handshake(&client_connection_1, &server_connection_1, 0x82).await;
+    let (client_outcome, mut client_sm, _client_control_1) =
+        (client.outcome, client.sm, client.control);
+    let (server_outcome, mut server_sm, _server_control_1) =
+        (server_side.outcome, server_side.sm, server_side.control);
     client_sm.on_channel_live().unwrap();
     server_sm.on_channel_live().unwrap();
 
@@ -243,17 +164,7 @@ async fn reconnect_with_wrong_token_is_rejected() {
     drop(client_connection_1);
     drop(server_connection_1);
 
-    let client_endpoint_2 = net::client_endpoint(loopback(0), &test_cert.cert_der);
-    let (client_connection_2, server_connection_2) = {
-        let server_endpoint = server_endpoint.clone();
-        let server_accept = tokio::spawn(async move { accept_one(&server_endpoint).await });
-        let client_connection = client_endpoint_2
-            .connect(server_addr, "localhost")
-            .expect("valid connect params")
-            .await
-            .expect("client-side QUIC handshake");
-        (client_connection, server_accept.await.unwrap())
-    };
+    let (client_connection_2, server_connection_2) = connect_to(&server).await;
 
     let wrong_token = {
         let mut t = client_outcome.reconnect_token;
