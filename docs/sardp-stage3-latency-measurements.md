@@ -29,6 +29,32 @@ M6 の測定ハーネス(`sardp::measurement`、PoC ブリーフ Part 8「E2E遅
 
 `present_us` はいずれも 0.2〜0.3ms(p95 0.5〜0.7ms)。`queue_us`(window)は定常で p50 31µs、p95 0.2〜1.6ms。
 
+### macOS(3M-1-d、2026-09-13)
+
+同一機ループバック。サーバーは `--capture desktop --all-idr`(ScreenCaptureKit → VideoToolbox、
+内蔵ディスプレイ 3420x2224@60Hz)、クライアントは `--display log`(フレームごとに `ffmpeg` を起動)。
+**Windows の構成 A とは比較できません** — macOS にはまだ永続デコーダのクライアント
+(`--display window` は Windows 専用)が無いため、測れるのは構成 C 相当だけです。
+
+| 構成 | encode | transport | decode | glass_to_glass | 備考 |
+|---|---|---|---|---|---|
+| **C(macOS)**: `--capture desktop --all-idr` + `--display log`、定常(generation 4、n=3087) | avg 27.5ms / p50 28.0ms / p95 43.0ms | avg 17.0ms / p50 6.6ms / p95 48.3ms | avg 54.8ms / p50 53.8ms / p95 60.4ms | avg 99.3ms / **p50 95.8ms / p95 128.0ms** | 80〜86KiB/フレーム。世代リセット 4 回(約68秒) |
+| C(macOS)、立ち上がり(generation 0、n=13) | p50 19.0ms | p50 960ms | p50 51.2ms | p50 1030ms | クライアントが `ffmpeg` 起動に追いつけず QUIC 受信バッファに滞留、直後に世代リセット |
+
+読み取れること:
+
+- **`transport` p50 6.6ms** はワイヤ側が問題ではないことを示しています(Part 8 の `transport_us`
+  目標 LAN 50ms に対して十分)。p95 48ms はデコーダが追いつかないときのサーバー側チャネル待ちで、
+  ワイヤの数値ではありません(Windows の構成 C と同じ事情)。
+- **`decode` p50 53.8ms が支配的**です。これは `ffmpeg` 起動コストであって macOS の問題ではなく、
+  永続デコーダのクライアント(macOS 版 `--display window` 相当)を書けば Windows の構成 A と
+  同じく 1ms 未満になるはずです。**これが現在 glass-to-glass の半分以上を占めています。**
+- **`encode` が単体計測の p50 16ms(3M-1-b)から p50 28ms に増えています。** 条件の違いは
+  (a) `--all-idr`(全フレームが IDR)と (b) 同一機でクライアントが毎フレーム `ffmpeg` を起動している
+  こと。generation 1〜2 では p50 16〜17ms で、負荷が積み上がるにつれ 28ms に上がりました。
+  Windows 側の「同一 GPU をクライアントのデコード・表示と共有している影響」と同種の現象です。
+  **別プロセス・別機での再計測が要ります。**
+
 ### DR-036 の結論
 
 - **コーデック起動コスト(`ffmpeg` 起動 ≈ 105ms + 85ms ≈ 190ms)は、永続パイプラインでは encode 6ms + decode 0.5ms ≈ 7ms になった。** glass-to-glass の中央値は 177ms → 9ms。
@@ -44,4 +70,7 @@ M6 の測定ハーネス(`sardp::measurement`、PoC ブリーフ Part 8「E2E遅
 
 - 別機(実 LAN / WAN)での再計測。`tc netem` 相当の条件再現は M6 ハーネス側にあるが、実デスクトップ経路とは接続していない。
 - 立ち上がり滞留の解消(デコーダ・ウィンドウの事前生成)。
-- macOS(3M-1)実装後、同じ表で比較する。
+- **macOS の永続デコーダ・クライアント**(`--display window` 相当)。これが無いと macOS 側は
+  構成 C までしか測れず、Windows の構成 A と同じ土俵に乗りません。現状 glass-to-glass の
+  半分以上が `ffmpeg` の起動コストです。
+- macOS の `encode` を負荷から切り離した再計測(別機、または `--all-idr` 無しの条件)。

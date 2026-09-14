@@ -1,0 +1,19 @@
+[package]
+name = "sardp-mac"
+version = "0.1.0"
+edition = "2024"
+description = "macOS OS integration for SARDP (Stage 3): ScreenCaptureKit capture + VideoToolbox H.264 hardware encode behind a safe API"
+
+# The mirror of `sardp-win`. All the inherently-unsafe code (the C ABI of
+# the Swift shim) is in `sck-capture-poc`; this crate has none of its own,
+# and the core `sardp` crate keeps `unsafe_code = "forbid"`.
+
+[dependencies]
+sardp = { path = ".." }
+sck-capture-poc = { path = "../tools/sck-capture-poc" }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[dev-dependencies]
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "time"] }

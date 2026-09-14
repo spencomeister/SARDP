@@ -49,6 +49,21 @@ use sardp::video_session;
 use sardp::video_sm::defaults::VIDEO_CONFIGURING_TIMEOUT;
 use sardp::{StreamKind, clock, dev_identity, net, pki};
 
+#[cfg(target_os = "macos")]
+use sardp_mac as os;
+/// The OS-integration crate for this platform, under one name.
+///
+/// `sardp-win` and `sardp-mac` expose deliberately parallel APIs
+/// (`DesktopH264Source`, `InjectCommand`, ...), which is what lets the
+/// wiring below be written once instead of per platform. Where they
+/// genuinely differ -- how an injector is configured and started, and
+/// which H.264 profile the hardware encoder negotiates -- the difference
+/// is confined to `start_input_sink` and `desktop_profile_tier` rather
+/// than spread across the file. The `desktop_capture` cfg that guards all
+/// of it is set by `build.rs`.
+#[cfg(windows)]
+use sardp_win as os;
+
 struct Args {
     bind: SocketAddr,
     cert: Option<PathBuf>,
@@ -65,8 +80,8 @@ struct Args {
     /// kept for debugging and for the ffmpeg-per-frame `--display log`
     /// client path, which can only decode self-contained frames.
     all_idr: bool,
-    /// Pause between characters of injected `TextInput` (Windows desktop
-    /// capture only; KNOWN_ISSUES.md #13).
+    /// Pause between characters of injected `TextInput` (desktop capture
+    /// only; KNOWN_ISSUES.md #13).
     text_char_delay_ms: u64,
 }
 
@@ -84,8 +99,10 @@ enum CaptureMode {
     /// The M1-M6 timecode pattern, encoded with a per-frame `ffmpeg`
     /// subprocess. Runs anywhere; the default.
     Synthetic,
-    /// The real desktop via DXGI Desktop Duplication + a hardware H.264
-    /// encoder MFT (`sardp-win`, Stage 3 3W-1-d). Windows only.
+    /// The real desktop with hardware H.264: DXGI Desktop Duplication +
+    /// an encoder MFT (`sardp-win`, 3W-1-d) on Windows, ScreenCaptureKit +
+    /// VideoToolbox (`sardp-mac`, 3M-1-d) on macOS. Rejected at argument
+    /// parsing where neither exists.
     Desktop,
 }
 
@@ -97,8 +114,8 @@ enum FrameSource {
         width: u32,
         height: u32,
     },
-    #[cfg(windows)]
-    Desktop(sardp_win::DesktopH264Source),
+    #[cfg(desktop_capture)]
+    Desktop(os::DesktopH264Source),
 }
 
 /// One frame ready to go on the wire, whatever produced it.
@@ -132,7 +149,7 @@ async fn next_frame(source: &mut FrameSource) -> Result<Option<SourcedFrame>, Co
                 encode_done_ts: clock::now_us(),
             }))
         }
-        #[cfg(windows)]
+        #[cfg(desktop_capture)]
         FrameSource::Desktop(desktop) => Ok(desktop.next_frame().await.map(|f| SourcedFrame {
             bytes: f.annex_b,
             is_idr: f.is_idr,
@@ -147,7 +164,7 @@ async fn next_frame(source: &mut FrameSource) -> Result<Option<SourcedFrame>, Co
 async fn next_desktop_frame(source: &mut FrameSource) -> Result<Option<SourcedFrame>, ConnError> {
     match source {
         FrameSource::Synthetic { .. } => std::future::pending().await,
-        #[cfg(windows)]
+        #[cfg(desktop_capture)]
         FrameSource::Desktop(_) => next_frame(source).await,
     }
 }
@@ -186,7 +203,7 @@ async fn send_sourced_frame(
 /// A frame that can open a new video Instance: asks the source for an IDR
 /// and skips whatever non-IDR frames arrive first.
 async fn next_idr_frame(source: &mut FrameSource) -> Result<SourcedFrame, ConnError> {
-    #[cfg(windows)]
+    #[cfg(desktop_capture)]
     if let FrameSource::Desktop(desktop) = source {
         desktop.request_idr();
     }
@@ -249,8 +266,10 @@ OPTIONS:\n\
     --height <N>            Synthetic frame height (default 360)\n\
     --fps <N>               Frame send rate (default 4)\n\
     --capture <MODE>        synthetic (default): M1-M6 timecode pattern via ffmpeg\n\
-                            desktop: real desktop via DXGI + hardware H.264 (Windows;\n\
-                            --width/--height/--fps are then taken from the display)\n\
+                            desktop: the real desktop with hardware H.264 -- DXGI +\n\
+                            Media Foundation on Windows, ScreenCaptureKit +\n\
+                            VideoToolbox on macOS. --width/--height/--fps are then\n\
+                            taken from the display.\n\
     --all-idr               With --capture desktop: encode every frame as an IDR\n\
                             (needed for a client running --display log; default off)\n\
     --text-char-delay-ms <N> With --capture desktop: pause between characters of\n\
@@ -258,7 +277,10 @@ OPTIONS:\n\
     --server-name <NAME>    Name announced in ServerHello (default sardp-server)\n\
     --help                  Show this message\n\n\
 With --capture desktop, the client's input stream (spec 2.12) is injected\n\
-into this desktop via SendInput; with synthetic capture it is only logged.\n\n\
+into this desktop (SendInput on Windows, CGEvent on macOS); with synthetic\n\
+capture it is only logged. macOS needs two separate TCC grants: Screen\n\
+Recording for capture and Accessibility for injection. Without the latter\n\
+video still works and input is reported as unavailable.\n\n\
 Once a client is connected, typing one of the following (Enter) toggles\n\
 the corresponding permission live, or triggers a one-shot action:\n\
     grant-view / revoke-view\n\
@@ -333,8 +355,11 @@ fn parse_args() -> Args {
                 capture = match args.next().expect("--capture requires a value").as_str() {
                     "synthetic" => CaptureMode::Synthetic,
                     "desktop" => {
-                        if !cfg!(windows) {
-                            eprintln!("--capture desktop is only available on Windows");
+                        if !cfg!(desktop_capture) {
+                            eprintln!(
+                                "--capture desktop needs an OS integration crate; this build \
+                                 has none (Windows and macOS do)"
+                            );
                             std::process::exit(2);
                         }
                         CaptureMode::Desktop
@@ -651,41 +676,41 @@ async fn handle_connection(
             66u16,
             4u8,
         ),
-        #[cfg(windows)]
+        #[cfg(desktop_capture)]
         CaptureMode::Desktop => {
-            let clock: sardp_win::Clock = Arc::new(clock::now_us);
-            let config = sardp_win::DesktopH264Config {
+            let clock: os::Clock = Arc::new(clock::now_us);
+            let config = os::DesktopH264Config {
                 all_idr: capture.all_idr,
                 ..Default::default()
             };
-            let source = sardp_win::DesktopH264Source::start(config, clock)
+            let source = os::DesktopH264Source::start(config, clock)
                 .map_err(|e| ConnError::Capture(e.to_string()))?;
             let info = source.info();
+            let (profile, tier) = desktop_profile_tier();
             eprintln!(
-                "[{peer}] desktop capture started: {}x{} @ {}Hz, hardware H.264, {}",
+                "[{peer}] desktop capture started: {}x{} @ {}Hz, hardware H.264 profile {}, {}",
                 info.width,
                 info.height,
                 info.fps,
+                profile,
                 if capture.all_idr {
                     "all-IDR (--all-idr)"
                 } else {
                     "IDR + P-frames"
                 }
             );
-            // Main profile (what the hardware MFT negotiates), Tier 3
-            // (hardware 4:2:0, no QP map yet -- spec Part 6).
             (
                 FrameSource::Desktop(source),
                 info.width,
                 info.height,
                 f64::from(info.fps),
-                77u16,
-                3u8,
+                profile,
+                tier,
             )
         }
-        #[cfg(not(windows))]
+        #[cfg(not(desktop_capture))]
         CaptureMode::Desktop => {
-            unreachable!("--capture desktop is rejected at argument parsing off Windows")
+            unreachable!("--capture desktop is rejected at argument parsing on this platform")
         }
     };
 
@@ -694,18 +719,8 @@ async fn handle_connection(
     // events instead, so a dev machine running the synthetic server never
     // gets its keyboard/mouse driven by a test client.
     let input_sink = match &frame_source {
-        #[cfg(windows)]
-        FrameSource::Desktop(source) => {
-            let info = source.info();
-            eprintln!(
-                "[{peer}] input injection: SendInput, output origin ({}, {}), text char delay {}ms",
-                info.origin_x, info.origin_y, capture.text_char_delay_ms
-            );
-            InputSink::Windows(sardp_win::InputInjector::start(sardp_win::InjectorConfig {
-                text_unit_delay: Duration::from_millis(capture.text_char_delay_ms),
-                output_origin: (info.origin_x, info.origin_y),
-            }))
-        }
+        #[cfg(desktop_capture)]
+        FrameSource::Desktop(source) => start_input_sink(source, capture.text_char_delay_ms, peer),
         _ => {
             eprintln!("[{peer}] input injection: log only (synthetic capture)");
             InputSink::Log
@@ -1211,12 +1226,96 @@ async fn accept_incoming_uni(
     Ok((prologue.kind, reader))
 }
 
+/// The H.264 profile and Part 6 tier the platform's hardware encoder
+/// actually produces. Tier 3 on both (hardware 4:2:0, no QP map yet);
+/// the profile differs because the encoders do.
+#[cfg(desktop_capture)]
+fn desktop_profile_tier() -> (u16, u8) {
+    #[cfg(windows)]
+    {
+        (77, 3) // Main: what the hardware MFT negotiates.
+    }
+    #[cfg(target_os = "macos")]
+    {
+        (100, 3) // High: what the VideoToolbox session is configured for.
+    }
+}
+
+/// Starts the platform's input injector for a desktop session.
+///
+/// The two platforms diverge here for a reason rather than by accident:
+/// `SendInput` needs no permission and cannot fail to start, while
+/// `CGEvent` posting needs the Accessibility TCC grant, which is separate
+/// from the Screen Recording one capture already has. A session whose
+/// video works but whose input does not is a real state, so a macOS
+/// injector that will not start becomes [`InputSink::Unavailable`] with
+/// the reason rather than failing the connection -- a view-only session
+/// on a machine without Accessibility is still useful.
+#[cfg(desktop_capture)]
+fn start_input_sink(
+    source: &os::DesktopH264Source,
+    text_char_delay_ms: u64,
+    peer: SocketAddr,
+) -> InputSink {
+    let info = source.info();
+    let text_unit_delay = Duration::from_millis(text_char_delay_ms);
+
+    #[cfg(windows)]
+    {
+        eprintln!(
+            "[{peer}] input injection: SendInput, output origin ({}, {}), text char delay {}ms",
+            info.origin_x, info.origin_y, text_char_delay_ms
+        );
+        InputSink::Os(os::InputInjector::start(os::InjectorConfig {
+            text_unit_delay,
+            output_origin: (info.origin_x, info.origin_y),
+        }))
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        // `SourceInfo` is in pixels and `CGEvent` works in points, so the
+        // injector needs the captured output's backing scale as well as
+        // its origin (KNOWN_ISSUES #27).
+        let config = os::InjectorConfig {
+            text_unit_delay,
+            output_origin: (f64::from(info.origin_x), f64::from(info.origin_y)),
+            scale: source.backing_scale(),
+            ..Default::default()
+        };
+        match os::InputInjector::start(config) {
+            Ok(injector) => {
+                eprintln!(
+                    "[{peer}] input injection: CGEvent, output origin ({}, {}) pt, \
+                     scale {}, text char delay {text_char_delay_ms}ms",
+                    config.output_origin.0, config.output_origin.1, config.scale
+                );
+                InputSink::Os(injector)
+            }
+            Err(e) => {
+                eprintln!(
+                    "[{peer}] input injection unavailable: {e}. Approve this binary in \
+                     System Settings > Privacy & Security > Accessibility and restart \
+                     the server; video is unaffected."
+                );
+                InputSink::Unavailable(e.to_string())
+            }
+        }
+    }
+}
+
 /// Where a session's input events go (spec 2.12 -> OS).
 enum InputSink {
     /// Log only (synthetic video: nothing to drive).
     Log,
-    #[cfg(windows)]
-    Windows(sardp_win::InputInjector),
+    #[cfg(desktop_capture)]
+    Os(os::InputInjector),
+    /// The platform has an injector but it could not be started -- on
+    /// macOS, Accessibility not being granted. Kept distinct from `Log`
+    /// so the reason is reported when input actually arrives, rather than
+    /// the session looking like a synthetic one.
+    #[cfg(desktop_capture)]
+    Unavailable(String),
 }
 
 /// Per-session input state (spec 4.4): IME mode SM, the pressed-key
@@ -1403,21 +1502,30 @@ impl InputInjection {
                     eprintln!("[{}] (log-only sink) {event:?}", self.peer);
                 }
             }
-            #[cfg(windows)]
-            InputSink::Windows(injector) => {
+            #[cfg(desktop_capture)]
+            InputSink::Os(injector) => {
                 let command = match event {
                     SinkEvent::Key { hid_usage, down } => {
-                        sardp_win::InjectCommand::Key { hid_usage, down }
+                        os::InjectCommand::Key { hid_usage, down }
                     }
-                    SinkEvent::Text(text) => sardp_win::InjectCommand::Text(text),
-                    SinkEvent::MouseMove { x, y } => sardp_win::InjectCommand::MouseMove { x, y },
+                    SinkEvent::Text(text) => os::InjectCommand::Text(text),
+                    SinkEvent::MouseMove { x, y } => os::InjectCommand::MouseMove { x, y },
                     SinkEvent::MouseButton { button, down } => {
-                        sardp_win::InjectCommand::MouseButton { button, down }
+                        os::InjectCommand::MouseButton { button, down }
                     }
-                    SinkEvent::Wheel { dx, dy } => sardp_win::InjectCommand::Wheel { dx, dy },
+                    SinkEvent::Wheel { dx, dy } => os::InjectCommand::Wheel { dx, dy },
                 };
                 if let Err(e) = injector.inject(command) {
                     eprintln!("[{}] input injection failed: {e}", self.peer);
+                }
+            }
+            #[cfg(desktop_capture)]
+            InputSink::Unavailable(reason) => {
+                // Reported on every event on purpose: silently dropping
+                // input would look like the client's messages never
+                // arrived.
+                if self.injected <= 3 || self.injected.is_multiple_of(100) {
+                    eprintln!("[{}] input not injected ({reason}); {event:?}", self.peer);
                 }
             }
         }
