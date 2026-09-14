@@ -7,7 +7,9 @@
 //! fits better alongside M5's backpressure work that needs the same
 //! stream kept continuously fed).
 
-use crate::messages::{self, AudioSyncFeedback, TransportFeedback, VideoFrameHeader};
+use crate::messages::{
+    self, AudioSyncFeedback, KeyframeRequest, TransportFeedback, VideoFrameHeader,
+};
 use crate::prologue;
 use crate::stream_kind::StreamKind;
 use crate::stream_reader::{EnvelopeReader, StreamReadError, write_envelope};
@@ -65,13 +67,29 @@ pub async fn send_audio_sync_feedback(
     .await
 }
 
-/// Either message a `feedback` stream can carry (spec 2.14's
-/// `TransportFeedback` and spec 2.13's `AudioSyncFeedback` share the same
-/// stream). See [`FeedbackReceiver::read_message`].
+/// Sends one `KeyframeRequest` Envelope on an already-opened feedback
+/// stream (spec 2.10: client->server, same stream as `TransportFeedback`).
+pub async fn send_keyframe_request(
+    send: &mut quinn::SendStream,
+    request: &KeyframeRequest,
+) -> Result<(), quinn::WriteError> {
+    write_envelope(
+        send,
+        messages::type_id::KEYFRAME_REQUEST,
+        &messages::encode(request),
+    )
+    .await
+}
+
+/// Any message a `feedback` stream can carry: spec 2.14's
+/// `TransportFeedback`, spec 2.13's `AudioSyncFeedback` and spec 2.10's
+/// `KeyframeRequest` all share the same stream. See
+/// [`FeedbackReceiver::read_message`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FeedbackMessage {
     Transport(TransportFeedback),
     AudioSync(AudioSyncFeedback),
+    Keyframe(KeyframeRequest),
 }
 
 /// Server side: the accepted `feedback` stream, positioned to read
@@ -115,7 +133,11 @@ impl FeedbackReceiver {
     }
 
     /// Like [`Self::read_one`], but also accepts `AudioSyncFeedback` (spec
-    /// 2.13) -- both message types travel on this same `feedback` stream.
+    /// 2.13) and `KeyframeRequest` (spec 2.10) -- all three message types
+    /// travel on this same `feedback` stream. A server that keeps the
+    /// stream open for a session's duration should use this rather than
+    /// `read_one`, or a client's `KeyframeRequest` would surface as
+    /// `UnexpectedType`.
     pub async fn read_message(&mut self) -> Result<FeedbackMessage, ReadFeedbackError> {
         let (type_raw, payload) = self
             .reader
@@ -128,6 +150,9 @@ impl FeedbackReceiver {
         } else if type_raw == messages::type_id::AUDIO_SYNC_FEEDBACK {
             let feedback = messages::decode(&payload).map_err(ReadFeedbackError::Decode)?;
             Ok(FeedbackMessage::AudioSync(feedback))
+        } else if type_raw == messages::type_id::KEYFRAME_REQUEST {
+            let request = messages::decode(&payload).map_err(ReadFeedbackError::Decode)?;
+            Ok(FeedbackMessage::Keyframe(request))
         } else {
             Err(ReadFeedbackError::UnexpectedType(type_raw))
         }
