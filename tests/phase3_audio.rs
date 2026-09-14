@@ -236,5 +236,6 @@ async fn audio_sync_feedback_is_read_off_the_shared_feedback_stream() {
     match message {
         FeedbackMessage::AudioSync(received) => assert_eq!(received, feedback),
         FeedbackMessage::Transport(_) => panic!("expected AudioSync, got Transport"),
+        FeedbackMessage::Keyframe(_) => panic!("expected AudioSync, got KeyframeRequest"),
     }
 }

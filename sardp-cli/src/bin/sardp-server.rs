@@ -26,7 +26,7 @@ use sardp::clipboard_session;
 use sardp::conn_error::{ConnError, is_transport_disconnect};
 use sardp::connection_sm::defaults as timeouts;
 use sardp::encoder;
-use sardp::feedback_session::FeedbackReceiver;
+use sardp::feedback_session::{FeedbackMessage, FeedbackReceiver};
 use sardp::file_handle_store::FileHandleStore;
 use sardp::file_transfer_session::{self as file_transfer};
 use sardp::handshake::ControlChannel;
@@ -1071,9 +1071,29 @@ async fn run_active_session(
                 }
                 frame_id += 1;
             }
-            feedback = feedback_receiver.read_one() => {
-                let feedback = feedback?;
+            message = feedback_receiver.read_message() => {
                 last_activity = tokio::time::Instant::now();
+                let feedback = match message? {
+                    FeedbackMessage::Transport(feedback) => feedback,
+                    FeedbackMessage::Keyframe(request) => {
+                        // Spec 2.10 / 4.5: log as OS.DECODE_ERROR; reopening
+                        // at generation+1 in response is a MAY that this
+                        // PoC server does not implement yet (the client's
+                        // queue circuit breaker sends this as a last
+                        // resort, see sardp::queue_circuit_breaker).
+                        eprintln!(
+                            "[{peer}] KeyframeRequest {:?} from client (reason code {:?}); not acted on",
+                            request.reason,
+                            ReasonCode::OS_DECODE_ERROR
+                        );
+                        continue;
+                    }
+                    FeedbackMessage::AudioSync(_) => {
+                        // Spec 2.13; audio is plumbing-only in this PoC
+                        // (KNOWN_ISSUES.md item 10), nothing to adjust.
+                        continue;
+                    }
+                };
                 let now_us = clock::now_us();
                 let decision = video_channel.on_feedback(now_us, feedback.client_queue_delay_us, 0)?;
                 match decision {

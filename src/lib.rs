@@ -32,6 +32,7 @@ pub mod permission_set;
 pub mod permission_sm;
 pub mod pki;
 pub mod prologue;
+pub mod queue_circuit_breaker;
 pub mod reason_code;
 pub mod reconnection;
 pub mod session_file;

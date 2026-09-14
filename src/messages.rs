@@ -83,6 +83,8 @@ pub mod type_id {
     pub const MOUSE_BUTTON: u16 = 0x0023;
     pub const WHEEL: u16 = 0x0024;
     pub const IME_MODE_CHANGE: u16 = 0x0025;
+    /// `feedback` stream (client->server, spec 2.10).
+    pub const KEYFRAME_REQUEST: u16 = 0x0026;
 }
 
 /// `AuthMethod` enum (spec 2.3).
@@ -615,6 +617,29 @@ pub struct ImeModeChange {
     pub effective_after_event_id: u64,
 }
 
+/// `KeyframeRequest.reason` (spec 2.10).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum KeyframeReason {
+    /// The client cannot continue decoding from the frames it has
+    /// (spec 4.5: logged server-side as `OS.DECODE_ERROR`; the server
+    /// MAY reopen the stream at `generation + 1`). Also what the client
+    /// queue circuit breaker sends
+    /// ([`crate::queue_circuit_breaker`]), since "the decoder is so far
+    /// behind that continuing the current reference chain is pointless"
+    /// is the closest of the three reasons.
+    DecodeError,
+    Reconnect,
+    Manual,
+}
+
+/// `KeyframeRequest` (spec 2.10, `feedback` stream, client->server): asks
+/// the server for a fresh self-contained IDR. Distinct from the
+/// server-driven backpressure reset, which has no dedicated message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeyframeRequest {
+    pub reason: KeyframeReason,
+}
+
 /// CBOR-encodes `msg` (the DR-021 message-body scheme for this
 /// implementation). Encoding an owned, in-memory `Vec<u8>` sink cannot
 /// fail for any of the message types in this module.
@@ -1041,6 +1066,20 @@ mod tests {
         let bytes = encode(&msg);
         let decoded: AudioSyncFeedback = decode(&bytes).unwrap();
         assert_eq!(decoded, msg);
+    }
+
+    #[test]
+    fn keyframe_request_round_trips_every_reason() {
+        for reason in [
+            KeyframeReason::DecodeError,
+            KeyframeReason::Reconnect,
+            KeyframeReason::Manual,
+        ] {
+            let msg = KeyframeRequest { reason };
+            let bytes = encode(&msg);
+            let decoded: KeyframeRequest = decode(&bytes).unwrap();
+            assert_eq!(decoded, msg);
+        }
     }
 
     fn input_header() -> InputHeader {
