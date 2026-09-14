@@ -14,7 +14,7 @@ use crate::messages::{
 };
 use crate::prologue;
 use crate::stream_kind::StreamKind;
-use crate::stream_reader::{write_envelope, EnvelopeReader, StreamReadError};
+use crate::stream_reader::{EnvelopeReader, StreamReadError, write_envelope};
 
 #[derive(Debug)]
 pub enum ReadInputError {
@@ -50,7 +50,12 @@ pub async fn send_text_input(
     send: &mut quinn::SendStream,
     event: &TextInput,
 ) -> Result<(), quinn::WriteError> {
-    write_envelope(send, messages::type_id::TEXT_INPUT, &messages::encode(event)).await
+    write_envelope(
+        send,
+        messages::type_id::TEXT_INPUT,
+        &messages::encode(event),
+    )
+    .await
 }
 
 pub async fn send_ime_composition(
@@ -69,7 +74,12 @@ pub async fn send_mouse_move(
     send: &mut quinn::SendStream,
     event: &MouseMove,
 ) -> Result<(), quinn::WriteError> {
-    write_envelope(send, messages::type_id::MOUSE_MOVE, &messages::encode(event)).await
+    write_envelope(
+        send,
+        messages::type_id::MOUSE_MOVE,
+        &messages::encode(event),
+    )
+    .await
 }
 
 pub async fn send_mouse_button(
@@ -126,7 +136,10 @@ impl InputReceiver {
     /// Accepts the next incoming unidirectional stream and validates its
     /// `StreamPrologue` as `input`.
     pub async fn accept(connection: &quinn::Connection) -> Result<Self, ReadInputError> {
-        let recv = connection.accept_uni().await.map_err(ReadInputError::Quic)?;
+        let recv = connection
+            .accept_uni()
+            .await
+            .map_err(ReadInputError::Quic)?;
         let mut reader = EnvelopeReader::new(recv);
         let stream_prologue = reader.read_prologue().await.map_err(ReadInputError::Read)?;
         if stream_prologue.kind != StreamKind::Input {

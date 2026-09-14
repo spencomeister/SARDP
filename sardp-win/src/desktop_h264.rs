@@ -15,190 +15,101 @@
 
 use std::collections::VecDeque;
 use std::mem::ManuallyDrop;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::thread::JoinHandle;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use tokio::sync::mpsc;
+use sardp::frame_source::{
+    Clock, DEFAULT_CHANNEL_CAPACITY, DesktopH264Config, EncodedFrame, FrameWorker, SendOutcome,
+    SourceError, SourceInfo, WorkerContext,
+};
+use sardp::h264::{self, ParameterSetCache};
 
-use windows::core::{Interface, PWSTR};
 use windows::Win32::Graphics::Direct3D11::{
-    ID3D11Device, ID3D11DeviceContext, ID3D11Multithread, ID3D11Resource, ID3D11Texture2D,
-    ID3D11VideoContext, ID3D11VideoDevice, ID3D11VideoProcessor, ID3D11VideoProcessorInputView,
-    ID3D11VideoProcessorOutputView, D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE,
-    D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_CREATE_DEVICE_VIDEO_SUPPORT, D3D11_TEX2D_VPIV,
-    D3D11_TEX2D_VPOV, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
-    D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE, D3D11_VIDEO_PROCESSOR_CONTENT_DESC,
+    D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+    D3D11_CREATE_DEVICE_VIDEO_SUPPORT, D3D11_TEX2D_VPIV, D3D11_TEX2D_VPOV, D3D11_TEXTURE2D_DESC,
+    D3D11_USAGE_DEFAULT, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE, D3D11_VIDEO_PROCESSOR_CONTENT_DESC,
     D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC, D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0,
     D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC, D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0,
     D3D11_VIDEO_PROCESSOR_STREAM, D3D11_VIDEO_USAGE_PLAYBACK_NORMAL,
-    D3D11_VPIV_DIMENSION_TEXTURE2D, D3D11_VPOV_DIMENSION_TEXTURE2D,
+    D3D11_VPIV_DIMENSION_TEXTURE2D, D3D11_VPOV_DIMENSION_TEXTURE2D, ID3D11Device,
+    ID3D11DeviceContext, ID3D11Multithread, ID3D11Resource, ID3D11Texture2D, ID3D11VideoContext,
+    ID3D11VideoDevice, ID3D11VideoProcessor, ID3D11VideoProcessorInputView,
+    ID3D11VideoProcessorOutputView,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_NV12, DXGI_RATIONAL, DXGI_SAMPLE_DESC,
 };
 use windows::Win32::Graphics::Dxgi::{
-    IDXGIResource, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO,
+    DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO, IDXGIResource,
 };
 use windows::Win32::Media::MediaFoundation::{
-    ICodecAPI, IMFActivate, IMFDXGIDeviceManager, IMFMediaEvent, IMFMediaEventGenerator,
-    IMFMediaType, IMFSample, IMFTransform, MFCreateDXGIDeviceManager, MFCreateDXGISurfaceBuffer,
-    MFCreateMediaType, MFCreateSample, MFShutdown, MFStartup, MFTEnumEx, MFMediaType_Video,
-    MFSampleExtension_CleanPoint, MFVideoFormat_H264, MFVideoFormat_NV12,
-    MFVideoInterlace_Progressive, CODECAPI_AVEncMPVGOPSize, CODECAPI_AVEncVideoForceKeyFrame,
-    METransformHaveOutput, METransformNeedInput, MFT_CATEGORY_VIDEO_ENCODER,
-    MFT_ENUM_FLAG_HARDWARE, MFT_ENUM_FLAG_SORTANDFILTER, MFT_ENUM_FLAG_SYNCMFT,
-    MFT_FRIENDLY_NAME_Attribute, MFT_MESSAGE_COMMAND_DRAIN, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
-    MFT_MESSAGE_NOTIFY_END_OF_STREAM, MFT_MESSAGE_NOTIFY_END_STREAMING,
-    MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_MESSAGE_SET_D3D_MANAGER, MFT_OUTPUT_DATA_BUFFER,
-    MFT_REGISTER_TYPE_INFO, MF_EVENT_FLAG_NO_WAIT, MF_E_TRANSFORM_NEED_MORE_INPUT,
-    MF_MT_AVG_BITRATE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE,
-    MF_MT_MAJOR_TYPE, MF_MT_MPEG_SEQUENCE_HEADER, MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE,
-    MF_TRANSFORM_ASYNC_UNLOCK, MF_VERSION, MFSTARTUP_FULL,
+    CODECAPI_AVEncMPVGOPSize, CODECAPI_AVEncVideoForceKeyFrame, ICodecAPI, IMFActivate,
+    IMFDXGIDeviceManager, IMFMediaEvent, IMFMediaEventGenerator, IMFMediaType, IMFSample,
+    IMFTransform, METransformHaveOutput, METransformNeedInput, MF_E_TRANSFORM_NEED_MORE_INPUT,
+    MF_EVENT_FLAG_NO_WAIT, MF_MT_AVG_BITRATE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE,
+    MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_MPEG_SEQUENCE_HEADER, MF_MT_PIXEL_ASPECT_RATIO,
+    MF_MT_SUBTYPE, MF_TRANSFORM_ASYNC_UNLOCK, MF_VERSION, MFCreateDXGIDeviceManager,
+    MFCreateDXGISurfaceBuffer, MFCreateMediaType, MFCreateSample, MFMediaType_Video,
+    MFSTARTUP_FULL, MFSampleExtension_CleanPoint, MFShutdown, MFStartup,
+    MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_FLAG_HARDWARE, MFT_ENUM_FLAG_SORTANDFILTER,
+    MFT_ENUM_FLAG_SYNCMFT, MFT_FRIENDLY_NAME_Attribute, MFT_MESSAGE_COMMAND_DRAIN,
+    MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, MFT_MESSAGE_NOTIFY_END_OF_STREAM,
+    MFT_MESSAGE_NOTIFY_END_STREAMING, MFT_MESSAGE_NOTIFY_START_OF_STREAM,
+    MFT_MESSAGE_SET_D3D_MANAGER, MFT_OUTPUT_DATA_BUFFER, MFT_REGISTER_TYPE_INFO, MFTEnumEx,
+    MFVideoFormat_H264, MFVideoFormat_NV12, MFVideoInterlace_Progressive,
 };
-use windows::Win32::System::Com::{CoInitializeEx, CoTaskMemFree, CoUninitialize, COINIT_MULTITHREADED};
+use windows::Win32::System::Com::{
+    COINIT_MULTITHREADED, CoInitializeEx, CoTaskMemFree, CoUninitialize,
+};
 use windows::Win32::System::Variant::VARIANT;
+use windows::core::{Interface, PWSTR};
 
 use dxgi_capture_poc::capture::{
-    create_d3d11_device, create_output_duplication, duplicated_output_desktop_rect,
-    primary_display_refresh_interval, FrameGuard,
+    FrameGuard, create_d3d11_device, create_output_duplication, duplicated_output_desktop_rect,
+    primary_display_refresh_interval,
 };
 
-/// Monotonic microsecond clock supplied by the caller, so the frames'
-/// `capture_ts`/`encode_done_ts` share the server's `VideoFrameHeader`
-/// clock basis (this crate deliberately doesn't depend on `sardp`).
-pub type Clock = Arc<dyn Fn() -> u64 + Send + Sync>;
-
-#[derive(Debug, Clone, Copy)]
-pub struct DesktopH264Config {
-    pub bitrate_bps: u32,
-    /// Encode every frame as an IDR (GOP size 1). Costs bitrate but keeps
-    /// each frame independently decodable -- needed for a client that
-    /// decodes each frame with a fresh `ffmpeg` process (`sardp-client
-    /// --display log`). Off: IDR on request ([`DesktopH264Source::request_idr`],
-    /// i.e. at each generation open) plus a long safety-net GOP; the rest
-    /// are P-frames (3W-1-d-3, with the client's persistent decoder).
-    pub all_idr: bool,
-    /// `AcquireNextFrame` timeout; also bounds how often the worker checks
-    /// its stop flag.
-    pub acquire_timeout: Duration,
-}
-
-impl Default for DesktopH264Config {
-    fn default() -> Self {
-        Self {
-            bitrate_bps: 8_000_000,
-            all_idr: false,
-            acquire_timeout: Duration::from_millis(500),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SourceInfo {
-    pub width: u32,
-    pub height: u32,
-    /// Display refresh rate, rounded; also the encoder's nominal frame rate.
-    pub fps: u32,
-    /// Top-left of the captured output in virtual-desktop coordinates:
-    /// input positions relative to the captured image are offset by this
-    /// before injection.
-    pub origin_x: i32,
-    pub origin_y: i32,
-}
-
-/// One encoded frame: an Annex-B H.264 access unit. When `is_idr`, the
-/// bytes are self-contained (SPS+PPS precede the IDR slice, spec 2.10).
-#[derive(Debug, Clone)]
-pub struct EncodedFrame {
-    pub annex_b: Vec<u8>,
-    pub is_idr: bool,
-    pub capture_ts: u64,
-    pub encode_done_ts: u64,
-}
-
-#[derive(Debug)]
-pub enum WinCaptureError {
-    /// The worker thread failed to set up capture/encode.
-    Init(String),
-    /// The worker thread died after startup (e.g. `DXGI_ERROR_ACCESS_LOST`).
-    Worker(String),
-}
-
-impl std::fmt::Display for WinCaptureError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Init(s) => write!(f, "desktop capture init failed: {s}"),
-            Self::Worker(s) => write!(f, "desktop capture worker failed: {s}"),
-        }
-    }
-}
-
-/// How many encoded frames may wait for the consumer before the worker
-/// starts dropping (source-side drop, DR-007).
-const CHANNEL_CAPACITY: usize = 4;
+/// Kept for callers written against the 3W-1-d-2 API; the type itself now
+/// lives in `sardp::frame_source` (shared with the other platforms).
+pub type WinCaptureError = SourceError;
 
 /// A running capture+encode pipeline. Dropping it stops the worker thread.
+///
+/// The thread/channel/readiness mechanics are `sardp::frame_source`'s
+/// [`FrameWorker`] (shared with every platform); this type adds the one
+/// Windows-side control the encoder needs, [`Self::request_idr`].
 pub struct DesktopH264Source {
-    rx: mpsc::Receiver<EncodedFrame>,
-    info: SourceInfo,
-    stop: Arc<AtomicBool>,
+    worker: FrameWorker<EncodedFrame, SourceInfo>,
     force_idr: Arc<AtomicBool>,
-    worker: Option<JoinHandle<()>>,
 }
 
 impl DesktopH264Source {
     /// Starts the worker and blocks (briefly) until it has captured its
     /// first frame and therefore knows the display dimensions.
-    pub fn start(config: DesktopH264Config, clock: Clock) -> Result<Self, WinCaptureError> {
-        let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
-        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<SourceInfo, String>>();
-        let stop = Arc::new(AtomicBool::new(false));
+    pub fn start(config: DesktopH264Config, clock: Clock) -> Result<Self, SourceError> {
         let force_idr = Arc::new(AtomicBool::new(false));
-
         let worker = {
-            let stop = stop.clone();
             let force_idr = force_idr.clone();
-            std::thread::Builder::new()
-                .name("sardp-win-capture".into())
-                .spawn(move || worker_main(config, clock, tx, ready_tx, stop, force_idr))
-                .map_err(|e| WinCaptureError::Init(format!("spawn worker thread: {e}")))?
+            FrameWorker::spawn(
+                "sardp-win-capture",
+                DEFAULT_CHANNEL_CAPACITY,
+                Duration::from_secs(15),
+                move |ctx| worker_main(config, clock, ctx, &force_idr),
+            )?
         };
-
-        let info = match ready_rx.recv_timeout(Duration::from_secs(15)) {
-            Ok(Ok(info)) => info,
-            Ok(Err(e)) => {
-                stop.store(true, Ordering::SeqCst);
-                let _ = worker.join();
-                return Err(WinCaptureError::Init(e));
-            }
-            Err(_) => {
-                stop.store(true, Ordering::SeqCst);
-                return Err(WinCaptureError::Init(
-                    "worker did not produce a first frame within 15s".into(),
-                ));
-            }
-        };
-
-        Ok(Self {
-            rx,
-            info,
-            stop,
-            force_idr,
-            worker: Some(worker),
-        })
+        Ok(Self { worker, force_idr })
     }
 
     pub fn info(&self) -> SourceInfo {
-        self.info
+        *self.worker.info()
     }
 
     /// Next encoded frame, or `None` once the worker has stopped (an error
     /// after startup surfaces as the channel closing; the reason is logged
     /// by the worker).
     pub async fn next_frame(&mut self) -> Option<EncodedFrame> {
-        self.rx.recv().await
+        self.worker.next().await
     }
 
     /// Ask the encoder to make the next frame an IDR (needed when a new
@@ -209,44 +120,23 @@ impl DesktopH264Source {
     }
 }
 
-impl Drop for DesktopH264Source {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::SeqCst);
-        if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
-        }
-    }
-}
-
 fn worker_main(
     config: DesktopH264Config,
     clock: Clock,
-    tx: mpsc::Sender<EncodedFrame>,
-    ready_tx: std::sync::mpsc::Sender<Result<SourceInfo, String>>,
-    stop: Arc<AtomicBool>,
-    force_idr: Arc<AtomicBool>,
-) {
+    ctx: &mut WorkerContext<EncodedFrame, SourceInfo>,
+    force_idr: &AtomicBool,
+) -> Result<(), String> {
     // COM/MF lifetime brackets the whole worker; every COM object is created
     // and dropped inside `run_worker` so MFShutdown runs after them.
     let com_ok = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.is_ok();
     if let Err(e) = unsafe { MFStartup(MF_VERSION, MFSTARTUP_FULL) } {
-        let _ = ready_tx.send(Err(format!("MFStartup: {e}")));
         if com_ok {
             unsafe { CoUninitialize() };
         }
-        return;
+        return Err(format!("MFStartup: {e}"));
     }
 
-    let mut ready_tx = Some(ready_tx);
-    if let Err(e) = run_worker(config, clock, &tx, &mut ready_tx, &stop, &force_idr) {
-        // If we never reported readiness, this is an init failure; otherwise
-        // the consumer just sees the channel close.
-        if let Some(ready) = ready_tx.take() {
-            let _ = ready.send(Err(e));
-        } else {
-            eprintln!("[sardp-win] capture worker stopped: {e}");
-        }
-    }
+    let result = run_worker(config, clock, ctx, force_idr);
 
     unsafe {
         let _ = MFShutdown();
@@ -254,27 +144,27 @@ fn worker_main(
             CoUninitialize();
         }
     }
+    result
 }
 
 fn run_worker(
     config: DesktopH264Config,
     clock: Clock,
-    tx: &mpsc::Sender<EncodedFrame>,
-    ready_tx: &mut Option<std::sync::mpsc::Sender<Result<SourceInfo, String>>>,
-    stop: &AtomicBool,
+    ctx: &mut WorkerContext<EncodedFrame, SourceInfo>,
     force_idr: &AtomicBool,
 ) -> Result<(), String> {
     let e = |ctx: &str, err: windows::core::Error| format!("{ctx}: {err}");
 
-    let (device, context) = create_d3d11_device(
-        D3D11_CREATE_DEVICE_VIDEO_SUPPORT | D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-    )
-    .map_err(|err| e("D3D11CreateDevice", err))?;
-    let multithread: ID3D11Multithread = device.cast().map_err(|err| e("ID3D11Multithread", err))?;
+    let (device, context) =
+        create_d3d11_device(D3D11_CREATE_DEVICE_VIDEO_SUPPORT | D3D11_CREATE_DEVICE_BGRA_SUPPORT)
+            .map_err(|err| e("D3D11CreateDevice", err))?;
+    let multithread: ID3D11Multithread =
+        device.cast().map_err(|err| e("ID3D11Multithread", err))?;
     let _ = unsafe { multithread.SetMultithreadProtected(true) };
 
     let device_manager = create_device_manager(&device).map_err(|err| e("device manager", err))?;
-    let duplication = create_output_duplication(&device).map_err(|err| e("DuplicateOutput", err))?;
+    let duplication =
+        create_output_duplication(&device).map_err(|err| e("DuplicateOutput", err))?;
     let origin = match duplicated_output_desktop_rect(&device) {
         Ok(rect) => (rect.left, rect.top),
         Err(err) => {
@@ -289,7 +179,6 @@ fn run_worker(
 
     let mut converter: Option<VideoConverter> = None;
     let mut encoder: Option<Encoder> = None;
-    let mut dropped: u64 = 0;
     let mut stats = CaptureStats::default();
     // Pacing: at most one encoded frame per display refresh. DXGI hands
     // out more "frames" than that -- pointer-only updates carry no new
@@ -302,7 +191,7 @@ fn run_worker(
     let start = Instant::now();
     let mut warned_no_image = false;
 
-    while !stop.load(Ordering::SeqCst) {
+    while !ctx.should_stop() {
         let mut frame_info = DXGI_OUTDUPL_FRAME_INFO::default();
         let mut resource: Option<IDXGIResource> = None;
         let acquired = unsafe {
@@ -312,7 +201,10 @@ fn run_worker(
             Ok(()) => {}
             Err(err) if err.code() == DXGI_ERROR_WAIT_TIMEOUT => continue,
             Err(err) if err.code() == DXGI_ERROR_ACCESS_LOST => {
-                return Err(e("AcquireNextFrame (access lost; display mode change/lock screen?)", err));
+                return Err(e(
+                    "AcquireNextFrame (access lost; display mode change/lock screen?)",
+                    err,
+                ));
             }
             Err(err) => return Err(e("AcquireNextFrame", err)),
         }
@@ -349,7 +241,10 @@ fn run_worker(
                 // A completely static desktop produces no presents; the
                 // first real frame (and so the Instance's first IDR) waits
                 // for the next desktop update.
-                eprintln!("[sardp-win] no desktop image update yet after {:?}", start.elapsed());
+                eprintln!(
+                    "[sardp-win] no desktop image update yet after {:?}",
+                    start.elapsed()
+                );
                 warned_no_image = true;
             }
             continue;
@@ -370,11 +265,17 @@ fn run_worker(
         if stats.encoded.is_multiple_of(600) {
             eprintln!(
                 "[sardp-win] capture: acquired={} encoded={} pointer_only={} paced_out={} dropped_by_consumer={}",
-                stats.acquired, stats.encoded, stats.pointer_only, stats.paced_out, dropped
+                stats.acquired,
+                stats.encoded,
+                stats.pointer_only,
+                stats.paced_out,
+                ctx.frames.dropped()
             );
         }
         let resource = resource.expect("AcquireNextFrame succeeded without a resource");
-        let texture: ID3D11Texture2D = resource.cast().map_err(|err| e("frame texture cast", err))?;
+        let texture: ID3D11Texture2D = resource
+            .cast()
+            .map_err(|err| e("frame texture cast", err))?;
 
         if encoder.is_none() {
             let mut desc = D3D11_TEXTURE2D_DESC::default();
@@ -387,15 +288,13 @@ fn run_worker(
                 Encoder::new(&device_manager, desc.Width, desc.Height, fps, &config)
                     .map_err(|err| e("Encoder", err))?,
             );
-            if let Some(ready) = ready_tx.take() {
-                let _ = ready.send(Ok(SourceInfo {
-                    width: desc.Width,
-                    height: desc.Height,
-                    fps,
-                    origin_x: origin.0,
-                    origin_y: origin.1,
-                }));
-            }
+            ctx.report_ready(SourceInfo {
+                width: desc.Width,
+                height: desc.Height,
+                fps,
+                origin_x: origin.0,
+                origin_y: origin.1,
+            });
         }
 
         let nv12 = converter
@@ -415,15 +314,12 @@ fn run_worker(
             .encode_frame(nv12, capture_ts, &clock)
             .map_err(|err| e("encode", err))?;
         for frame in outputs {
-            match tx.try_send(frame) {
-                Ok(()) => {}
-                Err(mpsc::error::TrySendError::Full(_)) => {
-                    dropped += 1;
-                    if dropped.is_power_of_two() {
-                        eprintln!("[sardp-win] consumer behind; dropped {dropped} encoded frame(s) so far");
-                    }
-                }
-                Err(mpsc::error::TrySendError::Closed(_)) => return Ok(()),
+            // Source-side drop under backpressure (DR-007) lives in the
+            // shared FrameSender; a closed channel means the consumer is
+            // gone and this worker is done.
+            match ctx.frames.send(frame) {
+                SendOutcome::Sent | SendOutcome::Dropped => {}
+                SendOutcome::Closed => return Ok(()),
             }
         }
     }
@@ -491,7 +387,10 @@ impl VideoConverter {
             MipLevels: 1,
             ArraySize: 1,
             Format: DXGI_FORMAT_B8G8R8A8_UNORM,
-            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
             Usage: D3D11_USAGE_DEFAULT,
             BindFlags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
             CPUAccessFlags: 0,
@@ -626,10 +525,16 @@ struct Encoder {
     /// self-contained). Taken from the first sample that carries them
     /// (hardware MFTs typically only include them with the very first IDR),
     /// with `MF_MT_MPEG_SEQUENCE_HEADER` on the negotiated output type as a
-    /// fallback source.
-    sequence_header: Option<Vec<u8>>,
+    /// fallback source. The logic is `sardp::h264`'s (shared with macOS).
+    parameter_sets: ParameterSetCache,
     /// `capture_ts` of inputs not yet matched to an output (1:1, no B-frames).
     pending_capture_ts: VecDeque<u64>,
+    /// How long `encode_frame` waits for the current input's output before
+    /// returning without it (one capture interval, at least 20ms).
+    output_wait: Duration,
+    /// `METransformNeedInput` events consumed while waiting for output,
+    /// still to be spent on inputs.
+    need_input_credits: u32,
     last_pts_100ns: Option<i64>,
     input_count: u64,
     output_count: u64,
@@ -679,7 +584,9 @@ impl Encoder {
                 eprintln!("[sardp-win] CODECAPI_AVEncMPVGOPSize={gop_size} rejected: {err}");
             }
         } else {
-            eprintln!("[sardp-win] encoder MFT has no ICodecAPI; GOP size left at the driver default");
+            eprintln!(
+                "[sardp-win] encoder MFT has no ICodecAPI; GOP size left at the driver default"
+            );
         }
 
         let output_type = unsafe {
@@ -717,8 +624,11 @@ impl Encoder {
             codec_api,
             all_idr: config.all_idr,
             fps,
-            sequence_header: None,
+            parameter_sets: ParameterSetCache::new(),
             pending_capture_ts: VecDeque::new(),
+            output_wait: Duration::from_micros(1_000_000 / u64::from(fps.max(1)))
+                .max(Duration::from_millis(20)),
+            need_input_credits: 0,
             last_pts_100ns: None,
             input_count: 0,
             output_count: 0,
@@ -753,7 +663,8 @@ impl Encoder {
         };
         self.last_pts_100ns = Some(pts);
 
-        let buffer = unsafe { MFCreateDXGISurfaceBuffer(&ID3D11Texture2D::IID, texture, 0, false)? };
+        let buffer =
+            unsafe { MFCreateDXGISurfaceBuffer(&ID3D11Texture2D::IID, texture, 0, false)? };
         let sample: IMFSample = unsafe { MFCreateSample()? };
         unsafe {
             sample.AddBuffer(&buffer)?;
@@ -763,8 +674,15 @@ impl Encoder {
 
         let mut outputs = Vec::new();
         loop {
-            let event = self.wait_for_event(Duration::from_secs(5))?;
-            let event_type = unsafe { event.GetType()? };
+            // A NeedInput seen (and banked) while waiting for a previous
+            // output is as good as one arriving now.
+            let event_type = if self.need_input_credits > 0 {
+                self.need_input_credits -= 1;
+                METransformNeedInput.0 as u32
+            } else {
+                let event = self.wait_for_event(Duration::from_secs(5))?;
+                unsafe { event.GetType()? }
+            };
             if event_type == METransformNeedInput.0 as u32 {
                 if self.all_idr {
                     // Belt and braces with the GOP-size setting: some MFTs
@@ -781,7 +699,15 @@ impl Encoder {
                 }
             }
         }
-        // Anything already ready (typically this frame's own output).
+        // Wait (bounded) for this input's own output. Collecting only what
+        // is *already* ready handed frame N's output over during frame
+        // N+1's call, i.e. one capture interval of avoidable latency on
+        // every frame (Stage 3 re-measurement: encode averaged 28ms with
+        // ~17ms of that being the wait for the next capture). The bound
+        // keeps an encoder that pipelines deeper than one frame from
+        // stalling the capture loop: whatever isn't ready by then is
+        // collected on the next call as before.
+        let deadline = Instant::now() + self.output_wait;
         loop {
             match unsafe { self.events.GetEvent(MF_EVENT_FLAG_NO_WAIT) } {
                 Ok(event) => {
@@ -790,9 +716,20 @@ impl Encoder {
                         if let Some(frame) = self.take_one_output(clock)? {
                             outputs.push(frame);
                         }
+                    } else if event_type == METransformNeedInput.0 as u32 {
+                        // Don't lose the MFT's permission for the next
+                        // input: the first version of this wait consumed
+                        // it here and the next call then waited 5s for a
+                        // NeedInput that had already been delivered.
+                        self.need_input_credits += 1;
                     }
                 }
-                Err(_) => break,
+                Err(_) => {
+                    if self.output_count >= self.input_count || Instant::now() >= deadline {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
             }
         }
         Ok(outputs)
@@ -836,30 +773,27 @@ impl Encoder {
         };
         self.output_count += 1;
         let encode_done_ts = clock();
-        let capture_ts = self.pending_capture_ts.pop_front().unwrap_or(encode_done_ts);
+        let capture_ts = self
+            .pending_capture_ts
+            .pop_front()
+            .unwrap_or(encode_done_ts);
 
-        let mut annex_b = sample_bytes(&sample)?;
+        let annex_b = sample_bytes(&sample)?;
         // MFSampleExtension_CleanPoint proved unreliable on the validated
-        // MFT (set on the first IDR only), so look at the NAL units too.
+        // MFT (set on the first IDR only), so the NAL units decide.
         let clean_point =
             unsafe { sample.GetUINT32(&MFSampleExtension_CleanPoint) }.unwrap_or(0) != 0;
-        let nal_types = nal_unit_types(&annex_b);
-        let is_idr = clean_point || nal_types.contains(&5);
-        if self.sequence_header.is_none() {
-            if nal_types.contains(&7) && nal_types.contains(&8) {
-                self.sequence_header = extract_parameter_sets(&annex_b);
-            } else {
-                self.sequence_header = self.read_sequence_header();
-            }
+        let is_idr = h264::is_idr_access_unit(&annex_b, clean_point);
+        if !self.parameter_sets.observe(&annex_b)
+            && let Some(header) = self.read_sequence_header()
+        {
+            self.parameter_sets.set_fallback(header);
         }
-        if is_idr && !nal_types.contains(&7) {
-            if let Some(header) = &self.sequence_header {
-                let mut with_header = Vec::with_capacity(header.len() + annex_b.len());
-                with_header.extend_from_slice(header);
-                with_header.append(&mut annex_b);
-                annex_b = with_header;
-            }
-        }
+        let annex_b = if is_idr {
+            self.parameter_sets.complete_idr(annex_b)
+        } else {
+            annex_b
+        };
         Ok(Some(EncodedFrame {
             annex_b,
             is_idr,
@@ -887,7 +821,10 @@ impl Encoder {
             return Ok(());
         }
         self.finished = true;
-        unsafe { self.transform.ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0)? };
+        unsafe {
+            self.transform
+                .ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0)?
+        };
         // Nobody consumes drained output at shutdown; just bound the wait.
         let deadline = Instant::now() + Duration::from_secs(2);
         while self.output_count < self.input_count && Instant::now() < deadline {
@@ -902,8 +839,12 @@ impl Encoder {
             }
         }
         unsafe {
-            let _ = self.transform.ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
-            let _ = self.transform.ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0);
+            let _ = self
+                .transform
+                .ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
+            let _ = self
+                .transform
+                .ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0);
         }
         Ok(())
     }
@@ -924,55 +865,6 @@ fn sample_bytes(sample: &IMFSample) -> windows::core::Result<Vec<u8>> {
     let bytes = unsafe { std::slice::from_raw_parts(ptr, len as usize) }.to_vec();
     unsafe { buffer.Unlock()? };
     Ok(bytes)
-}
-
-/// Byte offsets at which Annex-B start codes (`00 00 01` / `00 00 00 01`)
-/// begin, paired with the offset of the NAL header byte that follows. A
-/// minimal scanner (the full splitter lives in `sardp::h264`, which this
-/// crate can't depend on).
-fn nal_starts(annex_b: &[u8]) -> Vec<(usize, usize)> {
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i + 3 <= annex_b.len() {
-        if annex_b[i] == 0 && annex_b[i + 1] == 0 {
-            if annex_b[i + 2] == 1 {
-                out.push((i, i + 3));
-                i += 3;
-                continue;
-            }
-            if annex_b[i + 2] == 0 && annex_b.get(i + 3) == Some(&1) {
-                out.push((i, i + 4));
-                i += 4;
-                continue;
-            }
-        }
-        i += 1;
-    }
-    out
-}
-
-/// `nal_unit_type` of every NAL unit, in order.
-fn nal_unit_types(annex_b: &[u8]) -> Vec<u8> {
-    nal_starts(annex_b)
-        .into_iter()
-        .filter_map(|(_, header)| annex_b.get(header).map(|b| b & 0x1F))
-        .collect()
-}
-
-/// The SPS (7) and PPS (8) NAL units, start codes included, concatenated
-/// in stream order -- i.e. exactly what has to precede an IDR slice for
-/// the access unit to be self-contained.
-fn extract_parameter_sets(annex_b: &[u8]) -> Option<Vec<u8>> {
-    let starts = nal_starts(annex_b);
-    let mut out = Vec::new();
-    for (idx, &(start, header)) in starts.iter().enumerate() {
-        let nal_type = annex_b.get(header).map(|b| b & 0x1F)?;
-        if nal_type == 7 || nal_type == 8 {
-            let end = starts.get(idx + 1).map(|&(s, _)| s).unwrap_or(annex_b.len());
-            out.extend_from_slice(&annex_b[start..end]);
-        }
-    }
-    if out.is_empty() { None } else { Some(out) }
 }
 
 /// First hardware H.264 encoder MFT (vendor-neutral; on the validated
@@ -1028,33 +920,4 @@ fn find_hardware_h264_encoder() -> windows::core::Result<IMFActivate> {
     };
     eprintln!("[sardp-win] using hardware encoder MFT: {name}");
     Ok(first)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{extract_parameter_sets, nal_unit_types};
-
-    #[test]
-    fn nal_unit_types_handles_both_start_code_lengths() {
-        let buf = [0, 0, 0, 1, 0x67, 0xAA, 0, 0, 1, 0x68, 0xBB, 0, 0, 0, 1, 0x65, 0xCC];
-        assert_eq!(nal_unit_types(&buf), vec![7, 8, 5]);
-        assert_eq!(nal_unit_types(&[0, 0, 0, 0]), Vec::<u8>::new());
-        assert_eq!(nal_unit_types(&[]), Vec::<u8>::new());
-    }
-
-    #[test]
-    fn extract_parameter_sets_keeps_sps_and_pps_with_their_start_codes() {
-        let sps = [0, 0, 0, 1, 0x67, 0xAA, 0xAB];
-        let pps = [0, 0, 1, 0x68, 0xBB];
-        let idr = [0, 0, 0, 1, 0x65, 0xCC, 0xCD];
-        let mut buf = Vec::new();
-        buf.extend_from_slice(&sps);
-        buf.extend_from_slice(&pps);
-        buf.extend_from_slice(&idr);
-        let mut expected = Vec::new();
-        expected.extend_from_slice(&sps);
-        expected.extend_from_slice(&pps);
-        assert_eq!(extract_parameter_sets(&buf), Some(expected));
-        assert_eq!(extract_parameter_sets(&idr), None);
-    }
 }

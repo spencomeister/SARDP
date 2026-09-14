@@ -898,7 +898,6 @@ dependencies = [
  "rand",
  "rcgen",
  "rustls-pemfile",
- "sardp-win",
  "serde",
  "serde_bytes",
  "sha2",
@@ -907,10 +906,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "sardp-cli"
+version = "0.1.0"
+dependencies = [
+ "ed25519-dalek",
+ "quinn",
+ "sardp",
+ "sardp-mac",
+ "sardp-win",
+ "tokio",
+]
+
+[[package]]
+name = "sardp-mac"
+version = "0.1.0"
+dependencies = [
+ "sardp",
+ "sck-capture-poc",
+ "tokio",
+]
+
+[[package]]
 name = "sardp-win"
 version = "0.1.0"
 dependencies = [
  "dxgi-capture-poc",
+ "sardp",
  "tokio",
  "windows",
 ]
@@ -922,6 +943,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "91c1b7e4904c873ef0710c1f407dde2e6287de2bebc1bbbf7d430bb7cbffd939"
 dependencies = [
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "sck-capture-poc"
+version = "0.1.0"
+dependencies = [
+ "sardp",
 ]
 
 [[package]]

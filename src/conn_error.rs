@@ -4,7 +4,7 @@
 //! rather than a protocol violation the server itself detected. Lives in
 //! the library crate (KNOWN_ISSUES.md #1) purely so it can carry unit
 //! tests -- `ConnError` itself is only ever constructed by
-//! `src/bin/sardp-server.rs`.
+//! `sardp-cli/src/bin/sardp-server.rs`.
 
 use crate::audio_session::AudioError;
 use crate::clipboard_session::ClipboardSessionError;

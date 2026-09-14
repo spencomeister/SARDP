@@ -165,7 +165,10 @@ mod tests {
         let mut scancodes = HashSet::new();
         for (hid, sc, ext) in TABLE {
             assert!(hids.insert(*hid), "duplicate HID usage {hid:#x}");
-            assert!(scancodes.insert((*sc, *ext)), "duplicate scan code {sc:#x} ext={ext}");
+            assert!(
+                scancodes.insert((*sc, *ext)),
+                "duplicate scan code {sc:#x} ext={ext}"
+            );
         }
     }
 

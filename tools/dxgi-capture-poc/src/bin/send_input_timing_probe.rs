@@ -11,19 +11,18 @@
 
 use std::time::{Duration, Instant};
 
-use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    SendInput, SetFocus, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP,
-    KEYEVENTF_UNICODE, VIRTUAL_KEY,
+    INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, SendInput,
+    SetFocus, VIRTUAL_KEY,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DispatchMessageW, PeekMessageW, SendMessageW, SetForegroundWindow,
-    SetWindowTextW, ShowWindow, TranslateMessage, ES_AUTOVSCROLL, ES_MULTILINE, MSG,
-    PM_REMOVE, SW_SHOW, WM_GETTEXT, WM_GETTEXTLENGTH, WS_EX_LEFT, WS_OVERLAPPEDWINDOW,
-    WS_VISIBLE,
+    CreateWindowExW, DispatchMessageW, ES_AUTOVSCROLL, ES_MULTILINE, MSG, PM_REMOVE, PeekMessageW,
+    SW_SHOW, SendMessageW, SetForegroundWindow, SetWindowTextW, ShowWindow, TranslateMessage,
+    WM_GETTEXT, WM_GETTEXTLENGTH, WS_EX_LEFT, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
 };
+use windows::core::PCWSTR;
 
 const DEMO_TEXT: &str = "SARDP 3W-1-c: SendInputによる入力注入テスト / Hello from Rust!";
 
@@ -101,8 +100,8 @@ fn clear_text(hwnd: HWND) -> windows::core::Result<()> {
 }
 
 fn window_text(hwnd: HWND) -> String {
-    let len =
-        unsafe { SendMessageW(hwnd, WM_GETTEXTLENGTH, Some(WPARAM(0)), Some(LPARAM(0))) }.0 as usize;
+    let len = unsafe { SendMessageW(hwnd, WM_GETTEXTLENGTH, Some(WPARAM(0)), Some(LPARAM(0))) }.0
+        as usize;
     if len == 0 {
         return String::new();
     }
@@ -115,7 +114,9 @@ fn window_text(hwnd: HWND) -> String {
             Some(LPARAM(buf.as_mut_ptr() as isize)),
         )
     };
-    String::from_utf16_lossy(&buf).trim_end_matches('\0').to_string()
+    String::from_utf16_lossy(&buf)
+        .trim_end_matches('\0')
+        .to_string()
 }
 
 fn type_unicode_text(text: &str, delay: Duration) -> windows::core::Result<()> {

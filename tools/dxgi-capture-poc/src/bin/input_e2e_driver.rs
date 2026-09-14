@@ -25,17 +25,16 @@
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use windows::core::BOOL;
 use windows::Win32::Foundation::{HWND, LPARAM, POINT, RECT, WPARAM};
 use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
 use windows::Win32::UI::Input::KeyboardAndMouse::VK_RETURN;
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumChildWindows, EnumWindows, GetClassNameW, GetClientRect, GetCursorPos,
-    GetForegroundWindow, GetWindowRect, GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible,
-    PostMessageW,
-    SendMessageW, SetForegroundWindow, SetWindowPos, SWP_SHOWWINDOW, WM_CHAR, WM_GETTEXT,
+    EnumChildWindows, EnumWindows, GetClassNameW, GetClientRect, GetCursorPos, GetForegroundWindow,
+    GetWindowRect, GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible, PostMessageW,
+    SWP_SHOWWINDOW, SendMessageW, SetForegroundWindow, SetWindowPos, WM_CHAR, WM_GETTEXT,
     WM_GETTEXTLENGTH, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
 };
+use windows::core::BOOL;
 
 const DEFAULT_TEXT: &str = "SARDP d-4 input: Hello, 世界! 123";
 /// `sardp_win::display`'s window class.
@@ -79,7 +78,10 @@ fn main() {
     };
     let mut client_rect = RECT::default();
     unsafe { GetClientRect(client, &mut client_rect) }.expect("GetClientRect");
-    let window_size = (client_rect.right - client_rect.left, client_rect.bottom - client_rect.top);
+    let window_size = (
+        client_rect.right - client_rect.left,
+        client_rect.bottom - client_rect.top,
+    );
     println!(
         "[input-e2e] client window {client:?} title={title:?} client area {}x{} stream {}x{}",
         window_size.0, window_size.1, stream_size.0, stream_size.1
@@ -94,8 +96,9 @@ fn main() {
         .stderr(std::process::Stdio::null())
         .spawn()
         .expect("launch notepad.exe");
-    let Some(notepad) = wait_for_window(Duration::from_secs(5), |t| t.contains("Notepad") || t.contains("メモ帳"))
-    else {
+    let Some(notepad) = wait_for_window(Duration::from_secs(5), |t| {
+        t.contains("Notepad") || t.contains("メモ帳")
+    }) else {
         eprintln!("[input-e2e] FAIL: notepad window did not appear");
         std::process::exit(2);
     };
@@ -109,7 +112,9 @@ fn main() {
         notepad_rect.left, notepad_rect.top, notepad_rect.right, notepad_rect.bottom
     );
     if !ensure_foreground(notepad, Duration::from_secs(2)) {
-        println!("[input-e2e] note: could not confirm notepad foreground before the click; the injected click should fix that");
+        println!(
+            "[input-e2e] note: could not confirm notepad foreground before the click; the injected click should fix that"
+        );
     }
 
     // 3. Click into the edit area through the mirror.
@@ -138,10 +143,15 @@ fn main() {
     // The mirror is scaled (2560 -> 1280 => 2px per window px), so allow
     // the rounding of one window pixel each way.
     let tolerance = (stream_size.0 / window_size.0.max(1) as u32 + 2) as i32;
-    let cursor_ok = (cursor.x - target.0).abs() <= tolerance && (cursor.y - target.1).abs() <= tolerance;
+    let cursor_ok =
+        (cursor.x - target.0).abs() <= tolerance && (cursor.y - target.1).abs() <= tolerance;
     println!(
         "[input-e2e] MOUSE: cursor now at ({}, {}), target ({}, {}), tolerance {tolerance}px -> {}",
-        cursor.x, cursor.y, target.0, target.1, if cursor_ok { "PASS" } else { "FAIL" }
+        cursor.x,
+        cursor.y,
+        target.0,
+        target.1,
+        if cursor_ok { "PASS" } else { "FAIL" }
     );
     if !cursor_ok {
         failures.push("mouse position");
@@ -158,15 +168,22 @@ fn main() {
         // has the focus -- the injected text would land in whatever else
         // is in front.
         if !ensure_foreground(notepad, Duration::from_secs(2)) {
-            println!("[input-e2e] ABORT: notepad is not the foreground window; not typing anything");
+            println!(
+                "[input-e2e] ABORT: notepad is not the foreground window; not typing anything"
+            );
             println!("[input-e2e] RESULT: FAIL ({})", failures.join(", "));
             std::process::exit(1);
         }
-        println!("[input-e2e] note: notepad brought to the foreground directly for the typing step");
+        println!(
+            "[input-e2e] note: notepad brought to the foreground directly for the typing step"
+        );
     }
 
     // 4. Type through the mirror: WM_CHAR per UTF-16 unit, then Enter as a key.
-    println!("[input-e2e] typing {:?} + Enter via posted WM_CHAR/WM_KEYDOWN", args.text);
+    println!(
+        "[input-e2e] typing {:?} + Enter via posted WM_CHAR/WM_KEYDOWN",
+        args.text
+    );
     for unit in args.text.encode_utf16() {
         post(client, WM_CHAR, WPARAM(unit as usize), LPARAM(1));
         std::thread::sleep(Duration::from_millis(20));
@@ -205,7 +222,9 @@ fn main() {
             }
         }
         None => {
-            println!("[input-e2e] TEXT: inconclusive (no readable edit control; check the notepad screenshot)");
+            println!(
+                "[input-e2e] TEXT: inconclusive (no readable edit control; check the notepad screenshot)"
+            );
         }
     }
 
@@ -271,7 +290,10 @@ fn find_window(predicate: &dyn Fn(&str, &str) -> bool) -> Option<HWND> {
         found: None,
     };
     unsafe {
-        let _ = EnumWindows(Some(enum_windows_proc), LPARAM(&mut ctx as *mut FindContext as isize));
+        let _ = EnumWindows(
+            Some(enum_windows_proc),
+            LPARAM(&mut ctx as *mut FindContext as isize),
+        );
     }
     ctx.found
 }
@@ -341,7 +363,8 @@ unsafe extern "system" fn enum_child_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
 }
 
 fn window_text_via_message(hwnd: HWND) -> String {
-    let len = unsafe { SendMessageW(hwnd, WM_GETTEXTLENGTH, Some(WPARAM(0)), Some(LPARAM(0))) }.0 as usize;
+    let len = unsafe { SendMessageW(hwnd, WM_GETTEXTLENGTH, Some(WPARAM(0)), Some(LPARAM(0))) }.0
+        as usize;
     if len == 0 {
         return String::new();
     }
@@ -354,5 +377,7 @@ fn window_text_via_message(hwnd: HWND) -> String {
             Some(LPARAM(buf.as_mut_ptr() as isize)),
         )
     };
-    String::from_utf16_lossy(&buf).trim_end_matches('\0').to_string()
+    String::from_utf16_lossy(&buf)
+        .trim_end_matches('\0')
+        .to_string()
 }

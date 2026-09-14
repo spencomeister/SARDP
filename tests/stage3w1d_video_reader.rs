@@ -63,7 +63,16 @@ async fn read_next_frame_survives_cancellation_between_header_and_payload() {
     };
     let fake_idr_payload = vec![0x00, 0x00, 0x00, 0x01, 0x67, 0xAA, 0xBB];
     let (server_result, client_result) = tokio::join!(
-        open_video_instance(&server_connection, 0, 0, 1, encoder_config, fake_idr_payload, 0, 0),
+        open_video_instance(
+            &server_connection,
+            0,
+            0,
+            1,
+            encoder_config,
+            fake_idr_payload,
+            0,
+            0
+        ),
         accept_video_instance(&client_connection),
     );
     let (mut send_stream, _sm) = server_result.expect("server sends the instance intro");
@@ -92,29 +101,50 @@ async fn read_next_frame_survives_cancellation_between_header_and_payload() {
 
     // The read consumes the header and then waits for the payload; the
     // timeout drops (cancels) it in that state.
-    let cancelled = tokio::time::timeout(Duration::from_millis(300), frame_reader.read_next_frame()).await;
-    assert!(cancelled.is_err(), "the read must still be waiting for the payload");
+    let cancelled =
+        tokio::time::timeout(Duration::from_millis(300), frame_reader.read_next_frame()).await;
+    assert!(
+        cancelled.is_err(),
+        "the read must still be waiting for the payload"
+    );
 
     // Now the payload, and a complete frame 2 behind it.
-    write_envelope(&mut send_stream, messages::type_id::VIDEO_FRAME_PAYLOAD, &payload_1)
-        .await
-        .expect("payload write");
+    write_envelope(
+        &mut send_stream,
+        messages::type_id::VIDEO_FRAME_PAYLOAD,
+        &payload_1,
+    )
+    .await
+    .expect("payload write");
     let payload_2 = vec![0x00, 0x00, 0x00, 0x01, 0x61, 0x44];
-    sardp::video_session::send_video_frame(&mut send_stream, 0, 2, 1, 0, 200, 250, 64, 64, &payload_2)
-        .await
-        .expect("frame 2 write");
+    sardp::video_session::send_video_frame(
+        &mut send_stream,
+        0,
+        2,
+        1,
+        0,
+        200,
+        250,
+        64,
+        64,
+        &payload_2,
+    )
+    .await
+    .expect("frame 2 write");
 
-    let (header, payload) = tokio::time::timeout(Duration::from_secs(5), frame_reader.read_next_frame())
-        .await
-        .expect("frame 1 arrives")
-        .expect("frame 1 reads cleanly after the cancelled attempt");
+    let (header, payload) =
+        tokio::time::timeout(Duration::from_secs(5), frame_reader.read_next_frame())
+            .await
+            .expect("frame 1 arrives")
+            .expect("frame 1 reads cleanly after the cancelled attempt");
     assert_eq!(header, header_1);
     assert_eq!(payload, payload_1);
 
-    let (header, payload) = tokio::time::timeout(Duration::from_secs(5), frame_reader.read_next_frame())
-        .await
-        .expect("frame 2 arrives")
-        .expect("frame 2 reads cleanly");
+    let (header, payload) =
+        tokio::time::timeout(Duration::from_secs(5), frame_reader.read_next_frame())
+            .await
+            .expect("frame 2 arrives")
+            .expect("frame 2 reads cleanly");
     assert_eq!(header.frame_id, 2);
     assert_eq!(payload, payload_2);
 }

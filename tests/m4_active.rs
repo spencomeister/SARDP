@@ -26,7 +26,7 @@ use sardp::feedback_session::{
 use sardp::handshake::{client_handshake, server_handshake};
 use sardp::messages::{ChromaFormat, Codec, EncoderConfig};
 use sardp::timecode_frame::generate_timecode_frame;
-use sardp::timesync::{client_time_sync, server_respond_time_sync};
+use sardp::timesync::{client_time_sync, server_respond_time_sync_burst};
 use sardp::video_session::{open_video_instance, read_video_instance_intro};
 use sardp::{clock, net, pki};
 
@@ -85,7 +85,8 @@ async fn full_session_reaches_active_with_feedback_round_trip() {
     // 2. TimeSync (spec 2.9), over the still-open control stream.
     let (client_timesync_result, server_timesync_result) = tokio::join!(
         client_time_sync(&mut client_control),
-        server_respond_time_sync(&mut server_control),
+        // The client runs several rounds (best-of-N); answer them all.
+        server_respond_time_sync_burst(&mut server_control, std::time::Duration::from_millis(200)),
     );
     let timesync_result = client_timesync_result.expect("client TimeSync succeeds");
     server_timesync_result.expect("server TimeSync succeeds");

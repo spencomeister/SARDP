@@ -230,7 +230,10 @@ mod tests {
         pressed.on_key(0x06, false);
         pressed.on_button(1, true);
         assert!(!pressed.is_empty());
-        assert_eq!(pressed.take_releases(), vec![Release::Button(1), Release::Key(0xE0)]);
+        assert_eq!(
+            pressed.take_releases(),
+            vec![Release::Button(1), Release::Key(0xE0)]
+        );
         assert!(pressed.is_empty());
         assert!(pressed.take_releases().is_empty());
     }
@@ -258,11 +261,27 @@ mod tests {
         // Plain 'a': the character comes via TextInput, don't inject.
         assert!(!should_inject_key(ImeMode::ClientSide, 0x04, 0));
         // Shift+'a' is still a character ('A' via TextInput).
-        assert!(!should_inject_key(ImeMode::ClientSide, 0x04, key_modifier::SHIFT));
+        assert!(!should_inject_key(
+            ImeMode::ClientSide,
+            0x04,
+            key_modifier::SHIFT
+        ));
         // Ctrl+'c' is a shortcut: inject the physical key.
-        assert!(should_inject_key(ImeMode::ClientSide, 0x06, key_modifier::CTRL));
-        assert!(should_inject_key(ImeMode::ClientSide, 0x04, key_modifier::ALT));
-        assert!(should_inject_key(ImeMode::ClientSide, 0x04, key_modifier::META));
+        assert!(should_inject_key(
+            ImeMode::ClientSide,
+            0x06,
+            key_modifier::CTRL
+        ));
+        assert!(should_inject_key(
+            ImeMode::ClientSide,
+            0x04,
+            key_modifier::ALT
+        ));
+        assert!(should_inject_key(
+            ImeMode::ClientSide,
+            0x04,
+            key_modifier::META
+        ));
         // Non-character keys always go through.
         assert!(should_inject_key(ImeMode::ClientSide, 0x28, 0));
         assert!(should_inject_key(ImeMode::ClientSide, 0xE1, 0));

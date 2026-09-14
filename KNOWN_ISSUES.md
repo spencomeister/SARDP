@@ -8,7 +8,7 @@ PoCブリーフのPhase 1〜3 + Task 14(spencomeister/SARDP#1)の実装を通じ
 
 ### A. `SessionStore`のexpireタイマーの競合
 
-`suspend_and_store`(`src/bin/sardp-server.rs`)が`RECONNECT_GRACE_PERIOD`(300秒)後に`SessionStore`からエントリを削除するバックグラウンドタスクを積んでいましたが、当初は`SessionStore::expire(session_id)`という「session_idに対して現在何が入っていようと無条件に消す」メソッドを呼んでいました。
+`suspend_and_store`(`sardp-cli/src/bin/sardp-server.rs`)が`RECONNECT_GRACE_PERIOD`(300秒)後に`SessionStore`からエントリを削除するバックグラウンドタスクを積んでいましたが、当初は`SessionStore::expire(session_id)`という「session_idに対して現在何が入っていようと無条件に消す」メソッドを呼んでいました。
 
 suspend→reconnect→再suspendという流れが起きると、最初のsuspend用に積んだ古いタイマーが、2回目のsuspendによってまだ有効な猶予期間中にあるエントリを誤って削除してしまう競合がありました。
 
@@ -20,7 +20,7 @@ suspend→reconnect→再suspendという流れが起きると、最初のsuspen
 
 `permission_set::bit::FILE_UP`/`FILE_DOWN`は定義済みでしたが、`sardp-server`の`FileTransferRequest`処理はこれらを一切チェックせず、権限の有無に関わらず`file_handle`を発行していました。VIEW権限には同種のゲートがあった(`permission_sm.is_granted(bit::VIEW)`)のに、ファイル転送では見落としていました。
 
-**修正**: `FileTransferRequest`受信時に、`direction`に応じて`FILE_UP`/`FILE_DOWN`が`Granted`かを確認し、`Granted`でなければ`FileTransferReject`で応答するようにしました(`src/bin/sardp-server.rs`)。`PermissionSm::state()`を使って`Draining`(段階的revoke中)と`NotGranted`を区別し、前者は`POLICY_PERMISSION_REVOKED`、後者は`POLICY_PERMISSION_DENIED`を返します(仕様4.5の表の区別に合わせています)。
+**修正**: `FileTransferRequest`受信時に、`direction`に応じて`FILE_UP`/`FILE_DOWN`が`Granted`かを確認し、`Granted`でなければ`FileTransferReject`で応答するようにしました(`sardp-cli/src/bin/sardp-server.rs`)。`PermissionSm::state()`を使って`Draining`(段階的revoke中)と`NotGranted`を区別し、前者は`POLICY_PERMISSION_REVOKED`、後者は`POLICY_PERMISSION_DENIED`を返します(仕様4.5の表の区別に合わせています)。
 
 **付随事項**: 当時は下記「D. バイナリ本体が自動テストの対象外だった」という構造的な問題により、専用の自動回帰テストを追加できていませんでした(Dの修正で`PermissionSm::check_gate`としてテスト可能になっています)。また、現状`server_handshake_from_client_hello`が発行する`granted_permissions`には`FILE_UP`/`FILE_DOWN`が含まれていない(`src/handshake.rs`)ため、実バイナリでファイル転送を試すと常に拒否されます。これは意図した保守的挙動ですが、ファイル転送を実際に使う場合は付与ロジック側の対応が別途必要です。
 
@@ -98,11 +98,11 @@ VIEWのみだった管理者stdinトグル機構は`permission_sm::AdminCommand`
 
 ### 2. suspend-on-disconnectの検証パターンが手動テスト1回分に限られている
 
-`is_transport_disconnect`(`src/bin/sardp-server.rs`)は、video送出パス経由の切断を手動でkill -9して初めて漏れ(`ConnError::Video`が未分解だった)に気づいて直したという経緯があり、それ以外の経路(controlストリーム読み取り中、feedback読み取り中、backpressure再オープン中の切断)は実際に切ってみて確認していません。コード上は同じパターンで拾えるはずですが未検証です。
+`is_transport_disconnect`(`sardp-cli/src/bin/sardp-server.rs`)は、video送出パス経由の切断を手動でkill -9して初めて漏れ(`ConnError::Video`が未分解だった)に気づいて直したという経緯があり、それ以外の経路(controlストリーム読み取り中、feedback読み取り中、backpressure再オープン中の切断)は実際に切ってみて確認していません。コード上は同じパターンで拾えるはずですが未検証です。
 
 ### 4. `--session-file`はデモ専用の割り切りで、平文で資格情報相当を保存する
 
-`session_id`/`reconnect_token`/`user_id`を任意パスに平文・パーミッション制御なしで書き出す実装です(`src/bin/sardp-client.rs`)。`reconnect_token`はbearer credential(所持のみで再接続が成立する)なので、このファイルの中身が漏れることは元のセッションを乗っ取られることと同義です。実バイナリ間での再接続の往復を証明する唯一の現実的な手段として追加しましたが、デモ・テスト以外の用途に転用すべきではありません。
+`session_id`/`reconnect_token`/`user_id`を任意パスに平文・パーミッション制御なしで書き出す実装です(`sardp-cli/src/bin/sardp-client.rs`)。`reconnect_token`はbearer credential(所持のみで再接続が成立する)なので、このファイルの中身が漏れることは元のセッションを乗っ取られることと同義です。実バイナリ間での再接続の往復を証明する唯一の現実的な手段として追加しましたが、デモ・テスト以外の用途に転用すべきではありません。
 
 ### 5. クライアント側に自動再接続ロジックがない(サーバーとの非対称性)
 
@@ -223,3 +223,265 @@ d-2のE2E疎通(項目14参照)での観察:
 - **IME**: `ImeComposition`(未確定文字列、`WM_IME_COMPOSITION`の`GCS_COMPSTR`)は送信・受信・ログまでで、サーバー側の注入は未実装(確定文字列は`WM_CHAR`経由で`TextInput`として届くので実用上は打てる)。`ImeModeChange`はクライアントに送る手段(UI)がなく、サーバー側SM(`ImeModeSm`)のユニットテストのみ。
 - **権限の途中変更**: サーバーは`grant-keyboard`/`revoke-keyboard`/`grant-mouse`/`revoke-mouse`の管理コマンドで即時に注入を止められます(`PermissionSm`をイベントごとに参照)。クライアントは接続時点の付与状況でしか送信可否を決めず、後からの付与には反応しません(AUDIO_CAPTUREと同じPoCの割り切り)。E2Eでの動作確認は未実施(ユニットテストとコードレビューのみ)。
 - **未対応**: `Wheel.is_precise`(常にfalse)、マウスの相対移動モード、Alt+Tab等ローカルOSが横取りするキー、Secure Desktop(3W-2)、Pauseキー。
+
+### 18. Stage 3 遅延の再実測(DR-036)で分かったこと: TimeSync の 1 往復は信頼できない、エンコーダ出力の 1 フレーム遅れ
+
+3W-1 完了後に M6 の指標(`transport_us` / `glass_to_glass_us`)を永続パイプラインで再計測しました。結果と方法は `docs/sardp-stage3-latency-measurements.md` にまとめています(要点: `ffmpeg` 起動 ≈190ms → NVENC+DXVA ≈7ms、同一機 LAN 経由の glass-to-glass 中央値 177ms → 9ms、定常 p95 15〜61ms)。計測の過程で見つけて直した実装上の問題が 2 つあります。
+
+- **TimeSync(仕様 2.9)の 1 往復実装はオフセットが数百 ms ずれることがある**: 同一機でも握手直後の最初の往復で RTT 300〜600ms が観測され(2 往復目以降は 1ms 未満。原因は未特定)、その 1 サンプルから求めたオフセットで換算した値は全て無意味でした。これはバックプレッシャの主信号 `client_queue_delay_us`(仕様 2.10)も同じオフセットを使うため、**実運用でも判定を狂わせ得る問題**です。`timesync::client_time_sync` は 8 往復して最小 RTT のサンプルを採用(`best_of`)、サーバーは接続確立時に連続する要求をまとめて答え(`server_respond_time_sync_burst`、200ms の追従猶予)、以後は control ループでも `TimeSyncRequest` に応答するようにしました。仕様 2.9 自体は往復回数を規定していないので仕様変更はしていませんが、実装要件(Part 8)に「複数往復・最小 RTT 採用を SHOULD」として書く価値はあります(未反映)。
+- **NVENC MFT の出力を次フレームの入力時まで回収していなかった**: `encode_frame` が入力直後に「既に準備できている出力」しか取らず、フレーム N の出力はフレーム N+1 の入力時(約 17ms 後)に届いていました。1 キャプチャ間隔を上限に「この入力の出力」を待つ形に変更し、encode の実測は avg 28ms → 7〜10ms、配信遅延も実際に 1 フレーム分縮んでいます。待機中に `METransformNeedInput` を読み捨てると次の入力で 5 秒タイムアウトになる(最初の版で発生)ため、クレジットとして保持します。
+- **未対応**: 立ち上がり 0.7 秒の受信バッファ滞留(クライアントがデコーダ・ウィンドウを作る間に溜まる)、別機・実ネットワークでの再計測、`--display log` 経路は依然 `ffmpeg` 起動込みで 100ms 超/フレーム(比較用に残置)。
+
+### 19. クレート構成の変更: バイナリを `sardp-cli` に分離し、共有ロジックを `sardp` に集約(3M-1 の準備)
+
+macOS 実装の前に、`sardp-win` にあった OS 非依存の部分を `sardp` に移しました: `frame_source`(`EncodedFrame`/`SourceInfo`/`DesktopH264Config`、`FrameWorker`(ワーカースレッド+準備完了待ち+停止/join)と `FrameSender`(有界チャネル+`try_send` によるソース側ドロップ、DR-007))、`h264`(NAL 種別走査、`is_idr_access_unit`、`ParameterSetCache` による SPS/PPS 補完)。`sardp-win` はこれらを使う側になり、ユニットテスト(NAL 5 件、ワーカー 6 件)は `cargo test --lib` で OS を問わず走ります。
+
+このとき `sardp`(コア)が `sardp-win` に依存していた(`sardp-server`/`sardp-client` がコアクレートの `src/bin` にあったため)ことが循環依存になるので、**バイナリを新パッケージ `sardp-cli/` に移動**しました。`target/debug/sardp-server.exe` 等のパスは変わりません。ワークスペースの `default-members` は `.`(コア)と `sardp-cli` で、Windows 専用クレートは `--workspace` または `-p` で明示ビルドします(Linux でもコア+バイナリはそのままビルド・テストできる構成)。この機では Linux 向けの `cargo check --target x86_64-unknown-linux-gnu` が `ring` の C コンパイラ要件で止まるため、Linux 上での実行確認は未実施です(移した箇所に `cfg` 依存はありません)。
+
+## Stage 3(macOS OS統合、`tools/sck-capture-poc`)関連
+
+3M-1-a(ScreenCaptureKit 疎通)で判明した、SARDP 本体ではなく macOS の TCC(Transparency,
+Consent and Control)側の既知事項です。検証機は macOS 26.6.2 (25G83) / Apple M4、
+Command Line Tools のみ(Xcode なし)、Apple 発行のコード署名 ID は 0 件。
+
+### 20. macOS の画面収録許可はモーダルを出さない。システム設定の一覧への自動登録が唯一の在席経路
+
+`.app` を `open` で起動して(責任プロセスをアプリ自身にして)画面収録を要求しても、
+`CGRequestScreenCaptureAccess()` は即座に false を返し、SCK は 30ms ほどで
+`SCStreamErrorDomain Code=-3801` で失敗します。tccd のログでは `auth_reason=5`(Service Policy)
+で、`display_prompt:` は**一度も呼ばれません**。代わりに
+`Notifying for access kTCCServiceScreenCapture ... to UID: 501` が出て、アプリが
+システム設定 > プライバシーとセキュリティ > 画面とシステムオーディオの収録 の一覧に
+**未チェックで自動登録**されます。ユーザーがチェックを入れると `Allowed (System Set)` が書かれ、
+以後キャプチャできます。ad-hoc 署名・自己署名いずれでも同じです。
+
+当初は「Apple 発行の信頼された証明書がないアプリには TCC がプロンプトを出さない」と考えましたが、
+**これは反証済み**です。同じ自己署名 ID の `.app` から `AVCaptureDevice.requestAccess(for: .audio)`
+を呼ぶと tccd は普通にプロンプトを出します(`display_prompt: called for ... kTCCServiceMicrophone`
+→ `CFUserNotification response: 0x0`)。同一 identity・同一署名・同一配置でサービスだけ変えて
+挙動が変わる以上、これはコード署名の属性ではなく **(identity, service) の組**に対する判定です。
+`NSScreenCaptureUsageDescription` の欠落(それなら `auth_reason=8`)、Hardened Runtime、
+`/Applications` 配下かどうか、MDM・Screen Time ポリシーはいずれも除外済み。詳細と切り分けの
+全量は `tools/sck-capture-poc/README.md` にあります。
+
+- **未確定**: Developer ID で notarize したアプリなら画面収録でもモーダルが出るのか。証明書なしで
+  反証できます — notarize 済みの第三者アプリを `tccutil reset ScreenCapture <bundle id>` してから
+  画面収録を要求させ、`display_prompt: called for ... kTCCServiceScreenCapture` が出るかを見る。
+  出れば identity 依存、出なければ service 依存で確定します。**受け入れ基準「TCC 権限がゼロの
+  状態からの初回起動フローが破綻しない」は、最終的な署名形態(notarize 済み配布物)で再確認が必要**。
+- **検証の残骸**: 切り分けに使った `SwiftTccProbe`(`io.sardp.swift-tcc-probe`、`/private/tmp` 配下)が
+  アクセシビリティの一覧に未チェックで残っています。実体が消えているため `tccutil reset` は
+  "No such bundle identifier" で通りません。システム設定の「−」で削除する必要があります。
+
+### 21. TCC の許可はコード署名にピン留めされる。ad-hoc での再署名は既存の許可を破壊する
+
+ad-hoc 署名の指定要件は `identifier ... and cdhash H"..."` で、ビルドのたびに変わります。さらに
+**証明書署名で許可を得た後に ad-hoc で再署名すると、tccd の `UpdateVerifierData` が保存済みの
+csreq をその時の cdhash へ書き換え**、次のリビルドで
+`Failed to match existing code requirement` となって許可が失われます(一覧にはチェック済みで
+残るのに効かない、という分かりにくい壊れ方をします)。検証中に一度これを踏みました。
+
+対策として自己署名証明書 "SARDP Dev Signing" を使い、指定要件を
+`identifier "io.sardp.sck-capture-poc" and certificate leaf = H"0f7e..."` にしています
+(未信頼のままでも `codesign` は通る)。これはリビルドで変わらないことを実測で確認済み
+(cdhash が変わっても `CGPreflightScreenCaptureAccess = true` のままキャプチャできた)。
+`tools/sck-capture-poc/make-app.sh` は既定でこの証明書を使い、キーチェーンに無ければ失敗します。
+
+配布時の含意: **署名を変えると既存ユーザーの許可が全て失われます**。証明書更新やビルド方式の
+変更時は、ユーザーに再許可を求める導線が要ります。
+
+### 22. 実行中のプロセスは画面収録許可の付与を検知できない(再起動が必要)
+
+`CGPreflightScreenCaptureAccess` を 2 秒ごとにポーリングし続けても、ユーザーがシステム設定で
+チェックを入れた後に true へ変わりませんでした(10 分待って確認。許可自体は tccd のログで
+`Update Access Record: ... to Allowed (System Set)` として書かれている)。プロセスを起動し直すと
+即座に true になります。
+
+sardp-server 側の設計要件として:
+
+- 権限状態は Granted / Denied / Unknown の 3 値で表現する。
+- Denied のときは `open "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"`
+  で該当ペインを開いて誘導する(モーダルは当てにできない、20 番)。
+- **「権限待ち」を終端状態にしない**。許可後の反映にはプロセスの再起動が必要なので、
+  再起動を促すか、自分で exec し直す経路を用意する。
+
+### 23. 3M-1-b: VideoToolbox のエンコードはプロセス外で走る。解放漏れを in-process の指標では検出できない
+
+`VTCompressionSession` の実体は同一プロセス内ではなく **`VTEncoderXPCService`**(VideoToolbox.framework の
+XPCServices)で動きます。エンコード中に確認:
+
+```
+17539 .../VideoToolbox.framework/Versions/A/XPCServices/VTEncoderXPCService.xpc/...
+```
+
+このため、3W-1 で使ったような「起動・停止を繰り返して RSS / スレッド数 / FD 数を見る」リーク検査は
+**VideoToolbox 側の解放漏れに対して無力**です。実際に対照実験として
+`VTCompressionSessionInvalidate` を意図的に外して 10 サイクル回しましたが、
+RSS(約 33.9MB)・スレッド数(18)・FD 数(20)・`VTEncoderXPCService` のプロセス数
+(いずれもピーク baseline+1、終了後 baseline に復帰)のすべてで**差が出ませんでした**。
+ARC の解放だけでもセッションは畳まれているように見えます。
+
+- `sardp-mac/examples/desktop_source.rs --cycles N` はこの検査を行いますが、上記のとおり
+  **「各解放呼び出しが効いていること」の証明にはなりません**。証明できるのは
+  「再起動を繰り返してもパイプラインが in-process の資源を溜めないこと」までです。
+- `VTCompressionSessionInvalidate` はドキュメント上の teardown 手順なので、
+  観測できないとしても無条件に呼んでいます(規約に従うのであって、この機が罰してくれるからではない)。
+- **未対応**: XPC サービス側の資源を観測する手段(`footprint`/`vmmap` を
+  `VTEncoderXPCService` に対して取る等)は未整備。長時間稼働での再検証が要ります。
+
+### 24. 3M-1-b: エンコード遅延の実測 — 3420x2224 で p50 16〜18ms
+
+`sardp-mac` の `DesktopH264Source` で計測した capture→encode-done(同一の単調時計):
+
+| 条件 | p50 | p95 | 最大 |
+| --- | --- | --- | --- |
+| 3420x2224(内蔵ディスプレイのネイティブ)、8Mbps、High profile | 16〜18ms | 22〜26ms | 31〜39ms |
+
+Windows(NVENC)の 7〜10ms より大きいですが、画素数が約 3.7 倍(7.6MP)であることを考えると
+概ね妥当です。フレーム間隔が 100ms 以上空く場面でも遅延は 16ms 前後で一定だったので、
+DR-036 で Windows が踏んだ「フレーム N の出力を N+1 の入力時まで回収しない」型の
+1 フレーム遅れではなく、素のエンコード時間です。
+
+含意: Part 8 の目標(LAN 50ms)に対してエンコードだけで 16ms を使います。3M-1-d で M6 の
+測定ハーネスを回すときは、**ネイティブ解像度のまま配信するのか、`SCStreamConfiguration.width/height`
+で縮小するのか**を判断材料込みで決める必要があります(現在の実装はネイティブ固定)。
+
+### 25. `cargo:rustc-link-arg` は依存クレートに伝播しない(Swift ランタイムの rpath)
+
+`tools/sck-capture-poc/build.rs` が出す `cargo:rustc-link-lib` / `-search` は依存クレートの
+バイナリまで届きますが、`cargo:rustc-link-arg` は**それを出したパッケージにしか適用されません**。
+Swift ランタイムは SDK の `.tbd` 経由でリンクされ、install name が `@rpath/libswift*.dylib` のため、
+rpath が無いバイナリは起動時に落ちます:
+
+```
+dyld[16971]: Library not loaded: @rpath/libswift_Concurrency.dylib
+  Reason: no LC_RPATH's found
+```
+
+`sardp-mac/build.rs` に `-Wl,-rpath,/usr/lib/swift` を 1 行足して解決しています。
+**シムをリンクするバイナリクレートはすべてこの 1 行が要ります** — 3M-1-d で macOS を
+`sardp-cli` に結線するときも同じです。
+
+### 26. 3M-1-c: アクセシビリティは画面収録とは別のTCCゲートで、こちらはプロンプトが出る
+
+`CGEvent`でイベントを注入するには**アクセシビリティ(kTCCServiceAccessibility)**の許可が要ります。
+画面収録(kTCCServiceScreenCapture)とは完全に独立で、片方があってももう片方は要求し直しになります。
+
+画面収録と違い(#20)、こちらは`AXIsProcessTrustedWithOptions`でプロンプトが出ます
+(3M-1-a で`universalAccessAuthWarn`が461x181のダイアログを出すことを確認済み)。
+ただし到達点は同じで、`Update Access Record: kTCCServiceAccessibility ... to Denied (System Set)`
+が書かれてシステム設定の一覧に未チェックで載り、ユーザーがチェックを入れて許可されます。
+
+- `InputInjector::start`は`AXIsProcessTrusted()`を見て**起動時に失敗**します。
+  黙って落とされるイベントを投げ続けるより、呼び出し側が誘導できる形で失敗する方がよいという判断
+  (`CGEvent.post`には「システムに捨てられた」を伝える経路がありません)。
+  Windows の`SendInput`は権限不要なので、`sardp_win::InputInjector::start`が`Self`を返すのに対し
+  macOS 版は`Result`を返します。この非対称は本質的なものです。
+- **未計測**: 実行中のプロセスが許可の付与を検知できるか。画面収録では検知できないと実測しました(#22)が、
+  アクセシビリティでは測っていません。起動し直せば効くことだけ確認済みです。
+
+### 27. 3M-1-c: macOS の入力注入で、Windows と同じに書くと壊れるところ
+
+`sardp-mac::inject`が`sardp_win::inject`の直訳になっていない理由。いずれも
+`sardp-mac/examples/input_e2e.rs`がセッションイベントタップで実測して確認しています。
+
+| 事象 | 実測 |
+| --- | --- |
+| **修飾キーは状態であって打鍵ではない** | Command↓→a↓と送っても、`a`のイベント自身が`flags`にCommandを持っていなければショートカットにならない。`InputState`が押下中の修飾キーを追跡し、**すべての**イベント(マウスも含む)にflagsを付ける。実測: `keyDown key=0x00 flags=0x20100008`(NonCoalesced\|Command\|左Commandデバイスビット) |
+| **修飾キーは`flagsChanged`として届く** | Command の仮想キーコードで`keyDown`/`keyUp`をpostすると、macOS 側が`flagsChanged`(type 12, keycode 55)に変換して配送する。`flagsChanged`だけを見ているアプリにもちゃんと届く |
+| **ボタンを押したままの移動はドラッグ** | `mouseMoved`をpostしても多くのアプリはドラッグしない。押下中のボタンに応じて`leftMouseDragged`等に変える必要がある。実測: 押下中の3回の移動がすべて`leftMouseDragged`、`mouseMoved`は0件 |
+| **ダブルクリックにはクリック数が要る** | `leftMouseDown`を2回送るだけでは2回のシングルクリック。2回目に`kCGMouseEventClickState = 2`が要る。実測: 2回目が`click=2` |
+| **座標はポイント、キャプチャはピクセル** | キャプチャは3420x2224px、`CGEvent`は1710x1112pt。`InjectorConfig.scale`で割る。実測: ピクセル(1710,1112)→ポイント(855.0,556.0)、ウィンドウサーバの報告値と一致 |
+| **返ってくるflagsは送ったflagsではない** | ウィンドウサーバが`kCGEventFlagMaskNonCoalesced`(0x20000000)を必ずORする。flagsの比較はマスクしてから行うこと |
+| **左右の修飾キーの区別** | `kCGEventFlagMask*`だけでは左右が区別できない。IOKitの`NX_DEVICEL*/R*`ビット(0x1〜0x2000)を併せて立てる |
+
+**キーマップ**: `sardp-mac::keymap`はHID usage↔macOS仮想キーコード。macOSに対応キーが無いものは
+意図的に未マップにしています(Print Screen / Scroll Lock / Pause / Application / F21-F24、
+およびPC JISの カタカナひらがな・変換・無変換)。Apple JISキーボードは英数/かなをLANG2/LANG1
+(HID 0x91/0x90)として報告するのでそちらをマップしており、PC JISの3キーを無理に割り当てると
+双方向で曖昧になるため入れていません。
+
+**検証を安全に回す仕掛け**: `input_e2e`はイベントタップを**フィルタモード**で開き、
+自プロセスのタグ(`kCGEventSourceUserData` = `SARD`)が付いたイベントだけをアプリに届く前に破棄します。
+タグの無いイベント(実ユーザーの入力)は必ず素通しです。カーソル移動だけは意図的に通し
+(ピクセル→ポイント変換をウィンドウサーバ相手に検証する唯一の方法のため)、終了時に元の位置へ戻します。
+このタグはWindowsの`dwExtraInfo`と同じ役割で、3M-1-d で同一マシンのループバックE2Eを組むときに
+クライアント側がエコーループを断つのにも使います。
+
+### 28. 3M-1-d: sardp-cli への結線。プラットフォーム分岐の置き場所と、権限が片方だけ無い状態
+
+`sardp-server` は `#[cfg(windows)]` を macOS 用に複製するのではなく、**`use sardp_win as os` /
+`use sardp_mac as os` の別名 1 箇所**にまとめました。`sardp-win` と `sardp-mac` が意図的に
+同じ形の API(`DesktopH264Source`、`InjectCommand`、…)を出しているので、配線はほぼ 1 回書けば済みます。
+分岐条件そのものは `sardp-cli/build.rs` が出す `desktop_capture` cfg で、Linux(3G-1)を足すときは
+build.rs の 1 行だけです。
+
+本当に違う 2 箇所だけを関数に閉じ込めています:
+
+- `desktop_profile_tier()`: Windows は Main(77)、macOS は High(100)。ハードウェアエンコーダが
+  実際に出すプロファイルが違うため。Tier はどちらも 3。
+- `start_input_sink()`: `SendInput` は権限不要で失敗しない(`Self` を返す)のに対し、`CGEvent` は
+  アクセシビリティが要る(`Result` を返す)。
+
+**権限が片方だけ無い状態を設計上の状態として扱っています。** macOS では画面収録と
+アクセシビリティが独立なので、「映像は出るが入力は注入できない」は実際に起こります。
+その場合は接続を失敗させず `InputSink::Unavailable(reason)` にし、入力イベントが来たときに
+理由を出します。`InputSink::Log`(合成映像)と区別しているのは、**黙って捨てると
+クライアントのメッセージが届いていないように見える**からです。閲覧のみのセッションは
+アクセシビリティが無くても有用なので、接続ごと落とすのは過剰と判断しました。
+
+#### ループバック E2E の結果(2026-09-13)
+
+macOS のクライアントには入力を生む GUI がまだ無いので、`sardp-client --input-script` を足しました
+(移動 → クリック → ダブルクリック → ドラッグ → Shift+a → テキスト → ホイールの固定列)。
+安全のため `sardp-mac/examples/input_guard.rs` を先に起動します。これは**フィルタモードの
+イベントタップ**を持ち、`kCGEventSourceUserData` が `SARD` のイベントだけをアプリに届く前に
+破棄します(タグの無い実ユーザー入力は素通し)。タグはイベント側に乗るのでプロセスをまたいで効きます。
+
+```
+tools/sck-capture-poc/make-app.sh --app-name SardpGuard  --package sardp-mac --example input_guard --no-run
+tools/sck-capture-poc/make-app.sh --app-name SardpServer --package sardp-cli --bin sardp-server  --no-run
+open -n --stdout guard.log  --stderr guard.log  target/debug/SardpGuard.app  --args --secs 120
+open -n --stdout server.log --stderr server.log target/debug/SardpServer.app --args \
+    --capture desktop --all-idr --bind 127.0.0.1:4455 --cert-out /tmp/cert.pem
+./target/debug/sardp-client --server 127.0.0.1:4455 --trust-cert /tmp/cert.pem --input-script
+```
+
+サーバー側:
+
+```
+desktop capture started: 3420x2224 @ 60Hz, hardware H.264 profile 100, all-IDR (--all-idr)
+input injection: CGEvent, output origin (0, 0) pt, scale 2, text char delay 50ms
+input summary: injected=24 skipped_character_keys=2 dropped_not_granted=0 mouse_moves=4
+encoder: inputs=4085 outputs=4085 dropped_by_encoder=0 dropped_by_consumer=48
+connection ended cleanly
+```
+
+ガード側(実際に OS に届いたもの): 注入イベント 47 件を破棄、実ユーザーのイベント 363 件は素通し。
+内訳が計算どおりに閉じます:
+
+| 種別 | 件数 | 由来 |
+| --- | --- | --- |
+| mouseMoved | 5 | 明示的な移動 1 + ボタン押下前の位置決め 4 |
+| leftMouseDragged | 7 | ドラッグ中の明示的移動 3 + ボタン解放前の位置決め 4(押下中なのでドラッグになる) |
+| leftMouseDown / Up | 4 / 4 | クリック 3 + ドラッグ 1 |
+| flagsChanged | 2 | Shift の押下/解放(修飾キーは `flagsChanged` として届く、#27) |
+| keyDown / keyUp | 12 / 12 | テキスト "SARDP 3M-1-d" の 12 書記素クラスタ |
+| scrollWheel | 1 | ホイール 1 ノッチ |
+
+サーバーが `MouseButton` の直前に必ず位置決めの `MouseMove` を出す(「クライアントが見た場所に
+クリックを落とす」ため)ので、ボタンが押されている間の位置決めが `leftMouseDragged` になります。
+これは `sardp-mac::InputState` の「ボタン押下中の移動はドラッグ」規則がサーバーの実際の
+イベント列に対して意図どおり働いていることの確認でもあります。
+
+**`skipped_character_keys=2`**: スクリプトが送った `a` の押下/解放はサーバーが意図的に
+注入していません。仕様 4.4.1 / DR-025 の「IME が CLIENT_SIDE のとき、文字は `TextInput` が
+MUST の供給源で、合成中の生 `KeyEvent` を重ねて送ってはならない」に従った挙動です
+(修飾キーの Shift は文字キーではないので注入されています)。E2E が偶然この規則を踏んで、
+正しく効いていることが確認できました。
+
+遅延の実測は `docs/sardp-stage3-latency-measurements.md` の macOS 節に記録しています。
+要点: `transport` p50 6.6ms に対し `decode` p50 53.8ms が支配的で、これは
+`--display log`(フレームごとの `ffmpeg` 起動)のコストです。**macOS 版の永続デコーダ・
+クライアントが無いため、Windows の構成 A と同じ土俵での比較はまだできません。**
+

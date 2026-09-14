@@ -6,29 +6,31 @@
 //! E_INVALIDARGを返す原因切り分けに使った。同種のMFT絡みの問題が出た際に
 //! 再利用できるよう残してある(mf_h264_encode.rsとは独立したサンプルバイナリ)。
 
-use windows::core::{Interface, GUID};
-use windows::core::PWSTR;
+use windows::Win32::Foundation::HMODULE;
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_UNKNOWN;
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11CreateDevice, ID3D11Device, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-    D3D11_CREATE_DEVICE_VIDEO_SUPPORT, D3D11_SDK_VERSION,
+    D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_CREATE_DEVICE_VIDEO_SUPPORT, D3D11_SDK_VERSION,
+    D3D11CreateDevice, ID3D11Device,
 };
-use windows::Win32::Foundation::HMODULE;
-use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIAdapter, IDXGIAdapter1, IDXGIFactory1};
+use windows::Win32::Graphics::Dxgi::{
+    CreateDXGIFactory1, IDXGIAdapter, IDXGIAdapter1, IDXGIFactory1,
+};
 use windows::Win32::Media::MediaFoundation::{
-    IMFActivate, IMFMediaType, IMFTransform, MFCreateDXGIDeviceManager, MFCreateMediaType,
-    MFStartup, MFShutdown, MFTEnumEx, MFMediaType_Video, MFVideoFormat_H264,
-    MFVideoInterlace_Progressive, MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_FLAG_HARDWARE,
-    MFT_ENUM_FLAG_SORTANDFILTER, MFT_ENUM_FLAG_SYNCMFT, MFT_FRIENDLY_NAME_Attribute,
-    MFT_MESSAGE_SET_D3D_MANAGER, MFT_REGISTER_TYPE_INFO, MF_MT_AVG_BITRATE, MF_MT_FRAME_RATE,
-    MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE, MF_SA_D3D11_AWARE,
-    MF_TRANSFORM_ASYNC_UNLOCK, MF_VERSION, MFSTARTUP_FULL,
+    IMFActivate, IMFMediaType, IMFTransform, MF_MT_AVG_BITRATE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE,
+    MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE, MF_SA_D3D11_AWARE,
+    MF_TRANSFORM_ASYNC_UNLOCK, MF_VERSION, MFCreateDXGIDeviceManager, MFCreateMediaType,
+    MFMediaType_Video, MFSTARTUP_FULL, MFShutdown, MFStartup, MFT_CATEGORY_VIDEO_ENCODER,
+    MFT_ENUM_FLAG_HARDWARE, MFT_ENUM_FLAG_SORTANDFILTER, MFT_ENUM_FLAG_SYNCMFT,
+    MFT_FRIENDLY_NAME_Attribute, MFT_MESSAGE_SET_D3D_MANAGER, MFT_REGISTER_TYPE_INFO, MFTEnumEx,
+    MFVideoFormat_H264, MFVideoInterlace_Progressive,
 };
+use windows::core::PWSTR;
+use windows::core::{GUID, Interface};
 
 fn set_u64_pair(t: &IMFMediaType, key: &GUID, hi: u32, lo: u32) -> windows::core::Result<()> {
     unsafe { t.SetUINT64(key, ((hi as u64) << 32) | (lo as u64)) }
 }
-use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
+use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoUninitialize};
 
 fn main() -> windows::core::Result<()> {
     unsafe { CoInitializeEx(None, COINIT_MULTITHREADED).ok()? };
@@ -134,7 +136,9 @@ fn run() -> windows::core::Result<()> {
         // D3D11-awareなMFTは、device managerを教えるまで入力タイプの列挙自体を
         // 拒否する可能性があるため、先に送っておく。
         let raw_manager = Interface::as_raw(&manager) as usize;
-        if let Err(e) = unsafe { transform.ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, raw_manager) } {
+        if let Err(e) =
+            unsafe { transform.ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, raw_manager) }
+        {
             println!("[mf-probe]     ProcessMessage(SET_D3D_MANAGER) failed: {e}");
         }
 
