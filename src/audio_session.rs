@@ -133,6 +133,7 @@ pub async fn accept_audio_stream(
         AudioFrameReader {
             reader,
             kind: expected_kind,
+            pending_header: None,
         },
     ))
 }
@@ -187,6 +188,7 @@ pub async fn accept_audio_capture_from_reader(
         AudioFrameReader {
             reader,
             kind: StreamKind::AudioCapture,
+            pending_header: None,
         },
     )))
 }
@@ -217,24 +219,44 @@ pub fn generate_silence_payload(samples: usize) -> Vec<u8> {
 pub struct AudioFrameReader {
     reader: EnvelopeReader,
     kind: StreamKind,
+    /// An `AudioFrameHeader` already read whose payload hasn't been yet.
+    /// Makes [`Self::read_next_frame`] cancellation-safe, exactly as
+    /// `VideoFrameReader::pending_header` does for video: a `select!`
+    /// that drops the future between the two envelope reads resumes at
+    /// the payload instead of misreading it as the next header
+    /// (`PROTOCOL_UNEXPECTED_MESSAGE`). `sardp-client` polls audio
+    /// playback inside the same `select!` as video and window timing, so
+    /// the 3W-1-d-3 failure mode applies here unchanged.
+    pending_header: Option<AudioFrameHeader>,
 }
 
 impl AudioFrameReader {
     /// Reads the next `AudioFrameHeader` + `AudioFramePayload` pair,
     /// enforcing "payload immediately follows header" and the
     /// length-match rule (same shape as `VideoFrameReader::read_next_frame`).
+    ///
+    /// Cancellation-safe (`EnvelopeReader::read_envelope` is, and the
+    /// header is parked in `self` between the two reads).
     pub async fn read_next_frame(&mut self) -> Result<(AudioFrameHeader, Vec<u8>), AudioError> {
         let max_len = self.kind.max_envelope_length();
 
-        let (type_raw, payload) = self.reader.read_envelope(max_len).await?;
-        if type_raw != messages::type_id::AUDIO_FRAME_HEADER {
-            return Err(AudioError::ProtocolViolation(
-                ReasonCode::PROTOCOL_UNEXPECTED_MESSAGE,
-            ));
-        }
-        let header: AudioFrameHeader = messages::decode(&payload).map_err(AudioError::Decode)?;
-
+        let header = match self.pending_header.take() {
+            Some(header) => header,
+            None => {
+                let (type_raw, payload) = self.reader.read_envelope(max_len).await?;
+                if type_raw != messages::type_id::AUDIO_FRAME_HEADER {
+                    return Err(AudioError::ProtocolViolation(
+                        ReasonCode::PROTOCOL_UNEXPECTED_MESSAGE,
+                    ));
+                }
+                messages::decode(&payload).map_err(AudioError::Decode)?
+            }
+        };
+        // Park it until the payload has been read, in case we're cancelled
+        // while waiting for it.
+        self.pending_header = Some(header);
         let (type_raw, frame_payload) = self.reader.read_envelope(max_len).await?;
+        let header = self.pending_header.take().expect("parked just above");
         if type_raw != messages::type_id::AUDIO_FRAME_PAYLOAD {
             return Err(AudioError::ProtocolViolation(
                 ReasonCode::PROTOCOL_UNEXPECTED_MESSAGE,
