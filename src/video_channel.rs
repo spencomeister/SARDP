@@ -12,7 +12,52 @@
 
 use crate::backpressure::{BackpressureDecision, BaselineTracker, CongestionTracker};
 use crate::channel_sm::ChannelSm;
+use crate::messages::KeyframeRequest;
 use crate::video_sm::{ProtocolViolation, VideoInstanceSm};
+
+pub mod defaults {
+    /// Minimum spacing between two reopens the server performs in
+    /// response to client `KeyframeRequest`s (spec 2.10 / 4.5, a MAY):
+    /// 1 second, the same value as the client queue circuit breaker's
+    /// trip threshold ([`crate::queue_circuit_breaker::defaults::TRIP_THRESHOLD_US`]).
+    ///
+    /// Why that value: after a reopen the client discards the old
+    /// generation's backlog, so its queue age restarts from 0 and a
+    /// well-behaved breaker cannot legitimately trip again until the
+    /// *new* generation has itself been queued for more than the trip
+    /// threshold. Any request arriving sooner is a duplicate, a request
+    /// that crossed the reopen in flight, or a misbehaving client, and
+    /// honoring it would only spend another self-contained IDR. The
+    /// interval is measured from the last reopen of *either* kind
+    /// (backpressure-driven or request-driven) for the same reason.
+    pub const KEYFRAME_REQUEST_MIN_INTERVAL_US: u64 =
+        crate::queue_circuit_breaker::defaults::TRIP_THRESHOLD_US;
+}
+
+/// What the server should do with a client `KeyframeRequest`
+/// ([`VideoChannel::on_keyframe_request`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyframeRequestDecision {
+    /// Honor it: `RESET_STREAM` the current Instance, then
+    /// [`VideoChannel::prepare_reopen`] and open `generation + 1` with a
+    /// self-contained IDR -- exactly the [`BackpressureDecision::ResetStream`]
+    /// procedure.
+    Reopen,
+    /// Ignore it (log only); the current Instance continues untouched.
+    Ignored(KeyframeRequestIgnored),
+}
+
+/// Why a `KeyframeRequest` was not honored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyframeRequestIgnored {
+    /// Fewer than [`defaults::KEYFRAME_REQUEST_MIN_INTERVAL_US`] since the
+    /// last reopen; `next_allowed_at_us` is when one would be honored.
+    RateLimited { next_allowed_at_us: u64 },
+    /// The Instance isn't `Streaming`/`Congested` (still configuring, or
+    /// already closed and awaiting `prepare_reopen`), so there is nothing
+    /// to reset -- the reopen already in progress will deliver an IDR.
+    NotStreaming,
+}
 
 pub struct VideoChannel {
     channel_sm: ChannelSm,
@@ -20,6 +65,11 @@ pub struct VideoChannel {
     congestion: CongestionTracker,
     instance_sm: VideoInstanceSm,
     generation: u64,
+    /// `now_us` of the most recent reopen decision of either kind
+    /// (`ResetStream` from [`Self::on_feedback`], or `Reopen` from
+    /// [`Self::on_keyframe_request`]); the reference point for
+    /// `KEYFRAME_REQUEST_MIN_INTERVAL_US`.
+    last_reopen_us: Option<u64>,
 }
 
 impl VideoChannel {
@@ -32,6 +82,7 @@ impl VideoChannel {
             congestion: CongestionTracker::new(),
             instance_sm: VideoInstanceSm::new(),
             generation,
+            last_reopen_us: None,
         }
     }
 
@@ -109,9 +160,52 @@ impl VideoChannel {
             BackpressureDecision::ResetStream => {
                 self.instance_sm.on_reset()?;
                 self.channel_sm.on_reset();
+                self.last_reopen_us = Some(now_us);
             }
         }
         Ok(decision)
+    }
+
+    /// Decides whether to honor a client `KeyframeRequest` (spec 2.10,
+    /// `feedback` stream; spec 4.5: the server MAY reopen at
+    /// `generation + 1`). All three reasons are treated alike: each is
+    /// the client saying it needs a fresh self-contained IDR to continue.
+    ///
+    /// On [`KeyframeRequestDecision::Reopen`] the SMs have already moved
+    /// to `Closed(Reset)`/`Recovering`, and the caller MUST follow the
+    /// same procedure as after a `ResetStream` decision: `RESET_STREAM`
+    /// the old stream, [`Self::prepare_reopen`], open the new Instance,
+    /// [`Self::mark_instance_streaming`].
+    ///
+    /// Requests are rate-limited to one honored reopen per
+    /// [`defaults::KEYFRAME_REQUEST_MIN_INTERVAL_US`] (measured from the
+    /// last reopen of either kind), so a client that keeps asking -- or
+    /// several requests for the same episode -- cost at most one IDR per
+    /// interval. This is the server-side counterpart of the client
+    /// breaker's own re-arm cooldown; neither relies on the other.
+    pub fn on_keyframe_request(
+        &mut self,
+        now_us: u64,
+        request: KeyframeRequest,
+    ) -> KeyframeRequestDecision {
+        // The reason only matters for logging; keep it in the signature
+        // so callers hand over the whole message.
+        let _ = request.reason;
+        if let Some(last) = self.last_reopen_us {
+            let next_allowed_at_us =
+                last.saturating_add(defaults::KEYFRAME_REQUEST_MIN_INTERVAL_US);
+            if now_us < next_allowed_at_us {
+                return KeyframeRequestDecision::Ignored(KeyframeRequestIgnored::RateLimited {
+                    next_allowed_at_us,
+                });
+            }
+        }
+        if self.instance_sm.on_client_requested_reset().is_err() {
+            return KeyframeRequestDecision::Ignored(KeyframeRequestIgnored::NotStreaming);
+        }
+        self.channel_sm.on_reset();
+        self.last_reopen_us = Some(now_us);
+        KeyframeRequestDecision::Reopen
     }
 
     /// Call after a `ResetStream` decision, once the old stream has
@@ -236,6 +330,160 @@ mod tests {
         assert_eq!(channel.instance_state(), InstanceState::Streaming);
         assert_eq!(channel.channel_state(), ChannelState::Live);
         assert_eq!(channel.generation(), 0);
+    }
+
+    fn decode_error_request() -> KeyframeRequest {
+        KeyframeRequest {
+            reason: crate::messages::KeyframeReason::DecodeError,
+        }
+    }
+
+    const MIN_INTERVAL: u64 = super::defaults::KEYFRAME_REQUEST_MIN_INTERVAL_US;
+
+    #[test]
+    fn keyframe_request_from_streaming_reopens_at_the_next_generation() {
+        let mut channel = VideoChannel::new(0);
+        channel.mark_instance_streaming().unwrap();
+        // The server's own trackers see nothing wrong (no feedback at
+        // all, let alone a congested one) -- the request still wins.
+        assert_eq!(
+            channel.on_keyframe_request(5_000_000, decode_error_request()),
+            KeyframeRequestDecision::Reopen
+        );
+        assert_eq!(
+            channel.instance_state(),
+            InstanceState::Closed(CloseReason::Reset)
+        );
+        assert_eq!(channel.channel_state(), ChannelState::Recovering);
+
+        assert_eq!(channel.prepare_reopen(), 1);
+        channel.mark_instance_streaming().unwrap();
+        assert_eq!(channel.channel_state(), ChannelState::Live);
+        assert_eq!(channel.instance_state(), InstanceState::Streaming);
+    }
+
+    #[test]
+    fn keyframe_request_from_congested_also_reopens() {
+        let mut channel = VideoChannel::new(0);
+        channel.mark_instance_streaming().unwrap();
+        channel.on_feedback(0, 5_000, 0).unwrap();
+        channel.on_feedback(100_000, 150_000, 0).unwrap();
+        assert_eq!(channel.instance_state(), InstanceState::Congested);
+        assert_eq!(
+            channel.on_keyframe_request(200_000, decode_error_request()),
+            KeyframeRequestDecision::Reopen
+        );
+        assert_eq!(channel.channel_state(), ChannelState::Recovering);
+    }
+
+    #[test]
+    fn keyframe_requests_are_honored_at_most_once_per_min_interval() {
+        let mut channel = VideoChannel::new(0);
+        channel.mark_instance_streaming().unwrap();
+        let t0 = 10_000_000;
+        assert_eq!(
+            channel.on_keyframe_request(t0, decode_error_request()),
+            KeyframeRequestDecision::Reopen
+        );
+        channel.prepare_reopen();
+        channel.mark_instance_streaming().unwrap();
+
+        // A second request inside the interval is ignored, and the
+        // Instance is untouched (still Streaming, no second reopen).
+        assert_eq!(
+            channel.on_keyframe_request(t0 + MIN_INTERVAL - 1, decode_error_request()),
+            KeyframeRequestDecision::Ignored(KeyframeRequestIgnored::RateLimited {
+                next_allowed_at_us: t0 + MIN_INTERVAL,
+            })
+        );
+        assert_eq!(channel.instance_state(), InstanceState::Streaming);
+        assert_eq!(channel.generation(), 1);
+
+        // Exactly at the boundary it is honored again.
+        assert_eq!(
+            channel.on_keyframe_request(t0 + MIN_INTERVAL, decode_error_request()),
+            KeyframeRequestDecision::Reopen
+        );
+        assert_eq!(channel.prepare_reopen(), 2);
+    }
+
+    #[test]
+    fn rate_limit_check_comes_before_the_state_check() {
+        // An ignored (rate-limited) request must not touch the SMs even
+        // when they would otherwise allow the reset.
+        let mut channel = VideoChannel::new(0);
+        channel.mark_instance_streaming().unwrap();
+        channel.on_keyframe_request(0, decode_error_request());
+        channel.prepare_reopen();
+        channel.mark_instance_streaming().unwrap();
+        assert!(matches!(
+            channel.on_keyframe_request(1, decode_error_request()),
+            KeyframeRequestDecision::Ignored(KeyframeRequestIgnored::RateLimited { .. })
+        ));
+        assert_eq!(channel.channel_state(), ChannelState::Live);
+    }
+
+    #[test]
+    fn a_backpressure_reset_also_starts_the_min_interval() {
+        // A request that crossed a backpressure-driven reopen in flight
+        // was made against the old generation; it must not cost a second
+        // IDR right away.
+        let mut channel = VideoChannel::new(0);
+        channel.mark_instance_streaming().unwrap();
+        let mut now_us = 0u64;
+        channel.on_feedback(now_us, 5_000, 0).unwrap();
+        now_us += 100_000;
+        channel.on_feedback(now_us, 150_000, 0).unwrap();
+        let mut last = BackpressureDecision::Continue;
+        for _ in 0..3 {
+            now_us += 100_000;
+            last = channel.on_feedback(now_us, 400_000, 0).unwrap();
+        }
+        assert_eq!(last, BackpressureDecision::ResetStream);
+        let reset_at = now_us;
+        channel.prepare_reopen();
+        channel.mark_instance_streaming().unwrap();
+
+        assert_eq!(
+            channel.on_keyframe_request(reset_at + 50_000, decode_error_request()),
+            KeyframeRequestDecision::Ignored(KeyframeRequestIgnored::RateLimited {
+                next_allowed_at_us: reset_at + MIN_INTERVAL,
+            })
+        );
+        assert_eq!(
+            channel.on_keyframe_request(reset_at + MIN_INTERVAL, decode_error_request()),
+            KeyframeRequestDecision::Reopen
+        );
+    }
+
+    #[test]
+    fn keyframe_request_is_ignored_while_no_instance_is_streaming() {
+        // Before the first Instance is up...
+        let mut channel = VideoChannel::new(0);
+        assert_eq!(
+            channel.on_keyframe_request(0, decode_error_request()),
+            KeyframeRequestDecision::Ignored(KeyframeRequestIgnored::NotStreaming)
+        );
+        assert_eq!(channel.channel_state(), ChannelState::Initializing);
+
+        // ...and between a reset decision and the reopen (the caller is
+        // mid-reopen; that reopen delivers the IDR).
+        channel.mark_instance_streaming().unwrap();
+        channel.on_keyframe_request(0, decode_error_request());
+        assert_eq!(
+            channel.on_keyframe_request(MIN_INTERVAL, decode_error_request()),
+            KeyframeRequestDecision::Ignored(KeyframeRequestIgnored::NotStreaming)
+        );
+    }
+
+    #[test]
+    fn keyframe_request_reopen_keeps_the_baseline() {
+        let mut channel = VideoChannel::new(0);
+        channel.mark_instance_streaming().unwrap();
+        channel.on_feedback(0, 50_000, 0).unwrap();
+        channel.on_keyframe_request(1_000, decode_error_request());
+        channel.prepare_reopen();
+        assert_eq!(channel.baseline_us(), Some(50_000));
     }
 
     #[test]

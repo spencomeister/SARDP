@@ -171,6 +171,25 @@ impl VideoInstanceSm {
             _ => Err(unexpected()),
         }
     }
+
+    /// `Streaming | Congested -> Closed(Reset)`, when the server honors a
+    /// client `KeyframeRequest` (spec 2.10 / 4.5: "サーバーは
+    /// generation+1でストリーム再開を検討(MAY)"). Unlike [`Self::on_reset`]
+    /// this is not gated on `Congested`: the client asks for a fresh IDR
+    /// because *its* side can't continue (decode error, or the queue
+    /// circuit breaker), which the server's own backpressure trackers
+    /// may not have seen at all. The caller's obligations are the same
+    /// as after `on_reset`: `RESET_STREAM`, then reopen at
+    /// `generation + 1` with a self-contained IDR.
+    pub fn on_client_requested_reset(&mut self) -> Result<(), ProtocolViolation> {
+        match self.state {
+            InstanceState::Streaming | InstanceState::Congested => {
+                self.state = InstanceState::Closed(CloseReason::Reset);
+                Ok(())
+            }
+            _ => Err(unexpected()),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -180,6 +199,45 @@ mod tests {
     #[test]
     fn starts_in_created() {
         assert_eq!(VideoInstanceSm::new().state(), InstanceState::Created);
+    }
+
+    fn streaming_sm() -> VideoInstanceSm {
+        let mut sm = VideoInstanceSm::new();
+        sm.on_prologue_sent().unwrap();
+        sm.on_generation_sent().unwrap();
+        sm.on_encoder_config_sent().unwrap();
+        sm.on_first_idr_sent().unwrap();
+        assert_eq!(sm.state(), InstanceState::Streaming);
+        sm
+    }
+
+    #[test]
+    fn client_requested_reset_is_allowed_from_streaming() {
+        let mut sm = streaming_sm();
+        // The backpressure reset is *not* allowed from Streaming...
+        assert!(sm.on_reset().is_err());
+        // ...but a client-requested one is.
+        assert_eq!(sm.on_client_requested_reset(), Ok(()));
+        assert_eq!(sm.state(), InstanceState::Closed(CloseReason::Reset));
+    }
+
+    #[test]
+    fn client_requested_reset_is_allowed_from_congested() {
+        let mut sm = streaming_sm();
+        sm.on_congested().unwrap();
+        assert_eq!(sm.on_client_requested_reset(), Ok(()));
+        assert_eq!(sm.state(), InstanceState::Closed(CloseReason::Reset));
+    }
+
+    #[test]
+    fn client_requested_reset_is_rejected_outside_streaming_and_congested() {
+        let mut sm = VideoInstanceSm::new();
+        assert!(sm.on_client_requested_reset().is_err());
+        sm.on_prologue_sent().unwrap();
+        assert!(sm.on_client_requested_reset().is_err());
+        let mut closed = streaming_sm();
+        closed.on_client_requested_reset().unwrap();
+        assert!(closed.on_client_requested_reset().is_err());
     }
 
     #[test]

@@ -44,7 +44,7 @@ use sardp::reconnection::{self, EstablishOutcome};
 use sardp::session_store::SessionStore;
 use sardp::stream_reader::{EnvelopeReader, write_envelope};
 use sardp::timecode_frame;
-use sardp::video_channel::VideoChannel;
+use sardp::video_channel::{KeyframeRequestDecision, KeyframeRequestIgnored, VideoChannel};
 use sardp::video_session;
 use sardp::video_sm::defaults::VIDEO_CONFIGURING_TIMEOUT;
 use sardp::{StreamKind, clock, dev_identity, net, pki};
@@ -1073,19 +1073,45 @@ async fn run_active_session(
             }
             message = feedback_receiver.read_message() => {
                 last_activity = tokio::time::Instant::now();
+                let now_us = clock::now_us();
                 let feedback = match message? {
                     FeedbackMessage::Transport(feedback) => feedback,
                     FeedbackMessage::Keyframe(request) => {
-                        // Spec 2.10 / 4.5: log as OS.DECODE_ERROR; reopening
-                        // at generation+1 in response is a MAY that this
-                        // PoC server does not implement yet (the client's
-                        // queue circuit breaker sends this as a last
-                        // resort, see sardp::queue_circuit_breaker).
-                        eprintln!(
-                            "[{peer}] KeyframeRequest {:?} from client (reason code {:?}); not acted on",
-                            request.reason,
-                            ReasonCode::OS_DECODE_ERROR
-                        );
+                        // Spec 2.10 / 4.5: logged as OS.DECODE_ERROR, and
+                        // (the MAY) honored by reopening at generation+1
+                        // -- the same procedure as a backpressure reset.
+                        // The client's queue circuit breaker
+                        // (sardp::queue_circuit_breaker) sends this as a
+                        // last resort; VideoChannel rate-limits how often
+                        // it's honored.
+                        match video_channel.on_keyframe_request(now_us, request) {
+                            KeyframeRequestDecision::Reopen => {
+                                eprintln!(
+                                    "[{peer}] KeyframeRequest {:?} from client (reason code {:?}), resetting video stream",
+                                    request.reason,
+                                    ReasonCode::OS_DECODE_ERROR
+                                );
+                                video_send = reopen_video_generation(
+                                    connection, video_channel, video_send, encoder_config, frame_source, peer,
+                                )
+                                .await?;
+                                frame_id = 1;
+                            }
+                            KeyframeRequestDecision::Ignored(why) => {
+                                let detail = match why {
+                                    KeyframeRequestIgnored::RateLimited { next_allowed_at_us } => format!(
+                                        "within the minimum interval since the last reopen ({}ms to go)",
+                                        next_allowed_at_us.saturating_sub(now_us) / 1000
+                                    ),
+                                    KeyframeRequestIgnored::NotStreaming => "no Instance is streaming".to_string(),
+                                };
+                                eprintln!(
+                                    "[{peer}] KeyframeRequest {:?} from client (reason code {:?}) ignored: {detail}",
+                                    request.reason,
+                                    ReasonCode::OS_DECODE_ERROR
+                                );
+                            }
+                        }
                         continue;
                     }
                     FeedbackMessage::AudioSync(_) => {
@@ -1094,27 +1120,16 @@ async fn run_active_session(
                         continue;
                     }
                 };
-                let now_us = clock::now_us();
                 let decision = video_channel.on_feedback(now_us, feedback.client_queue_delay_us, 0)?;
                 match decision {
                     BackpressureDecision::Continue | BackpressureDecision::EnterCongested | BackpressureDecision::ExitCongested => {}
                     BackpressureDecision::ResetStream => {
                         eprintln!("[{peer}] backpressure hard threshold exceeded, resetting video stream");
-                        let _ = video_send.reset(quinn::VarInt::from_u32(0));
-                        let new_generation = video_channel.prepare_reopen();
-                        video_send = tokio::time::timeout(
-                            VIDEO_CONFIGURING_TIMEOUT,
-                            open_generation(connection, new_generation, 1, encoder_config, frame_source),
+                        video_send = reopen_video_generation(
+                            connection, video_channel, video_send, encoder_config, frame_source, peer,
                         )
-                        .await
-                        .map_err(|_elapsed| ConnError::Violation(ReasonCode::PROTOCOL_VIDEO_CONFIGURING_TIMEOUT))??;
-                        video_channel.mark_instance_streaming()?;
+                        .await?;
                         frame_id = 1;
-                        eprintln!(
-                            "[{peer}] reopened at generation {new_generation}, channel {:?}",
-                            video_channel.channel_state()
-                        );
-                        debug_assert_eq!(video_channel.channel_state(), ChannelState::Live);
                     }
                 }
             }
@@ -1705,6 +1720,38 @@ fn spawn_file_transfer(
 /// Opens a fresh video Instance at `generation` (spec 2.10/4.3.2): a
 /// self-contained IDR from `source` plus setup messages. Shared by the
 /// initial open and every backpressure-triggered reopen.
+/// Spec 2.10's reopen procedure, shared by the backpressure `ResetStream`
+/// decision and an honored client `KeyframeRequest`: the `VideoChannel`
+/// SMs must already be at `Closed(Reset)`/`Recovering`. `RESET_STREAM`s
+/// the old Instance's stream, bumps the generation, opens the new
+/// Instance with a fresh self-contained IDR, and returns its send stream
+/// (the caller restarts `frame_id` at 1 for the new generation).
+async fn reopen_video_generation(
+    connection: &quinn::Connection,
+    video_channel: &mut VideoChannel,
+    old_video_send: quinn::SendStream,
+    encoder_config: EncoderConfig,
+    frame_source: &mut FrameSource,
+    peer: SocketAddr,
+) -> Result<quinn::SendStream, ConnError> {
+    let mut old_video_send = old_video_send;
+    let _ = old_video_send.reset(quinn::VarInt::from_u32(0));
+    let new_generation = video_channel.prepare_reopen();
+    let video_send = tokio::time::timeout(
+        VIDEO_CONFIGURING_TIMEOUT,
+        open_generation(connection, new_generation, 1, encoder_config, frame_source),
+    )
+    .await
+    .map_err(|_elapsed| ConnError::Violation(ReasonCode::PROTOCOL_VIDEO_CONFIGURING_TIMEOUT))??;
+    video_channel.mark_instance_streaming()?;
+    eprintln!(
+        "[{peer}] reopened at generation {new_generation}, channel {:?}",
+        video_channel.channel_state()
+    );
+    debug_assert_eq!(video_channel.channel_state(), ChannelState::Live);
+    Ok(video_send)
+}
+
 async fn open_generation(
     connection: &quinn::Connection,
     generation: u64,
