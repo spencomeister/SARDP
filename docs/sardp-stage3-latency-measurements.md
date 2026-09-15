@@ -29,6 +29,42 @@ M6 の測定ハーネス(`sardp::measurement`、PoC ブリーフ Part 8「E2E遅
 
 `present_us` はいずれも 0.2〜0.3ms(p95 0.5〜0.7ms)。`queue_us`(window)は定常で p50 31µs、p95 0.2〜1.6ms。
 
+### macOS、永続デコーダ・ウィンドウ導入後(3M-1-e、2026-09-16)
+
+3M-1-d時点の課題(「macOSにはまだ永続デコーダのクライアントが無い」)を解消した後の計測。
+サーバーは`--capture desktop`(IDR+Pフレーム、`--all-idr`なし)、クライアントは新設の
+`--display window`(`sardp_mac::display::H264DisplayWindow` — `VTDecompressionSession`永続デコーダ
++ `NSWindow`、Windows`H264DisplayWindow`と同じ形のAPI)。同一機LAN経由(`192.168.1.6`、
+内蔵ディスプレイ3420x2224@60Hz)、約38秒・601フレーム、世代リセット0回・全フレーム
+`presented=true`(構成Aの土俵にmacOSが初めて乗った計測)。
+
+| 構成 | encode | transport | queue | decode | present | glass_to_glass |
+|---|---|---|---|---|---|---|
+| **A(macOS)**: `--capture desktop` + `--display window`、全601フレーム | avg 32.0ms / p50 33.7ms / p95 45.1ms | avg 2.5ms / p50 1.9ms / p95 2.6ms | avg 20.6ms / p50 0.04ms / p95 206.6ms | avg 3.7ms / p50 3.7ms / p95 4.3ms | avg 3.4ms / p50 3.2ms / p95 6.2ms | avg 62.2ms / **p50 48.4ms** / p95 233.0ms / max 272.6ms |
+| A(macOS)、定常状態(先頭30フレーム除外、n=571) | avg 32.6ms / p50 34.4ms / p95 45.2ms | avg 1.9ms / p50 1.9ms / p95 2.6ms | avg 12.2ms / p50 0.04ms / p95 95.4ms | avg 3.7ms / p50 3.7ms / p95 4.3ms | avg 3.4ms / p50 3.2ms / p95 6.3ms | avg 53.8ms / **p50 47.8ms / p95 121.8ms** / max 272.6ms |
+
+読み取れること(Windows構成Aとの対比、両者とも同一機・同一GPUでencode/decodeを共有する条件):
+
+- **`decode`(p50 3.7ms)と`present`(p50 3.2ms)はどちらも軽い。** `VTDecompressionSession`の
+  同期デコード(`VTDecodeFrameFlags`を空にすると出力コールバックが`VTDecompressionSessionDecodeFrame`
+  の戻り前に必ず走る、`VtDecoder.swift`のポーリング不要設計)と、IOSurfaceを介した
+  `CALayer.contents`直代入(CPUコピーなし)が効いている。Windows(DXVA+`ID3D11VideoProcessor`
+  blit、decode p50 0.5ms・present p50 0.2〜0.3ms)と桁は近い。
+- **`encode`がp50 34msと、3M-1-b単体計測(同条件・同解像度でp50 16〜18ms)からほぼ倍増した。**
+  Windows側が「同一GPUをクライアントのデコード・表示と共有している影響」として観測したのと同種の
+  現象で、Apple SiliconのUnified Memory上でVideoToolboxのエンコード(サーバー)とデコード
+  (クライアント)を同一プロセス空間内の同一GPUに同時発行しているための競合と考えられる。
+  Windows(NVENC単体p50 5〜7ms → 同居時p50 5.6〜6.4msとほぼ無変化)と比べ、macOSの方が
+  競合の影響を強く受けている。**別機構成での切り分けが必要**(Windowsの「今後」節と同じ課題)。
+- **`glass_to_glass`のp50 47.8msは、Part 8のLAN目標(50ms)にほぼ収まるが、Windows(構成A、
+  p50 9.0ms)の約5倍。** 支配要因は`encode`(p50 34ms)であって`transport`(p50 1.9ms、ワイヤは
+  健全)でも`decode`/`present`(合計p50 7ms未満)でもない。
+- **`queue`のp95が95〜207msと大きい**(中央値は0.04msで健全)。画面の動きが多い区間で
+  デコードスループットが供給に一時的に追いつかず、キューが伸びる場面があったと見られる
+  (バックプレッシャの世代リセットは1回も発生していないため、閾値には達していない範囲)。
+  Windows(定常p50 31µs、p95 0.2〜1.6ms)より一桁大きく、`encode`の遅さがバースト時に
+  そのままキュー滞留として跳ね返っている可能性が高い(同じ根本原因の二次効果)。
+
 ### macOS(3M-1-d、2026-09-13)
 
 同一機ループバック。サーバーは `--capture desktop --all-idr`(ScreenCaptureKit → VideoToolbox、
@@ -70,7 +106,9 @@ M6 の測定ハーネス(`sardp::measurement`、PoC ブリーフ Part 8「E2E遅
 
 - 別機(実 LAN / WAN)での再計測。`tc netem` 相当の条件再現は M6 ハーネス側にあるが、実デスクトップ経路とは接続していない。
 - 立ち上がり滞留の解消(デコーダ・ウィンドウの事前生成)。
-- **macOS の永続デコーダ・クライアント**(`--display window` 相当)。これが無いと macOS 側は
-  構成 C までしか測れず、Windows の構成 A と同じ土俵に乗りません。現状 glass-to-glass の
-  半分以上が `ffmpeg` の起動コストです。
-- macOS の `encode` を負荷から切り離した再計測(別機、または `--all-idr` 無しの条件)。
+- ~~macOS の永続デコーダ・クライアント(`--display window` 相当)~~ → 3M-1-e で対応済み(上記)。
+- **macOS の `encode` を負荷から切り離した再計測**(別機、またはサーバー/クライアントを
+  別プロセスグループ・別GPUコンテキストで分離できるか)。3M-1-e の計測で、同一機上で
+  encode(サーバー)と decode(クライアント)を同時稼働させると `encode` がp50 16〜18ms(単体)
+  からp50 34ms(同居)へほぼ倍増することが分かった。Windows(同居でもp50 5.6〜6.4msとほぼ無変化)
+  より競合の影響が大きい理由の特定が必要。

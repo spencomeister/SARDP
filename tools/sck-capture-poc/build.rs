@@ -79,6 +79,8 @@ fn main() {
         "swiftCoreMedia",
         "swiftVideoToolbox",
         "swiftCoreImage",
+        "swiftAppKit",
+        "swiftQuartzCore",
         "swiftXPC",
         "swiftIOKit",
         "swiftos",
@@ -94,6 +96,9 @@ fn main() {
         "CoreGraphics",
         "Foundation",
         "ApplicationServices",
+        "AppKit",
+        "QuartzCore",
+        "IOSurface",
     ] {
         println!("cargo:rustc-link-lib=framework={fw}");
     }
