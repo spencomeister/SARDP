@@ -286,6 +286,7 @@ dependencies = [
 name = "dxgi-capture-poc"
 version = "0.1.0"
 dependencies = [
+ "sardp",
  "windows",
 ]
 

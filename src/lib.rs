@@ -13,6 +13,7 @@ pub mod conn_error;
 pub mod connection_sm;
 pub mod decoder;
 pub mod dev_identity;
+pub mod drop_guard;
 pub mod encoder;
 pub mod envelope;
 pub mod feedback_session;
@@ -45,6 +46,7 @@ pub mod varint;
 pub mod video_channel;
 pub mod video_session;
 pub mod video_sm;
+pub mod worker_handle;
 
 pub use connection_sm::{ConnectionSm, ConnectionState, ProtocolViolation};
 pub use envelope::{Envelope, EnvelopeError};

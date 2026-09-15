@@ -3,8 +3,11 @@
 //! mp4ファイルへ書き出す。
 //!
 //! SARDP本体(sardp-server/sardp-client)とはまだ接続しない、3W-1-aと同じ位置づけの
-//! 独立したサンプルバイナリ。3W-1-aのFrameGuard(DXGIフレーム解放のRAII)と同じ考え方を
+//! 独立したサンプルバイナリ。3W-1-aの`release_frame_on_drop`(DXGIフレーム解放のRAII、
+//! KNOWN_ISSUES #29の`DropGuard`)と同じ「スコープを抜けたら必ず解放する」考え方を
 //! エンコーダ側リソース(IMFTransformのドレイン、IMFSinkWriterのFinalize)にも適用している。
+//! ただしこちら側は`finished`フラグで二重呼び出しを防ぐ必要があり`DropGuard`には
+//! 収まらないため、手書きの`impl Drop`のままにしている(KNOWN_ISSUES #29参照)。
 //!
 //! 実装メモ: 当初IMFSinkWriterの自動ハードウェア変換挿入(MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS)
 //! を試したが、内部的には正しくNVIDIAのD3D11対応非同期MFTを選択しGetTransformForStreamで
@@ -56,8 +59,8 @@ use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoUninit
 use windows::core::{GUID, HSTRING, Interface, PWSTR};
 
 use dxgi_capture_poc::capture::{
-    FrameGuard, create_d3d11_device, create_output_duplication, primary_display_refresh_interval,
-    read_dirty_rects, read_move_rect_count,
+    create_d3d11_device, create_output_duplication, primary_display_refresh_interval,
+    read_dirty_rects, read_move_rect_count, release_frame_on_drop,
 };
 
 const ACQUIRE_TIMEOUT_MS: u32 = 500;
@@ -148,10 +151,8 @@ fn run() -> windows::core::Result<()> {
             Err(e) => return Err(e),
         }
 
-        // 3W-1-aと同じFrameGuard: 以降どの経路で抜けてもReleaseFrameを保証する。
-        let frame_guard = FrameGuard {
-            duplication: &duplication,
-        };
+        // 3W-1-aと同じ`release_frame_on_drop`: 以降どの経路で抜けてもReleaseFrameを保証する。
+        let frame_guard = release_frame_on_drop(&duplication);
 
         let resource = resource.expect("AcquireNextFrame succeeded without a resource");
         let texture: ID3D11Texture2D = resource.cast()?;
@@ -212,7 +213,7 @@ fn run() -> windows::core::Result<()> {
             .encode_frame(nv12_texture, elapsed_since_start)?;
 
         // 次のAcquireNextFrameより前に明示的に解放する。途中で`?`により抜けた場合は
-        // FrameGuard::dropが代わりに解放する。
+        // DropGuardのdropが代わりに解放する。
         drop(frame_guard);
 
         let elapsed = frame_start.elapsed();
@@ -437,8 +438,11 @@ impl VideoConverter {
 ///
 /// [`Muxer`]がFinalize()を呼ばないとmp4のmoovアトムが書かれず再生不能になるのと同様、
 /// このEncoderもMFT_MESSAGE_COMMAND_DRAINを送って未出力ぶんを回収しきらないと
-/// 末尾のフレームが失われる。FrameGuardと同じ考え方でDropにフォールバックの
-/// finish()呼び出しを持たせている(通常経路では明示的に呼ぶ)。
+/// 末尾のフレームが失われる。`release_frame_on_drop`と同じ「スコープを抜けたら
+/// 必ず解放する」考え方でDropにフォールバックのfinish()呼び出しを持たせている
+/// (通常経路では明示的に呼ぶ)。ただし`finished`フラグでの二重呼び出し防止が
+/// `Drop::drop`自身のメソッドと状態を共有するため、`DropGuard`(KNOWN_ISSUES #29)
+/// には置き換えず手書きの`impl Drop`のままにしている。
 struct Encoder {
     transform: IMFTransform,
     events: IMFMediaEventGenerator,

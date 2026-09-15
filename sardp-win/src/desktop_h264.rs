@@ -66,8 +66,8 @@ use windows::Win32::System::Variant::VARIANT;
 use windows::core::{Interface, PWSTR};
 
 use dxgi_capture_poc::capture::{
-    FrameGuard, create_d3d11_device, create_output_duplication, duplicated_output_desktop_rect,
-    primary_display_refresh_interval,
+    create_d3d11_device, create_output_duplication, duplicated_output_desktop_rect,
+    primary_display_refresh_interval, release_frame_on_drop,
 };
 
 /// Kept for callers written against the 3W-1-d-2 API; the type itself now
@@ -212,9 +212,7 @@ fn run_worker(
         let now = Instant::now();
 
         // Same RAII guard as 3W-1-a: ReleaseFrame on every exit path.
-        let frame_guard = FrameGuard {
-            duplication: &duplication,
-        };
+        let frame_guard = release_frame_on_drop(&duplication);
         stats.acquired += 1;
         if stats.acquired <= 3 {
             eprintln!(

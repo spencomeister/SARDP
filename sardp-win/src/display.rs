@@ -17,7 +17,6 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::thread::JoinHandle;
 use std::time::Duration;
 
 use tokio::sync::mpsc;
@@ -85,7 +84,9 @@ use dxgi_capture_poc::capture::create_d3d11_device;
 
 use crate::inject::{INJECTED_EXTRA_INFO, button, modifier};
 use crate::keymap;
+use sardp::drop_guard::DropGuard;
 use sardp::frame_source::Clock;
+use sardp::worker_handle::WorkerHandle;
 
 /// Input the user gave the window (3W-1-d-4), in window client-area
 /// pixels; the client maps positions to the stream's pixel space and
@@ -141,21 +142,6 @@ struct WindowState {
     /// `WM_CHAR` delivers a non-BMP character as two messages.
     pending_high_surrogate: Option<u16>,
     buttons_down: u8,
-}
-
-/// Detaches and frees the `WindowState` when the display thread exits.
-struct UserDataGuard {
-    hwnd: HWND,
-    state: *mut WindowState,
-}
-
-impl Drop for UserDataGuard {
-    fn drop(&mut self) {
-        unsafe {
-            SetWindowLongPtrW(self.hwnd, GWLP_USERDATA, 0);
-            drop(Box::from_raw(self.state));
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -252,13 +238,16 @@ pub struct H264DisplayWindow {
     /// up as `client_queue_delay_us` in `TransportFeedback`, and the
     /// server's backpressure (spec 2.10) resets the stream and opens a
     /// new generation, which is what makes the backlog skippable.
-    tx: std::sync::mpsc::Sender<SubmittedFrame>,
+    ///
+    /// The "feed a worker thread, then join on drop" boilerplate this
+    /// used to carry as its own `impl Drop` is [`WorkerHandle`] (core
+    /// crate, KNOWN_ISSUES #29) now.
+    handle: WorkerHandle<SubmittedFrame>,
     timing_rx: mpsc::Receiver<FrameTiming>,
     /// Taken by the client with [`Self::take_input_receiver`] so it can
     /// be polled independently of [`Self::next_timing`].
     input_rx: Option<mpsc::UnboundedReceiver<WindowInput>>,
     shared: Arc<Shared>,
-    worker: Option<JoinHandle<()>>,
 }
 
 impl H264DisplayWindow {
@@ -300,11 +289,10 @@ impl H264DisplayWindow {
         }
 
         Ok(Self {
-            tx,
+            handle: WorkerHandle::new(tx, worker),
             timing_rx,
             input_rx: Some(input_rx),
             shared,
-            worker: Some(worker),
         })
     }
 
@@ -316,8 +304,9 @@ impl H264DisplayWindow {
     }
 
     /// Queues a frame for decode+display. Never blocks and never drops
-    /// (see the `tx` field); frames of a generation older than the newest
-    /// submitted one are skipped by the display thread and get no timing.
+    /// (see the `handle` field's doc); frames of a generation older than
+    /// the newest submitted one are skipped by the display thread and get
+    /// no timing.
     pub fn submit(&self, frame: SubmittedFrame) -> Result<(), WinDisplayError> {
         if self.shared.closed.load(Ordering::SeqCst) {
             return Err(WinDisplayError::Closed);
@@ -325,7 +314,7 @@ impl H264DisplayWindow {
         self.shared
             .newest_generation
             .fetch_max(frame.generation, Ordering::SeqCst);
-        self.tx.send(frame).map_err(|_| WinDisplayError::Closed)
+        self.handle.send(frame).map_err(|_| WinDisplayError::Closed)
     }
 
     /// Next decode/present timing report; `None` once the window has been
@@ -341,11 +330,11 @@ impl H264DisplayWindow {
 
 impl Drop for H264DisplayWindow {
     fn drop(&mut self) {
+        // Set first: a manual `Drop::drop` body always runs before a
+        // struct's fields auto-drop, so the worker's poll loop already
+        // sees `closed` by the time `handle`'s own drop (right after this
+        // method returns) closes the channel and joins.
         self.shared.closed.store(true, Ordering::SeqCst);
-        // Dropping `tx` here ends the worker's receive loop; join it.
-        if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
-        }
     }
 }
 
@@ -393,10 +382,27 @@ fn worker_main(
     }
 }
 
+/// Closes `handle` when the returned guard is dropped (KNOWN_ISSUES #29's
+/// `DropGuard`). Boxed, rather than `-> DropGuard<impl FnOnce()>`, because
+/// [`Presenter`] below needs to name the field's type and struct fields
+/// can't use `impl Trait`.
+fn close_handle_on_drop(handle: HANDLE) -> DropGuard<Box<dyn FnOnce()>> {
+    DropGuard::new(Box::new(move || {
+        let _ = unsafe { CloseHandle(handle) };
+    }))
+}
+
 /// Everything the display thread holds between frames. `device`/`context`
 /// are kept alive here (the swap chain, decoder and video processor all
 /// hang off them) even though nothing calls them directly after setup.
 struct Presenter {
+    /// Closes `frame_latency_waitable` (documented requirement for
+    /// `GetFrameLatencyWaitableObject`) when `Presenter` is dropped.
+    /// Declared first so it still runs before every other field's own
+    /// drop, same as the manual `impl Drop` this replaced (which always
+    /// ran ahead of the compiler's per-field drops too).
+    #[allow(dead_code)]
+    close_frame_latency_waitable: DropGuard<Box<dyn FnOnce()>>,
     #[allow(dead_code)]
     device: ID3D11Device,
     #[allow(dead_code)]
@@ -415,13 +421,6 @@ struct Presenter {
     window_width: u32,
     window_height: u32,
     decoder: Option<Decoder>,
-}
-
-impl Drop for Presenter {
-    fn drop(&mut self) {
-        // Documented requirement for GetFrameLatencyWaitableObject.
-        let _ = unsafe { CloseHandle(self.frame_latency_waitable) };
-    }
 }
 
 struct Decoder {
@@ -453,7 +452,13 @@ fn run_worker(
         buttons_down: 0,
     }));
     unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, state as isize) };
-    let _user_data = UserDataGuard { hwnd, state };
+    // Detaches and frees `WindowState` when the display thread exits
+    // (KNOWN_ISSUES #29: a `DropGuard` closure in place of a
+    // single-purpose `UserDataGuard` type).
+    let _user_data = DropGuard::new(move || unsafe {
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+        drop(Box::from_raw(state));
+    });
 
     let (device, context) =
         create_d3d11_device(D3D11_CREATE_DEVICE_VIDEO_SUPPORT | D3D11_CREATE_DEVICE_BGRA_SUPPORT)
@@ -487,6 +492,7 @@ fn run_worker(
     }
 
     let mut presenter = Presenter {
+        close_frame_latency_waitable: close_handle_on_drop(frame_latency_waitable),
         device,
         context,
         video_device,
