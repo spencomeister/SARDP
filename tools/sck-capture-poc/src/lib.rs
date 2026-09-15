@@ -8,5 +8,8 @@
 //! split as `tools/dxgi-capture-poc` + `sardp-win` on Windows.
 
 pub mod inject;
+pub mod main_thread;
 pub mod shim;
 pub mod vt;
+pub mod vtdec;
+pub mod window;

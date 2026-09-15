@@ -502,9 +502,42 @@ MUST の供給源で、合成中の生 `KeyEvent` を重ねて送ってはなら
 - `InputInjector`(`sardp-win/src/inject.rs`): `impl Drop`ごと削除。`inject()`は`self.handle.send(command).map_err(|_| InjectorClosed)`に簡略化。
 - `H264DisplayWindow`(`sardp-win/src/display.rs`): こちらは調査時点で指摘されていたとおり、`shared.closed`という`AtomicBool`を先に立ててから閉じる、という一点だけ`InputInjector`と異なります。`impl Drop for H264DisplayWindow`は`self.shared.closed.store(true, ...)`の1行だけに縮小し、`handle: WorkerHandle<SubmittedFrame>`フィールド自身の自動dropが(手書きDropの後に走るので)チャネルを閉じてjoinします。ワーカースレッド側は`AtomicBool`のポーリングと`recv_timeout`の`Disconnected`の両方を見ているため、どちらの合図でも正しく停止します(この二重性自体は元のコードのまま、変更していません)。
 
-**保留(macOSセッション待ち)**: `sardp-mac/src/inject.rs`の`InputInjector`も`sardp-win`版と同型の`tx`+`JoinHandle`のDropを持っていますが、この機ではビルド・実行を検証できない(Swiftシムがリンクできない、`cargo build --workspace`が`sck-capture-poc`の未解決シンボルで失敗する)ため、**今回は手を付けていません**。`WorkerHandle`自体はOS非依存(本体クレート、`std::sync::mpsc`+`std::thread::JoinHandle`のみ)なので、次のmacOS実機セッションでそのまま使えるはずです。
+**対応済み(3M-1-eセッション、2026-09-16)**: `sardp-mac/src/inject.rs`の`InputInjector`も`sardp-win`版と同型の`tx: Option<Sender<_>>`+`worker: Option<JoinHandle<()>>`の手書き`impl Drop`を持っていましたが、`WorkerHandle<InjectCommand>`1フィールドに置き換えました。`inject()`は`self.handle.send(command).map_err(|_| InjectorClosed)`に簡略化。`cargo build -p sardp-mac`/`cargo test -p sardp-mac --lib`(25件、既存のまま変化なし)で確認済み。当時「この機ではビルド・実行を検証できない」としていたのは3M-1-a時点の状況で、3M-1-eまでにmacOS実機での`cargo build --workspace`・実バイナリ実行ともに確立済みだったため、今回は検証込みで対応できました。
 
 **着手しなかった6件(元の調査どおり)**: `tools/sck-capture-poc`の`Injector`・`EventTap`・`Session`・`Encoder`(FFIハンドル解放、`drop_sink`関数ポインタで型消去したsinkの解放)と、`Encoder`(`sardp-win/src/desktop_h264.rs`)・`Encoder`/`Muxer`(`tools/dxgi-capture-poc/src/bin/mf_h264_encode.rs`、`finished`/`finalized`フラグでの二重呼び出し防止つき)。いずれも`Drop::drop`自身がメソッド・状態を共有するか、生ポインタと関数ポインタの組を扱うため、`DropGuard`に収めると`unsafe`が増えるだけで可読性が下がると判断し、コメントで`DropGuard`との使い分けの理由を残すに留めました。
 
 **検証**: `cargo build`/`cargo clippy`/`cargo fmt --check`/`cargo test --lib`を`sardp`・`sardp-win`・`sardp-cli`・`tools/dxgi-capture-poc`の4クレートで実施(`cargo test --lib`: `sardp` 358件、`sardp-win` 3件、いずれもpass。`cargo build --workspace`はmacOS専用クレートのリンクエラーで失敗するため対象外、既知の事象で今回の変更とは無関係)。実機での動作確認: `sardp-server --capture desktop` + `sardp-client --display window --input on`をLAN経由(`192.168.1.10`)で実行し、映像(600フレーム超、`decode_us`/`present_us`はitem 16の実測値と同水準)・マウス入力の転送とサーバー側`SendInput`注入(サーバーログに`mouse move event`/`mouse button event`、`input summary: injected=7`)の両方が正常動作することを確認。続けてクライアントへ`WM_CLOSE`を送り、`H264DisplayWindow`・`InputForwarder`を含むdropチェーンがハングせず約2.1秒で完了することを`Process.WaitForExit`で確認。サーバー側も接続終了時に`InputInjector`(`WorkerHandle`経由)のdropを含めて`connection ended cleanly`まで到達することを確認済み。
 
+
+### 30. 3M-1-e: 永続 `VTDecompressionSession` デコーダ + `NSWindow` 表示。`NSWindow` はプロセスの本物のメインスレッドでしか作れない(捕捉不能な例外で強制終了する)
+
+`sardp_mac::display::H264DisplayWindow`(Windows の `sardp_win::display::H264DisplayWindow` と同じ API 形状 — `open`/`submit`/`next_timing`/`is_closed`、`SubmittedFrame`/`FrameTiming`/`DisplayConfig`)を追加し、`sardp-cli` の `--display window` を macOS でも使えるようにした(`sardp-server`の`os`エイリアスと同じパターンを`sardp-client`にも導入)。デコーダは`sck_capture_poc::vtdec::Decoder`(新規、`VtDecoder.swift`)、ウィンドウは`sck_capture_poc::window::DisplayWindow`(新規、`DisplayWindow.swift`)。
+
+**VideoToolbox側の設計判断**: `VTDecompressionSessionDecodeFrame`に空の`VTDecodeFrameFlags`(非同期・時間並べ替えのいずれも立てない)を渡すと、ドキュメント上「出力コールバックは関数が返る前に必ず呼ばれる」という保証が得られる。Windowsの`IMFTransform`(`ProcessInput`→ポーリングで`ProcessOutput`)のような手書きの同期化ループが不要で、1回の`decode()`呼び出しが1回の入出力ペアに素直に対応する。フォーマット記述(`CMVideoFormatDescriptionCreateFromH264ParameterSets`)はSPS/PPSから構築する必要があり、Media FoundationのデコーダMFTのようにAnnex-Bビットストリームから自分でパースしてはくれない。サーバー側の`sardp::h264::ParameterSetCache`(3M-1-b、既存)が全IDRを自己完結にしているため、クライアント側は各IDRから`sardp::h264::split_annex_b`でSPS/PPSを抽出すればよく、専用のフォールバック機構は不要だった。出力の`CVPixelBuffer`は`kCVPixelBufferIOSurfacePropertiesKey`付きで要求し、`CALayer.contents`に直接代入(CPUコピーなし、WindowsのDXVA+`ID3D11VideoProcessor`blitと同じ役割)。
+
+**本題: `NSWindow`はプロセスの本物のメインスレッド(スレッド0)でしか作れない。** これはガイドライン上の推奨ではなく、`-[NSWindow initWithContentRect:styleMask:backing:defer:]`内部で無条件に`NSInternalInconsistencyException`("NSWindow should only be instantiated on the main thread!")を投げる強制です。このObjective-C例外はRustの`catch_unwind`で捕捉できず、FFI境界を越えた瞬間に`fatal runtime error: Rust cannot catch foreign exceptions, aborting`でプロセスごと即座に終了します(`Result`で確認する余地は一切ない)。
+
+最初の切り分けは誤りでした。ウィンドウ作成をバックグラウンドスレッドから行い、`NSApplication.shared`の`.accessory`活性化ポリシー+`nextEvent(until: .distantPast)`の非ブロッキングポーリングだけで実際に画面に出る、という単体スワミプローブ(`SCScreenshotManager`で自プロセスからスクリーンショットして目視確認)を最初に作って「動く」と判断しましたが、**このプローブはSwiftの裸の実行ファイルとして直接実行したため、`main()`自身がスレッド0で走っていました** — 実際に検証すべき「スレッド0を`#[tokio::main]`が占有している状態で、スポーンされた別スレッドからウィンドウを作る」状況を再現できていませんでした。本番の`sardp-client`(`#[tokio::main]`)に組み込んで初めて上記のクラッシュを引き当てました。同じプローブを明示的に`Thread{}`で生成した別スレッドから再実行すると、単体でも同一の例外を確実に再現できます。
+
+**修正**: ワークアラウンドではなく、AppKitが実際に要求する形にする。`sardp-cli`の`sardp-client`の`main()`を`#[tokio::main]`から素の`fn main()`に変更し、macOSで`--display window`のときだけ役割を入れ替える —
+プロセスの本物のスレッド0は`sardp_mac::run_main_thread_loop`(新規、`sck_capture_poc::main_thread`)を実行してAppKitのイベントキューを servicing し続け、tokioランタイム(とその先の`sardp_mac::display`のワーカースレッド)はスポーンした別スレッドで動く。`sck_capture_poc::window::DisplayWindow`の各メソッド(`create`/`present`/`pump`/`is_visible`/`should_close`/`Drop`)は、実際のFFI呼び出しを`on_main_thread`(チャネル越しにジョブをスレッド0へ送り、実行完了を待つ)でラップしており、呼び出し側(`sardp_mac::display`)から見ると何も変わらない。生ポインタを`on_main_thread`のクロージャに渡す際、Rust 2021の「精密なクロージャキャプチャ」(RFC 2229)が`SendPtr`ラッパーではなく中の`*mut c_void`フィールドだけをキャプチャしてしまい`Send`境界を静かに回避できてしまう罠があり、フィールドアクセス(`.0`)ではなくメソッド呼び出し(`.get()`)にすることで防いでいる(`tools/sck-capture-poc/src/window.rs`)。
+
+**副次的に踏んだ罠、修正済み**: `.activationPolicy = .regular` + `activate(ignoringOtherApps: true)`を試した際、`collectionBehavior = [.canJoinAllSpaces, .moveToActiveSpace]`を追加した組み合わせで`run_main_thread_loop`自体がハングする(15秒のreadyタイムアウトで気づいた、クラッシュではなく単にジョブが永久に完了しない)という別の不具合を踏んだ。原因は特定していないが、スペース切り替え絡みの同期APIが本セッション環境(下記30-Aの理由と同根の可能性がある)で応答しないためと推測している。**最終的な実装は`.accessory`のみ(activateなし)に戻した**(3M-1-d以前の他バンドルと同じ選択、フォーカスを奪わない)。
+
+**検証**: `cargo test --lib`(`sardp` 358件、`sardp-mac` 25件、うち`display`モジュールの3件が新規 — SPS/PPS分離とAVCC変換のユニットテスト)。実機: 署名済み`SardpServer.app`+`SardpClient.app`(`--display window`)をLAN経由(`192.168.1.6`、KNOWN_ISSUES #14と同じ理由でループバック不使用)で約38秒・601フレーム連続稼働、世代リセット0回、全フレーム`presented=true`でクラッシュなし(修正前は`video channel Live`直後、最初のフレームで確実にabort)。実測値は`docs/sardp-stage3-latency-measurements.md`の「macOS、永続デコーダ・ウィンドウ導入後」節。
+
+#### 30-A. この環境固有: 実行時に画面がロックされていると、ウィンドウは作成・稼働してもウィンドウサーバーに合成されない
+
+3M-1-eの受け入れ基準(スクリーンショットでの目視確認)を試みる過程で判明した、macOS本体の仕様であり実装のバグではない事象。セッション中に画面がロックされ(`CGSessionCopyCurrentDictionary`の`CGSSessionScreenIsLocked = 1`で確認)、その状態で`sardp-client --display window`を実行すると:
+
+- クラッシュせず、フレームは継続してデコード・「表示」される(`presented=true`、`window.isVisible()`も`true`)。
+- しかし`win.occlusionState`に`.visible`ビットが立たない(観測値`8192`、公開APIの`.visible`(値2)を含まない)。
+- サーバー側の`ScreenCaptureKit`キャプチャをダンプして`ffmpeg`で確認すると、実際の画面はロック画面の壁紙のみ(Dock・メニューバー・アイコンなし)で、`SardpClient`のウィンドウはどこにも合成されていない。
+
+これはWindowsのSecure Desktop(UAC昇格ダイアログ・ログイン画面、Part 7既述)と同種の、OSが意図的に設けているセキュリティ境界であり、ロック画面より上に通常権限プロセスのウィンドウを合成させない仕組みが働いていると考えられる。3M-2(無人アクセス)がスコープ外である今回の対象(3M-1、在席)では、「画面がロックされていない」ことが前提となる。**受け入れ基準のスクリーンショット確認は、この理由により本セッションでは完了できていない** — デコード・表示ロジック自体の正しさは上記の実機ログ(全フレーム`presented=true`、世代リセット0回)とダンプフレームの`ffmpeg`デコード結果(実デスクトップの画像が正しく得られる)で確認済みだが、実際にウィンドウがユーザーの目に見える形でウィンドウサーバーに合成されることの確認は、画面のロックが解除された状態での再検証が必要。
+
+#### 30-B. `encode`(サーバー)と`decode`(クライアント)を同一機・同一GPUで同時稼働させると、macOSの方がWindowsよりエンコード遅延の増加が大きい
+
+`docs/sardp-stage3-latency-measurements.md`に詳細。単体計測(3M-1-b)のp50 16〜18msに対し、`--display window`のクライアントを同時稼働させるとp50 34msとほぼ倍増した。Windows(NVENC単体p50 5〜7ms→同居時p50 5.6〜6.4msとほぼ無変化)と比べて競合の影響が大きい。Apple SiliconのUnified Memory上で同一プロセス空間内の同一GPUにVideoToolboxのエンコード・デコードを同時発行していることが疑わしいが未確認。別機構成での切り分けが必要(未対応)。
+
+**未対応のまま残っている点**(Windows項目16と同じ形で記録): ウィンドウのリサイズ非対応(固定サイズ)、macOSのウィンドウは表示専用でキーボード・マウス入力を一切捕捉しない(3M-1-d以来の`--input-script`が引き続き唯一の入力経路、Windowsの`--input on`相当は未実装)、ストリーム解像度変更時のデコーダ再作成は`decoder_dims`比較のみでWindows同様未検証、Tier 4(ソフトウェア)フォールバックなし、30-Aの画面ロック環境での再検証。

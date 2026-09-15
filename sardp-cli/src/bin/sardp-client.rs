@@ -8,9 +8,11 @@
 //!   proving the wire protocol end-to-end the same way M4-M6's tests did.
 //!   Only self-contained frames decode this way (`sardp-server --all-idr`
 //!   for desktop capture).
-//! - `window` (Windows, Stage 3 3W-1-d-3): a persistent hardware H.264
-//!   decoder behind an on-screen window (`sardp_win::H264DisplayWindow`),
-//!   so P-frame streams display at the server's frame rate.
+//! - `window` (Windows 3W-1-d-3, macOS 3M-1-e): a persistent hardware
+//!   H.264 decoder behind an on-screen window (`os::H264DisplayWindow`),
+//!   so P-frame streams display at the server's frame rate. Window-driven
+//!   keyboard/mouse capture (`--input on`) is Windows-only so far; the
+//!   macOS window is display-only.
 //!
 //! Either way a real `TransportFeedback` is sent for every frame (spec
 //! 2.14), which is what lets `sardp-server`'s backpressure mechanism
@@ -18,7 +20,7 @@
 //! each other -- including resetting the stream, which this client
 //! recovers from by accepting the next generation's Instance.
 
-#[cfg(windows)]
+#[cfg(desktop_capture)]
 use std::collections::VecDeque;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
@@ -39,12 +41,21 @@ use sardp::messages::{
     self, AudioCodec, AudioConfig, InputHeader, KeyEvent, MouseButton, MouseMove, SessionClose,
     TextInput, VideoFrameHeader, Wheel,
 };
-#[cfg(windows)]
+#[cfg(desktop_capture)]
 use sardp::queue_circuit_breaker::ClientQueueCircuitBreaker;
 // Only the window input path composes; `--input-script` commits text
-// directly, so this is Windows-only for now.
+// directly, so this is Windows-only for now (the macOS window, 3M-1-e,
+// does not capture keyboard/mouse input from the window at all yet).
 #[cfg(windows)]
 use sardp::messages::ImeComposition;
+/// The OS-integration crate's display window, under one name -- see
+/// `sardp-server`'s `os` alias doc for why `sardp-win`/`sardp-mac` being
+/// deliberately parallel APIs is what lets this be written once. Unlike
+/// the server side, `os::WindowInput`/`os::H264DisplayWindow::take_input_receiver`
+/// only exist on Windows so far (KNOWN_ISSUES #28): macOS's window is
+/// display-only for this checkpoint, so every reference to window-driven
+/// *input* stays behind `#[cfg(windows)]` even though window *display*
+/// itself is `#[cfg(desktop_capture)]`.
 use sardp::permission_set::bit;
 use sardp::reason_code::ReasonCode;
 use sardp::reconnection::client_reconnect;
@@ -54,6 +65,10 @@ use sardp::timecode_frame::extract_timecode;
 use sardp::timesync;
 use sardp::video_session::{VideoError, VideoFrameReader, accept_video_instance};
 use sardp::{StreamKind, clock, dev_identity, net, pki};
+#[cfg(target_os = "macos")]
+use sardp_mac as os;
+#[cfg(windows)]
+use sardp_win as os;
 
 /// `--display`: where decoded frames go.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -118,7 +133,7 @@ OPTIONS:\n\
                               fresh handshake (demo/test use only)\n\
     --display <log|window>    log: decode each frame with ffmpeg and log its\n\
                               timecode (default, any platform; needs\n\
-                              self-contained frames). window: Windows only,\n\
+                              self-contained frames). window: Windows/macOS,\n\
                               persistent hardware decoder + on-screen window\n\
     --window-size <WxH>       Window client size for --display window\n\
                               (default 1280x720; frames are scaled to fit)\n\
@@ -196,8 +211,11 @@ fn parse_args() -> Args {
                 display = match value.as_str() {
                     "log" => DisplayMode::Log,
                     "window" => {
-                        if !cfg!(windows) {
-                            eprintln!("--display window is only available on Windows");
+                        if !cfg!(desktop_capture) {
+                            eprintln!(
+                                "--display window is only available on Windows/macOS \
+                                 (needs an OS-integration crate)"
+                            );
                             std::process::exit(2);
                         }
                         DisplayMode::Window
@@ -388,10 +406,62 @@ impl From<sardp::clipboard_session::ClipboardSessionError> for AppError {
     }
 }
 
-#[tokio::main]
-async fn main() {
+/// Real (synchronous) process entry point. Ordinarily just builds a
+/// tokio runtime and blocks on [`async_main`] -- what `#[tokio::main]`
+/// would expand to. On macOS with `--display window` it does something
+/// different: `sardp_mac::display`'s `NSWindow` may only be created on
+/// the process's *real* main thread (an enforced, uncatchable-from-Rust
+/// requirement -- see `sck_capture_poc::main_thread`'s doc for how this
+/// was found and why the fix is not a workaround but doing what AppKit
+/// actually requires). Tokio's own thread (thread 0, since
+/// `#[tokio::main]`/`Runtime::block_on` don't relinquish it) is exactly
+/// the wrong one for that, so in this one case the roles swap: this
+/// function's own thread (the real thread 0) runs
+/// `sardp_mac::run_main_thread_loop` for the life of the process, and
+/// the tokio runtime -- with it, eventually, `sardp_mac::display`'s
+/// worker thread -- runs on a thread spawned for the purpose instead.
+/// Every other platform, and every other `--display` mode on macOS,
+/// takes the ordinary path.
+fn main() {
     let args = parse_args();
 
+    #[cfg(target_os = "macos")]
+    if matches!(args.display, DisplayMode::Window) {
+        return run_with_appkit_on_the_real_main_thread(args);
+    }
+
+    tokio::runtime::Runtime::new()
+        .expect("build tokio runtime")
+        .block_on(async_main(args));
+}
+
+/// See [`main`]'s doc. `should_exit` is set by the spawned thread once
+/// [`async_main`] returns, so `sardp_mac::run_main_thread_loop` stops
+/// pumping AppKit and this function (and with it the process, falling
+/// off the end of `main`) can exit normally -- unless `async_main` never
+/// gets that far because it called `std::process::exit` itself first
+/// (the error path below), which tears down the whole process
+/// immediately regardless of what this thread is doing.
+#[cfg(target_os = "macos")]
+fn run_with_appkit_on_the_real_main_thread(args: Args) {
+    let should_exit = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let worker = {
+        let should_exit = should_exit.clone();
+        std::thread::Builder::new()
+            .name("sardp-client-tokio".into())
+            .spawn(move || {
+                tokio::runtime::Runtime::new()
+                    .expect("build tokio runtime")
+                    .block_on(async_main(args));
+                should_exit.store(true, std::sync::atomic::Ordering::SeqCst);
+            })
+            .expect("spawn tokio runtime thread")
+    };
+    sardp_mac::run_main_thread_loop(&should_exit);
+    let _ = worker.join();
+}
+
+async fn async_main(args: Args) {
     let trusted_cert = pki::load_trusted_cert_pem(&args.trust_cert)
         .unwrap_or_else(|e| panic!("failed to load --trust-cert {:?}: {e}", args.trust_cert));
 
@@ -995,7 +1065,7 @@ struct DisplayedFrame {
 
 /// A frame handed to the window whose decode/present timing hasn't come
 /// back yet (`window` mode only).
-#[cfg(windows)]
+#[cfg(desktop_capture)]
 struct PendingFeedback {
     header: VideoFrameHeader,
     payload_len: usize,
@@ -1007,15 +1077,15 @@ struct PendingFeedback {
 
 enum VideoSink {
     Log,
-    #[cfg(windows)]
+    #[cfg(desktop_capture)]
     Window {
-        window: sardp_win::H264DisplayWindow,
+        window: os::H264DisplayWindow,
         pending: VecDeque<PendingFeedback>,
         /// KNOWN_ISSUES #16/#29: `pending` mirrors `H264DisplayWindow`'s
         /// own internal (unbounded) decode queue 1:1 -- every `submit()`
         /// there pairs with exactly one push here, every `next_timing()`
         /// with exactly one pop -- so its front's age stands in for the
-        /// real queue's age without reaching into `sardp-win`.
+        /// real queue's age without reaching into the OS crate.
         breaker: ClientQueueCircuitBreaker,
     },
 }
@@ -1027,9 +1097,9 @@ impl VideoSink {
                 eprintln!("display: log (per-frame ffmpeg decode)");
                 Ok(Self::Log)
             }
-            #[cfg(windows)]
+            #[cfg(desktop_capture)]
             DisplayMode::Window => {
-                let config = sardp_win::DisplayConfig {
+                let config = os::DisplayConfig {
                     title: format!(
                         "SARDP {} ({}x{})",
                         args.server, encoder_config.width, encoder_config.height
@@ -1038,7 +1108,7 @@ impl VideoSink {
                     height: args.window_size.1,
                 };
                 let window =
-                    sardp_win::H264DisplayWindow::open(config, std::sync::Arc::new(clock::now_us))
+                    os::H264DisplayWindow::open(config, std::sync::Arc::new(clock::now_us))
                         .map_err(|e| AppError::Display(e.to_string()))?;
                 eprintln!(
                     "display: window {}x{} (hardware H.264 decode, stream {}x{})",
@@ -1053,20 +1123,25 @@ impl VideoSink {
                     breaker: ClientQueueCircuitBreaker::new(),
                 })
             }
-            #[cfg(not(windows))]
+            #[cfg(not(desktop_capture))]
             DisplayMode::Window => {
                 let _ = encoder_config;
-                unreachable!("--display window is rejected at argument parsing off Windows")
+                unreachable!(
+                    "--display window is rejected at argument parsing without desktop_capture"
+                )
             }
         }
     }
 
-    /// The window's input events (window mode, once); `None` in log mode.
+    /// The window's input events (window mode, once); `None` in log mode
+    /// and on macOS (3M-1-e's window does not capture input yet).
     fn take_input_receiver(&mut self) -> Option<WindowInputRx> {
         match self {
             Self::Log => None,
             #[cfg(windows)]
             Self::Window { window, .. } => window.take_input_receiver(),
+            #[cfg(all(desktop_capture, not(windows)))]
+            Self::Window { .. } => None,
         }
     }
 
@@ -1075,7 +1150,7 @@ impl VideoSink {
     async fn next_window_timing(&mut self) -> Option<WindowTiming> {
         match self {
             Self::Log => std::future::pending().await,
-            #[cfg(windows)]
+            #[cfg(desktop_capture)]
             Self::Window { window, .. } => window.next_timing().await.map(|t| WindowTiming {
                 generation: t.generation,
                 frame_id: t.frame_id,
@@ -1097,7 +1172,7 @@ impl VideoSink {
         offset_us: i64,
         target_latency_us: u32,
     ) -> Result<(), AppError> {
-        #[cfg(windows)]
+        #[cfg(desktop_capture)]
         if let Self::Window {
             pending, breaker, ..
         } = self
@@ -1161,7 +1236,7 @@ impl VideoSink {
     /// pushed or popped recently (e.g. the server itself has stopped
     /// sending, so [`process_frame`]'s own observe-on-push never fires).
     /// A no-op in `log` mode.
-    #[cfg(windows)]
+    #[cfg(desktop_capture)]
     async fn tick_circuit_breaker(
         &mut self,
         feedback_send: &mut quinn::SendStream,
@@ -1176,7 +1251,7 @@ impl VideoSink {
         Ok(())
     }
 
-    #[cfg(not(windows))]
+    #[cfg(not(desktop_capture))]
     async fn tick_circuit_breaker(
         &mut self,
         _feedback_send: &mut quinn::SendStream,
@@ -1196,7 +1271,7 @@ impl VideoSink {
 /// `submit()`-ed) and this queue drains from the front as those frames'
 /// timing reports come back with nothing to match, i.e. get skipped as
 /// `stats.no_output`.
-#[cfg(windows)]
+#[cfg(desktop_capture)]
 async fn observe_circuit_breaker(
     pending: &VecDeque<PendingFeedback>,
     breaker: &mut ClientQueueCircuitBreaker,
@@ -1219,9 +1294,10 @@ async fn observe_circuit_breaker(
     Ok(())
 }
 
-/// The window's input event type, per platform (only Windows has a
-/// window; elsewhere the receiver is always `None` and the arm never
-/// fires).
+/// The window's input event type, per platform. Only Windows captures
+/// input from the window at all (3M-1-e's macOS window is display-only,
+/// see `VideoSink::take_input_receiver`); everywhere else the receiver
+/// is always `None` and this arm never fires.
 #[cfg(windows)]
 type WindowInputEvent = sardp_win::WindowInput;
 #[cfg(not(windows))]
@@ -1599,8 +1675,9 @@ impl InputForwarder {
     }
 }
 
-/// Window-mode decode/present timestamps, mirrored from `sardp_win` so the
-/// `select!` arm has a type on every platform.
+/// Window-mode decode/present timestamps, mirrored from `os::FrameTiming`
+/// (`sardp_win`/`sardp_mac` deliberately share this shape) so the
+/// `select!` arm has one platform-independent type to work with.
 #[derive(Debug, Clone, Copy)]
 struct WindowTiming {
     generation: u64,
@@ -1853,7 +1930,7 @@ async fn process_frame(
             );
             feedback_session::send_transport_feedback(feedback_send, &feedback).await?;
         }
-        #[cfg(windows)]
+        #[cfg(desktop_capture)]
         VideoSink::Window {
             window,
             pending,
@@ -1867,7 +1944,7 @@ async fn process_frame(
             }
             let payload_len = payload.len();
             window
-                .submit(sardp_win::SubmittedFrame {
+                .submit(os::SubmittedFrame {
                     generation: header.generation,
                     frame_id: header.frame_id,
                     is_idr: header.is_idr(),

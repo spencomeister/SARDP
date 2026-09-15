@@ -24,17 +24,31 @@
 //! in [`keymap`]. Gated by Accessibility, which is a TCC permission
 //! independent of the Screen Recording one capture needs.
 //!
-//! The client side is still to come.
+//! Client side ([`display`], 3M-1-e): a persistent VideoToolbox H.264
+//! decoder behind an on-screen `NSWindow`, the same shape as
+//! `sardp_win::display::H264DisplayWindow`.
 
 pub mod desktop_h264;
+pub mod display;
 pub mod inject;
 pub mod keymap;
 
 pub use desktop_h264::{DesktopH264Source, MacCaptureError};
+pub use display::{DisplayConfig, FrameTiming, H264DisplayWindow, MacDisplayError, SubmittedFrame};
 pub use inject::{
     InjectCommand, InjectorClosed, InjectorConfig, InputInjector, InputState, Post,
     is_accessibility_trusted, request_accessibility_trust,
 };
+/// Services AppKit's event queue for the life of the process; **must be
+/// called on the process's real main thread**, before the first
+/// [`H264DisplayWindow`] is created from any other thread (see
+/// `sck_capture_poc::main_thread`'s doc for why this exists at all --
+/// `NSWindow`'s main-thread requirement is enforced with an uncaught
+/// exception Rust cannot recover from, not a `Result`). `sardp-cli`'s
+/// `main`, on macOS with `--display window`, restructures itself around
+/// this: its real thread 0 runs this loop while the tokio runtime (and
+/// with it `display`'s worker thread) runs on a spawned thread instead.
+pub use sck_capture_poc::main_thread::run_main_thread_loop;
 // Shared with the other platforms; re-exported so callers can name them
 // without depending on the core crate directly, as `sardp-win` does.
 pub use sardp::frame_source::{Clock, DesktopH264Config, EncodedFrame, SourceError, SourceInfo};
