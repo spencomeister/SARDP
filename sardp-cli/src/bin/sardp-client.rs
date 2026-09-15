@@ -39,6 +39,8 @@ use sardp::messages::{
     self, AudioCodec, AudioConfig, InputHeader, KeyEvent, MouseButton, MouseMove, SessionClose,
     TextInput, VideoFrameHeader, Wheel,
 };
+#[cfg(windows)]
+use sardp::queue_circuit_breaker::ClientQueueCircuitBreaker;
 // Only the window input path composes; `--input-script` commits text
 // directly, so this is Windows-only for now.
 #[cfg(windows)]
@@ -683,6 +685,15 @@ async fn run(connection: quinn::Connection, args: &Args) -> Result<(), AppError>
     let mut keepalive_interval = tokio::time::interval(timeouts::KEEPALIVE_INTERVAL);
     let mut last_activity = tokio::time::Instant::now();
 
+    // Circuit breaker (`window` mode; KNOWN_ISSUES #16/#29): `process_frame`
+    // and `on_window_timing` already feed it on every push/pop of the
+    // pending queue, but a queue that has stopped changing entirely (the
+    // server itself stalled) would otherwise go unobserved between those
+    // events. 100ms matches spec 4.7's `TRANSPORT_FEEDBACK_INTERVAL`, so
+    // this can't itself become the bottleneck in reporting a trip.
+    let mut circuit_breaker_interval = tokio::time::interval(Duration::from_millis(100));
+    circuit_breaker_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
     // KNOWN_ISSUES.md #12: audio_capture (client -> server). Only opened
     // if granted at handshake/reconnect time -- unlike sardp-server's
     // AUDIO_PLAYBACK, which reacts live to later admin grants, this client
@@ -832,6 +843,9 @@ async fn run(connection: quinn::Connection, args: &Args) -> Result<(), AppError>
                 if let Some(forwarder) = input_forwarder.as_mut() {
                     forwarder.forward(event).await?;
                 }
+            }
+            _ = circuit_breaker_interval.tick() => {
+                sink.tick_circuit_breaker(&mut feedback_send, &mut stats).await?;
             }
             _ = audio_capture_interval.tick() => {
                 if let Some(send) = audio_capture_send.as_mut() {
@@ -985,6 +999,10 @@ struct DisplayedFrame {
 struct PendingFeedback {
     header: VideoFrameHeader,
     payload_len: usize,
+    /// Client clock when this frame was submitted to the display window;
+    /// what the circuit breaker (KNOWN_ISSUES #16/#29) below measures the
+    /// oldest-queued-frame age from.
+    receive_ts: u64,
 }
 
 enum VideoSink {
@@ -993,6 +1011,12 @@ enum VideoSink {
     Window {
         window: sardp_win::H264DisplayWindow,
         pending: VecDeque<PendingFeedback>,
+        /// KNOWN_ISSUES #16/#29: `pending` mirrors `H264DisplayWindow`'s
+        /// own internal (unbounded) decode queue 1:1 -- every `submit()`
+        /// there pairs with exactly one push here, every `next_timing()`
+        /// with exactly one pop -- so its front's age stands in for the
+        /// real queue's age without reaching into `sardp-win`.
+        breaker: ClientQueueCircuitBreaker,
     },
 }
 
@@ -1026,6 +1050,7 @@ impl VideoSink {
                 Ok(Self::Window {
                     window,
                     pending: VecDeque::new(),
+                    breaker: ClientQueueCircuitBreaker::new(),
                 })
             }
             #[cfg(not(windows))]
@@ -1073,7 +1098,10 @@ impl VideoSink {
         target_latency_us: u32,
     ) -> Result<(), AppError> {
         #[cfg(windows)]
-        if let Self::Window { pending, .. } = self {
+        if let Self::Window {
+            pending, breaker, ..
+        } = self
+        {
             // Frames complete in submission order; anything ahead of the
             // reported one in the queue never produced output (the decoder
             // needed more input, or it was dropped inside the window) and
@@ -1112,6 +1140,11 @@ impl VideoSink {
                 target_latency_us,
             );
             feedback_session::send_transport_feedback(feedback_send, &feedback).await?;
+
+            // The queue just shrank (a pop, and possibly a skip-drain of
+            // stale entries too); feed the new oldest age to the circuit
+            // breaker (KNOWN_ISSUES #16/#29).
+            observe_circuit_breaker(pending, breaker, feedback_send, stats).await?;
         }
         let _ = (
             &timing,
@@ -1122,6 +1155,68 @@ impl VideoSink {
         );
         Ok(())
     }
+
+    /// Periodic circuit-breaker poll (`select!` tick, `window` mode only):
+    /// catches a backlog whose age keeps growing even though nothing has
+    /// pushed or popped recently (e.g. the server itself has stopped
+    /// sending, so [`process_frame`]'s own observe-on-push never fires).
+    /// A no-op in `log` mode.
+    #[cfg(windows)]
+    async fn tick_circuit_breaker(
+        &mut self,
+        feedback_send: &mut quinn::SendStream,
+        stats: &mut FrameStats,
+    ) -> Result<(), AppError> {
+        if let Self::Window {
+            pending, breaker, ..
+        } = self
+        {
+            observe_circuit_breaker(pending, breaker, feedback_send, stats).await?;
+        }
+        Ok(())
+    }
+
+    #[cfg(not(windows))]
+    async fn tick_circuit_breaker(
+        &mut self,
+        _feedback_send: &mut quinn::SendStream,
+        _stats: &mut FrameStats,
+    ) -> Result<(), AppError> {
+        Ok(())
+    }
+}
+
+/// Circuit breaker (KNOWN_ISSUES #16/#29): feeds `breaker` the age
+/// (client clock) of the oldest frame still in `pending` and, if it
+/// trips, sends `KeyframeRequest{DecodeError}` on the feedback stream.
+/// The server MAY answer by reopening at `generation + 1` (spec 2.10),
+/// whereupon `H264DisplayWindow`'s own worker thread discards the old
+/// generation's backlog on its side (it compares against
+/// `newest_generation`, updated the instant a new-generation frame is
+/// `submit()`-ed) and this queue drains from the front as those frames'
+/// timing reports come back with nothing to match, i.e. get skipped as
+/// `stats.no_output`.
+#[cfg(windows)]
+async fn observe_circuit_breaker(
+    pending: &VecDeque<PendingFeedback>,
+    breaker: &mut ClientQueueCircuitBreaker,
+    feedback_send: &mut quinn::SendStream,
+    stats: &mut FrameStats,
+) -> Result<(), AppError> {
+    let age = pending
+        .front()
+        .map(|p| clock::now_us().saturating_sub(p.receive_ts))
+        .unwrap_or(0);
+    if let Some(request) = breaker.observe(age) {
+        stats.keyframe_requests_sent += 1;
+        eprintln!(
+            "client queue circuit breaker tripped ({} frame(s) queued, oldest {age}us old); sending KeyframeRequest{{DecodeError}} (#{})",
+            pending.len(),
+            stats.keyframe_requests_sent
+        );
+        feedback_session::send_keyframe_request(feedback_send, &request).await?;
+    }
+    Ok(())
 }
 
 /// The window's input event type, per platform (only Windows has a
@@ -1545,6 +1640,10 @@ struct FrameStats {
     resets: u64,
     bytes: u64,
     idr: u64,
+    /// Window mode: `KeyframeRequest{DecodeError}` sent by the client
+    /// queue circuit breaker (KNOWN_ISSUES #16/#29), not spec 2.10's
+    /// normal server-driven backpressure. Should stay 0 in a healthy run.
+    keyframe_requests_sent: u64,
     /// Per-displayed-frame samples, in microseconds.
     encode_us: Vec<u64>,
     transport_us: Vec<u64>,
@@ -1649,7 +1748,7 @@ impl FrameStats {
 
     fn print_summary(&self) {
         eprintln!(
-            "stats: received={} displayed={} (idr={}, not_presented={}) stale_generation={} no_output={} resets={} bytes={}",
+            "stats: received={} displayed={} (idr={}, not_presented={}) stale_generation={} no_output={} resets={} bytes={} keyframe_requests_sent={}",
             self.received,
             self.displayed,
             self.idr,
@@ -1658,6 +1757,7 @@ impl FrameStats {
             self.no_output,
             self.resets,
             self.bytes,
+            self.keyframe_requests_sent,
         );
         let row = |name: &str, samples: &[u64]| {
             let (avg, p50, p95, max) = summarize(samples);
@@ -1754,7 +1854,11 @@ async fn process_frame(
             feedback_session::send_transport_feedback(feedback_send, &feedback).await?;
         }
         #[cfg(windows)]
-        VideoSink::Window { window, pending } => {
+        VideoSink::Window {
+            window,
+            pending,
+            breaker,
+        } => {
             if window.is_closed() {
                 // The user closed the window; the timing arm ends the
                 // session on its next poll. Don't turn the race into an
@@ -1785,6 +1889,7 @@ async fn process_frame(
             pending.push_back(PendingFeedback {
                 header,
                 payload_len,
+                receive_ts,
             });
             if pending.len() > 64 && pending.len().is_power_of_two() {
                 eprintln!(
@@ -1794,6 +1899,11 @@ async fn process_frame(
                     header.frame_id
                 );
             }
+
+            // The queue just grew; feed the new oldest age to the circuit
+            // breaker (KNOWN_ISSUES #16/#29). Cheap and correct even when
+            // the just-pushed frame is itself the oldest (a fresh queue).
+            observe_circuit_breaker(pending, breaker, feedback_send, stats).await?;
         }
     }
     Ok(())
