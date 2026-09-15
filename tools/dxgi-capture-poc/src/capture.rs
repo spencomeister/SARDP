@@ -18,19 +18,23 @@ use windows::Win32::Graphics::Dxgi::{
 use windows::Win32::Graphics::Gdi::{DEVMODEW, ENUM_CURRENT_SETTINGS, EnumDisplaySettingsW};
 use windows::core::{Interface, PCWSTR};
 
-/// AcquireNextFrame成功後、確実にReleaseFrameを対応させるRAIIガード。
-/// Desktop Duplicationは未解放フレームを1つしか許さないため、
-/// 以降の処理が`?`で早期returnしてもpanicでunwindしても解放漏れが起きないようにする。
-pub struct FrameGuard<'a> {
-    pub duplication: &'a IDXGIOutputDuplication,
-}
+use sardp::drop_guard::DropGuard;
 
-impl Drop for FrameGuard<'_> {
-    fn drop(&mut self) {
-        if let Err(e) = unsafe { self.duplication.ReleaseFrame() } {
+/// Returns an RAII guard (KNOWN_ISSUES #29: a [`DropGuard`] closure) that
+/// calls `ReleaseFrame` when dropped, logging (not propagating) any
+/// failure. Desktop Duplication allows only one outstanding
+/// `AcquireNextFrame` at a time, so this MUST be constructed immediately
+/// after a successful `AcquireNextFrame` and held until the caller is
+/// done with the frame -- every exit path after that (an early `?`, a
+/// `.expect()` panic, ...) then still releases it.
+pub fn release_frame_on_drop(
+    duplication: &IDXGIOutputDuplication,
+) -> DropGuard<impl FnOnce() + '_> {
+    DropGuard::new(move || {
+        if let Err(e) = unsafe { duplication.ReleaseFrame() } {
             eprintln!("[capture] ReleaseFrame failed: {e}");
         }
-    }
+    })
 }
 
 /// D3D11デバイス+コンテキストを作成する。

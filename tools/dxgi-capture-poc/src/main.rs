@@ -22,8 +22,8 @@ use windows::Win32::Graphics::Dxgi::{
 use windows::core::Interface;
 
 use dxgi_capture_poc::capture::{
-    FrameGuard, create_d3d11_device, create_output_duplication, primary_display_refresh_interval,
-    read_dirty_rects, read_move_rect_count,
+    create_d3d11_device, create_output_duplication, primary_display_refresh_interval,
+    read_dirty_rects, read_move_rect_count, release_frame_on_drop,
 };
 
 /// 1フレーム取得を待つ最大時間(ms)。これを超えると「変化なし」としてリトライする。
@@ -89,9 +89,7 @@ fn main() -> windows::core::Result<()> {
         // AcquireNextFrameが成功した直後、他の処理より先にガードを作る。
         // これ以降のどの経路(cast失敗、Map失敗、assert_eq!のpanicなど)でも
         // スコープを抜ける際にDropが走りReleaseFrameが呼ばれる。
-        let frame_guard = FrameGuard {
-            duplication: &duplication,
-        };
+        let frame_guard = release_frame_on_drop(&duplication);
 
         let resource = resource.expect("AcquireNextFrame succeeded without a resource");
         let texture: ID3D11Texture2D = resource.cast()?;
@@ -123,7 +121,7 @@ fn main() -> windows::core::Result<()> {
         println!("[dxgi-capture-poc]   saved: {}", bmp_path.display());
 
         // 次のAcquireNextFrameより前に明示的に解放する(スロットリングのsleepより前)。
-        // 途中で`?`により抜けた場合はFrameGuard::dropが代わりに解放する。
+        // 途中で`?`により抜けた場合はDropGuardのdropが代わりに解放する。
         drop(frame_guard);
 
         let elapsed = frame_start.elapsed();

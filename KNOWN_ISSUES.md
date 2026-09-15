@@ -485,3 +485,25 @@ MUST の供給源で、合成中の生 `KeyEvent` を重ねて送ってはなら
 `--display log`(フレームごとの `ffmpeg` 起動)のコストです。**macOS 版の永続デコーダ・
 クライアントが無いため、Windows の構成 A と同じ土俵での比較はまだできません。**
 
+### 29. RAII後始末(`impl Drop`)の共通化: 本体クレートに`DropGuard`/`WorkerHandle`を追加し、Windows実機で検証済みの範囲を置き換えた
+
+「正常終了・エラー・panicのどの経路でも必ず解放する」ための`impl Drop`が、OS分岐クレートと検証ツールに個別に書かれていました。前回のWindows/macOSクロスプラットフォームセッションでの調査(2026-09-14)は、対象を3種に分類して記録するところまでで止めていました: 単純なクロージャで置き換えられる4件、専用の小さな型(`tx`+`JoinHandle`のペア)に束ねる方が向く3件、共通化しない方がよい6件。今回のWindows実機セッションで、**このうちWindowsでビルド・実行を検証できる範囲**を実装しました。
+
+**`DropGuard<F: FnOnce()>`(本体クレート、`src/drop_guard.rs`)**: クロージャを1回だけ(`Option<F>`+`take()`)dropで実行するだけの薄い型。`#[must_use]`を付け、`let _ = DropGuard::new(...)`のように束縛せず即座に捨てると「スコープの終わりではなくその場で即実行される」ことが分かるようにしています。ユニットテスト5件(通常のスコープ終了・`?`による早期return・panicによるunwind・即座にdropした場合・move-onlyな値のキャプチャ)。置き換えた4件:
+
+- `NetemGuard`(`src/netem.rs`): 見本として最初に着手。`clear()`を呼ぶだけのフィールドに変更、公開API(`NetemGuard::apply`)は不変。
+- `FrameGuard`(`tools/dxgi-capture-poc/src/capture.rs`): `ReleaseFrame`を呼ぶだけの構造体だったものを、`release_frame_on_drop(&duplication) -> DropGuard<impl FnOnce() + '_>`という関数に変更(構造体リテラルでの構築から関数呼び出しに変わるだけで、`drop(frame_guard)`による明示的な早期解放はそのまま動く)。呼び出し元3箇所(`tools/dxgi-capture-poc/src/main.rs`、同`src/bin/mf_h264_encode.rs`、`sardp-win/src/desktop_h264.rs`)を更新。`tools/dxgi-capture-poc`は今回`sardp`への依存を新規に追加しました(循環依存にはならない: `sardp`はOS分岐クレートに依存しません)。
+- `Presenter`(`sardp-win/src/display.rs`): `CloseHandle`を1回呼ぶだけの`impl Drop`でしたが、`Presenter`自体は他にも多くのフィールドを持つ本体の構造体なので、型そのものをガードに置き換えることはできません。`close_frame_latency_waitable: DropGuard<Box<dyn FnOnce()>>`という専用フィールドを構造体の**先頭**に追加し(手書きDropが常にフィールドの自動dropより先に走っていた元の順序を、構造体自身は`impl Drop`を持たなくなった後も維持するため、フィールド宣言順=drop順を利用)、`impl Drop for Presenter`ごと削除しました。フィールド型を名指しする必要があるため`DropGuard<impl FnOnce()>`ではなく`Box<dyn FnOnce()>`で型消去しています。
+- `UserDataGuard`(`sardp-win/src/display.rs`): `SetWindowLongPtrW`で切り離して`Box::from_raw`を落とすだけだった専用型を削除し、構築箇所(`let _user_data = DropGuard::new(move || unsafe { ... });`)にインラインのクロージャとして残しました。
+
+**`WorkerHandle<T>`(本体クレート、`src/worker_handle.rs`)**: 「チャネルの送信側+`JoinHandle`を持ち、dropで送信側を閉じてからjoinする」ワーカースレッド1本ぶんの後始末をまとめた型。同じ方向性の既存の`crate::frame_source::FrameWorker`(ワーカーが**生成**する側をtokio mpscの受信側として持つ)とは逆方向(呼び出し側がワーカーへ**投入**する側をstd mpscの送信側として持つ)なので、別モジュールとして新設しました。`send()`はワーカー側のreceiverが自発的に(panicや早期returnで)なくなっていた場合のみ`Err`を返します(`tx`が`None`になるのは`Drop::drop`内だけで、それは`self`の排他所有を要求するため、`&self`メソッドの`send()`と競合し得ません)。ユニットテスト3件(投入した値がdrop時のjoinより前にワーカーに届く、何も投入せずdropしても正常にjoinする、ワーカーが自発的に終了した後の`send`は`Err`)。置き換えた2件(いずれも`sardp-win`、Windows実機で検証可能な範囲):
+
+- `InputInjector`(`sardp-win/src/inject.rs`): `impl Drop`ごと削除。`inject()`は`self.handle.send(command).map_err(|_| InjectorClosed)`に簡略化。
+- `H264DisplayWindow`(`sardp-win/src/display.rs`): こちらは調査時点で指摘されていたとおり、`shared.closed`という`AtomicBool`を先に立ててから閉じる、という一点だけ`InputInjector`と異なります。`impl Drop for H264DisplayWindow`は`self.shared.closed.store(true, ...)`の1行だけに縮小し、`handle: WorkerHandle<SubmittedFrame>`フィールド自身の自動dropが(手書きDropの後に走るので)チャネルを閉じてjoinします。ワーカースレッド側は`AtomicBool`のポーリングと`recv_timeout`の`Disconnected`の両方を見ているため、どちらの合図でも正しく停止します(この二重性自体は元のコードのまま、変更していません)。
+
+**保留(macOSセッション待ち)**: `sardp-mac/src/inject.rs`の`InputInjector`も`sardp-win`版と同型の`tx`+`JoinHandle`のDropを持っていますが、この機ではビルド・実行を検証できない(Swiftシムがリンクできない、`cargo build --workspace`が`sck-capture-poc`の未解決シンボルで失敗する)ため、**今回は手を付けていません**。`WorkerHandle`自体はOS非依存(本体クレート、`std::sync::mpsc`+`std::thread::JoinHandle`のみ)なので、次のmacOS実機セッションでそのまま使えるはずです。
+
+**着手しなかった6件(元の調査どおり)**: `tools/sck-capture-poc`の`Injector`・`EventTap`・`Session`・`Encoder`(FFIハンドル解放、`drop_sink`関数ポインタで型消去したsinkの解放)と、`Encoder`(`sardp-win/src/desktop_h264.rs`)・`Encoder`/`Muxer`(`tools/dxgi-capture-poc/src/bin/mf_h264_encode.rs`、`finished`/`finalized`フラグでの二重呼び出し防止つき)。いずれも`Drop::drop`自身がメソッド・状態を共有するか、生ポインタと関数ポインタの組を扱うため、`DropGuard`に収めると`unsafe`が増えるだけで可読性が下がると判断し、コメントで`DropGuard`との使い分けの理由を残すに留めました。
+
+**検証**: `cargo build`/`cargo clippy`/`cargo fmt --check`/`cargo test --lib`を`sardp`・`sardp-win`・`sardp-cli`・`tools/dxgi-capture-poc`の4クレートで実施(`cargo test --lib`: `sardp` 358件、`sardp-win` 3件、いずれもpass。`cargo build --workspace`はmacOS専用クレートのリンクエラーで失敗するため対象外、既知の事象で今回の変更とは無関係)。実機での動作確認: `sardp-server --capture desktop` + `sardp-client --display window --input on`をLAN経由(`192.168.1.10`)で実行し、映像(600フレーム超、`decode_us`/`present_us`はitem 16の実測値と同水準)・マウス入力の転送とサーバー側`SendInput`注入(サーバーログに`mouse move event`/`mouse button event`、`input summary: injected=7`)の両方が正常動作することを確認。続けてクライアントへ`WM_CLOSE`を送り、`H264DisplayWindow`・`InputForwarder`を含むdropチェーンがハングせず約2.1秒で完了することを`Process.WaitForExit`で確認。サーバー側も接続終了時に`InputInjector`(`WorkerHandle`経由)のdropを含めて`connection ended cleanly`まで到達することを確認済み。
+

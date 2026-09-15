@@ -15,8 +15,9 @@
 //! loop.
 
 use std::sync::mpsc;
-use std::thread::JoinHandle;
 use std::time::Duration;
+
+use sardp::worker_handle::WorkerHandle;
 
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY,
@@ -98,9 +99,13 @@ impl std::fmt::Display for InjectorClosed {
     }
 }
 
+/// KNOWN_ISSUES #29: the "feed a worker thread, then join on drop"
+/// boilerplate is [`WorkerHandle`] (core crate) now; dropping `self`
+/// closes the queue and then joins the thread, letting it finish
+/// whatever was already queued (the caller's spec 4.4.2 releases are
+/// typically the last commands) before the drop returns.
 pub struct InputInjector {
-    tx: Option<mpsc::Sender<InjectCommand>>,
-    worker: Option<JoinHandle<()>>,
+    handle: WorkerHandle<InjectCommand>,
 }
 
 impl InputInjector {
@@ -117,29 +122,13 @@ impl InputInjector {
             })
             .expect("spawn inject thread");
         Self {
-            tx: Some(tx),
-            worker: Some(worker),
+            handle: WorkerHandle::new(tx, worker),
         }
     }
 
     /// Queues one injection; never blocks.
     pub fn inject(&self, command: InjectCommand) -> Result<(), InjectorClosed> {
-        self.tx
-            .as_ref()
-            .ok_or(InjectorClosed)?
-            .send(command)
-            .map_err(|_| InjectorClosed)
-    }
-}
-
-impl Drop for InputInjector {
-    fn drop(&mut self) {
-        // Close the queue, then let the thread finish what's queued (the
-        // caller's spec 4.4.2 releases are typically the last commands).
-        drop(self.tx.take());
-        if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
-        }
+        self.handle.send(command).map_err(|_| InjectorClosed)
     }
 }
 
