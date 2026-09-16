@@ -11,6 +11,10 @@ description = "macOS OS integration for SARDP (Stage 3): ScreenCaptureKit captur
 [dependencies]
 sardp = { path = ".." }
 sck-capture-poc = { path = "../tools/sck-capture-poc" }
+# `display` (3M-1-e) hands frame timings back through a `tokio::sync::mpsc`
+# channel, the same choice `sardp_win::display` made -- just the channel
+# type, not a runtime: nothing here spawns tasks or needs an executor.
+tokio = { version = "1.53.1", features = ["sync"] }
 
 [lints.rust]
 unsafe_code = "forbid"

@@ -1,4 +1,4 @@
-# sck-capture-poc (3M-1-a / 3M-1-b)
+# sck-capture-poc (3M-1-a / 3M-1-b / 3M-1-e)
 
 `docs/sardp-stage3-os-integration-roadmap.md`のmacOS 3M-1: 在席キャプチャ・エンコード基盤の
 単体疎通確認と、その**OS境界そのもの**。Windowsの`tools/dxgi-capture-poc`と同じ位置づけで、
@@ -39,6 +39,27 @@ NSStringキーのCMSampleBuffer attachment)なので、ロードマップの判�
   移動をドラッグにするか、クリック数をいくつにするかといった判断はすべて`sardp-mac::inject`側にあり、
   ディスプレイもTCC許可も無い環境でユニットテストできる。`src/inject.rs`が安全なラッパー。
   末尾のイベントタップは**検証専用**(下記)。
+
+- `shim/VtDecoder.swift`: `VTDecompressionSession`に触れる唯一の場所(3M-1-e)。空の
+  `VTDecodeFrameFlags`を渡す(非同期・時間並べ替えのどちらも立てない)と出力コールバックが
+  `VTDecompressionSessionDecodeFrame`の戻り前に必ず走るというドキュメント上の保証を使い、
+  Windowsの`IMFTransform`のような手書きポーリングループなしで1呼び出し=1入出力を実現する。
+  フォーマット記述はSPS/PPSから構築する必要があるため(Media FoundationのMFTと違い
+  Annex-Bを自分ではパースしない)、呼び出し側が`sardp::h264`でIDRから抽出して渡す。出力は
+  `kCVPixelBufferIOSurfacePropertiesKey`付きで要求し、`DisplayWindow.swift`がCPUコピーなしで
+  `CALayer.contents`へ直代入できるようにする。`src/vtdec.rs`が安全なラッパー、
+  `PixelBufferOwned`が`Decoder::decode`から`DisplayWindow::present`への一度きりの受け渡しを
+  型で表現する(`Drop`で解放漏れを防ぐ)。
+- `shim/DisplayWindow.swift`: `NSWindow`/`NSApplication`に触れる唯一の場所(3M-1-e)。
+  **`NSWindow`はプロセスの本物のメインスレッドでしか作れない**(捕捉不能な
+  `NSInternalInconsistencyException`で強制終了する、`Result`では確認できない)ため、
+  `main_thread.rs`がこのファイルの全関数を実際にメインスレッドへ持ち込む。詳細と踏んだ罠は
+  `KNOWN_ISSUES.md`項目30。`src/window.rs`が安全なラッパー。
+- `src/main_thread.rs`: `DisplayWindow`のFFI呼び出しをプロセスの本物のメインスレッドへ
+  マーシャリングする(チャネル越しにジョブを送り完了を待つ)。呼び出し側(`sardp-mac::display`)
+  からは透過的。`sardp-cli`の`sardp-client`は`--display window`のときだけ`main()`を
+  素の`fn main()`に変え、本物のスレッド0でこのループを回し、tokioランタイムは別スレッドへ
+  追い出す。
 
 ## バイナリ
 

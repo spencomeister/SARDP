@@ -38,12 +38,12 @@
 //! unit tests; the Swift shim only posts what it is told.
 
 use std::sync::mpsc;
-use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use sck_capture_poc::inject::{InjectError, Injector, MouseKind};
 
 use crate::keymap;
+use sardp::worker_handle::WorkerHandle;
 
 pub use sck_capture_poc::inject::{
     INJECTED_USER_DATA, cursor_position, is_accessibility_trusted, request_accessibility_trust,
@@ -428,9 +428,14 @@ impl std::error::Error for InjectorClosed {}
 /// A running injector. Dropping it lets the thread finish what is queued
 /// (the caller's spec 4.4.2 releases are typically the last commands) and
 /// then releases the event source.
+///
+/// The "feed a worker thread, then join on drop" boilerplate this used to
+/// carry as its own `impl Drop` is [`WorkerHandle`] (core crate,
+/// KNOWN_ISSUES #29) now -- the same replacement `sardp_win::InputInjector`
+/// got; this one is macOS's turn (KNOWN_ISSUES #29's "held for a macOS
+/// session" note, #30).
 pub struct InputInjector {
-    tx: Option<mpsc::Sender<InjectCommand>>,
-    worker: Option<JoinHandle<()>>,
+    handle: WorkerHandle<InjectCommand>,
 }
 
 impl InputInjector {
@@ -475,27 +480,13 @@ impl InputInjector {
             })
             .expect("spawn inject thread");
         Ok(Self {
-            tx: Some(tx),
-            worker: Some(worker),
+            handle: WorkerHandle::new(tx, worker),
         })
     }
 
     /// Queues one injection; never blocks.
     pub fn inject(&self, command: InjectCommand) -> Result<(), InjectorClosed> {
-        self.tx
-            .as_ref()
-            .ok_or(InjectorClosed)?
-            .send(command)
-            .map_err(|_| InjectorClosed)
-    }
-}
-
-impl Drop for InputInjector {
-    fn drop(&mut self) {
-        drop(self.tx.take());
-        if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
-        }
+        self.handle.send(command).map_err(|_| InjectorClosed)
     }
 }
 
