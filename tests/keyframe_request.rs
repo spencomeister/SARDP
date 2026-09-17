@@ -16,7 +16,9 @@
 //!   payloads `m5_backpressure.rs` uses: this is about the protocol
 //!   mechanism, not video content, so it runs without `ffmpeg`.
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+mod common;
+
+use common::connect_pair;
 
 use sardp::channel_sm::ChannelState;
 use sardp::client_display::{ClientDisplay, SubmitOutcome};
@@ -34,40 +36,6 @@ use sardp::video_channel::{
 };
 use sardp::video_session::{open_video_instance, read_video_instance_intro};
 use sardp::video_sm::InstanceState;
-use sardp::{net, pki};
-
-/// Local bind address for the test endpoints. Defaults to 127.0.0.1, but
-/// honors `SARDP_TEST_BIND_ADDR` (an IPv4 address) so the test can still
-/// run on a machine whose UDP *loopback* is broken while UDP over a real
-/// local interface works (KNOWN_ISSUES.md item 14 -- e.g. set it to the
-/// machine's LAN address). Same override as `stage3w1d_input.rs`.
-fn loopback(port: u16) -> SocketAddr {
-    let ip = std::env::var("SARDP_TEST_BIND_ADDR")
-        .ok()
-        .and_then(|s| s.parse::<Ipv4Addr>().ok())
-        .unwrap_or(Ipv4Addr::LOCALHOST);
-    SocketAddr::new(IpAddr::V4(ip), port)
-}
-
-async fn connect_pair() -> (quinn::Connection, quinn::Connection) {
-    let test_cert = pki::generate_test_certificate("localhost");
-    let server_endpoint = net::server_endpoint(loopback(0), &test_cert);
-    let server_addr = server_endpoint.local_addr().unwrap();
-    let client_endpoint = net::client_endpoint(loopback(0), &test_cert.cert_der);
-
-    let server_accept = tokio::spawn(async move {
-        let incoming = server_endpoint.accept().await.expect("incoming connection");
-        let connection = incoming.await.expect("server-side handshake");
-        (server_endpoint, connection)
-    });
-    let client_connection = client_endpoint
-        .connect(server_addr, "localhost")
-        .expect("valid connect params")
-        .await
-        .expect("client-side handshake");
-    let (_server_endpoint, server_connection) = server_accept.await.unwrap();
-    (client_connection, server_connection)
-}
 
 fn test_encoder_config() -> EncoderConfig {
     EncoderConfig {

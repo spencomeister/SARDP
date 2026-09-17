@@ -6,7 +6,9 @@
 //! only exercised by hand-running two real binaries -- gets a real
 //! automated regression test.
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+mod common;
+
+use common::{TestServer, connect_to};
 
 use ed25519_dalek::SigningKey;
 use sardp::connection_sm::defaults as timeouts;
@@ -14,46 +16,15 @@ use sardp::handshake::client_handshake;
 use sardp::reason_code::ReasonCode;
 use sardp::reconnection::{EstablishOutcome, client_reconnect, establish_connection};
 use sardp::session_store::SessionStore;
-use sardp::{net, pki};
-
-/// Local bind address for the test endpoints. Defaults to 127.0.0.1, but
-/// honors `SARDP_TEST_BIND_ADDR` (an IPv4 address) so the test can still
-/// run on a machine whose UDP *loopback* is broken while UDP over a real
-/// local interface works (KNOWN_ISSUES.md item 14 -- e.g. set it to the
-/// machine's LAN address). Same override as `stage3w1d_input.rs`.
-fn loopback(port: u16) -> SocketAddr {
-    let ip = std::env::var("SARDP_TEST_BIND_ADDR")
-        .ok()
-        .and_then(|s| s.parse::<Ipv4Addr>().ok())
-        .unwrap_or(Ipv4Addr::LOCALHOST);
-    SocketAddr::new(IpAddr::V4(ip), port)
-}
-
-async fn accept_one(endpoint: &quinn::Endpoint) -> quinn::Connection {
-    let incoming = endpoint.accept().await.expect("incoming connection");
-    incoming.await.expect("server-side QUIC handshake")
-}
 
 #[tokio::test]
 async fn establish_connection_handles_a_fresh_client_hello() {
-    let test_cert = pki::generate_test_certificate("localhost");
-    let server_endpoint = net::server_endpoint(loopback(0), &test_cert);
-    let server_addr = server_endpoint.local_addr().unwrap();
+    let server = TestServer::start();
     let client_signing_key = SigningKey::from_bytes(&[0x91; 32]);
     let trusted_public_key = client_signing_key.verifying_key();
     let sessions = SessionStore::new();
 
-    let client_endpoint = net::client_endpoint(loopback(0), &test_cert.cert_der);
-    let (client_connection, server_connection) = {
-        let server_endpoint = server_endpoint.clone();
-        let server_accept = tokio::spawn(async move { accept_one(&server_endpoint).await });
-        let client_connection = client_endpoint
-            .connect(server_addr, "localhost")
-            .expect("valid connect params")
-            .await
-            .expect("client-side QUIC handshake");
-        (client_connection, server_accept.await.unwrap())
-    };
+    let (client_connection, server_connection) = connect_to(&server).await;
 
     let (client_result, server_result) = tokio::join!(
         client_handshake(
@@ -92,25 +63,13 @@ async fn establish_connection_handles_a_fresh_client_hello() {
 
 #[tokio::test]
 async fn establish_connection_resumes_a_suspended_session() {
-    let test_cert = pki::generate_test_certificate("localhost");
-    let server_endpoint = net::server_endpoint(loopback(0), &test_cert);
-    let server_addr = server_endpoint.local_addr().unwrap();
+    let server = TestServer::start();
     let client_signing_key = SigningKey::from_bytes(&[0x92; 32]);
     let trusted_public_key = client_signing_key.verifying_key();
     let sessions = std::sync::Arc::new(SessionStore::new());
 
     // --- Establish and suspend an original session. ---
-    let client_endpoint_1 = net::client_endpoint(loopback(0), &test_cert.cert_der);
-    let (client_connection_1, server_connection_1) = {
-        let server_endpoint = server_endpoint.clone();
-        let server_accept = tokio::spawn(async move { accept_one(&server_endpoint).await });
-        let client_connection = client_endpoint_1
-            .connect(server_addr, "localhost")
-            .expect("valid connect params")
-            .await
-            .expect("client-side QUIC handshake");
-        (client_connection, server_accept.await.unwrap())
-    };
+    let (client_connection_1, server_connection_1) = connect_to(&server).await;
     let (client_result, server_result) = tokio::join!(
         client_handshake(
             &client_connection_1,
@@ -151,17 +110,7 @@ async fn establish_connection_resumes_a_suspended_session() {
     drop(server_connection_1);
 
     // --- Reconnect on a brand new QUIC connection. ---
-    let client_endpoint_2 = net::client_endpoint(loopback(0), &test_cert.cert_der);
-    let (client_connection_2, server_connection_2) = {
-        let server_endpoint = server_endpoint.clone();
-        let server_accept = tokio::spawn(async move { accept_one(&server_endpoint).await });
-        let client_connection = client_endpoint_2
-            .connect(server_addr, "localhost")
-            .expect("valid connect params")
-            .await
-            .expect("client-side QUIC handshake");
-        (client_connection, server_accept.await.unwrap())
-    };
+    let (client_connection_2, server_connection_2) = connect_to(&server).await;
 
     let (client_reconnect_result, server_result) = tokio::join!(
         client_reconnect(
@@ -202,9 +151,7 @@ async fn establish_connection_resumes_a_suspended_session() {
 
 #[tokio::test]
 async fn establish_connection_reports_a_rejected_reconnect() {
-    let test_cert = pki::generate_test_certificate("localhost");
-    let server_endpoint = net::server_endpoint(loopback(0), &test_cert);
-    let server_addr = server_endpoint.local_addr().unwrap();
+    let server = TestServer::start();
     let client_signing_key = SigningKey::from_bytes(&[0x93; 32]);
     let trusted_public_key = client_signing_key.verifying_key();
     let sessions = SessionStore::new();
@@ -212,17 +159,7 @@ async fn establish_connection_reports_a_rejected_reconnect() {
     // No session was ever suspended -- any SessionReauthenticate must be
     // rejected. Drive it directly against a raw control stream, mirroring
     // the wire shape `client_reconnect` sends.
-    let client_endpoint = net::client_endpoint(loopback(0), &test_cert.cert_der);
-    let (client_connection, server_connection) = {
-        let server_endpoint = server_endpoint.clone();
-        let server_accept = tokio::spawn(async move { accept_one(&server_endpoint).await });
-        let client_connection = client_endpoint
-            .connect(server_addr, "localhost")
-            .expect("valid connect params")
-            .await
-            .expect("client-side QUIC handshake");
-        (client_connection, server_accept.await.unwrap())
-    };
+    let (client_connection, server_connection) = connect_to(&server).await;
 
     let mut unknown_sm = sardp::connection_sm::ConnectionSm::new();
     unknown_sm.complete_handshake().unwrap();
