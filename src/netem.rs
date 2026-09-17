@@ -12,6 +12,8 @@
 
 use std::process::{Command, Stdio};
 
+use crate::drop_guard::DropGuard;
+
 const DEFAULT_IFACE: &str = "lo";
 
 #[derive(Debug)]
@@ -131,19 +133,24 @@ pub fn clear() -> Result<(), NetemError> {
 
 /// RAII guard: applies `profile` on construction, clears it (best-effort)
 /// on drop, so a test leaves the loopback interface as it found it even
-/// if it panics partway through.
-pub struct NetemGuard;
+/// if it panics partway through. A [`DropGuard`] closure (KNOWN_ISSUES
+/// #29): this type only exists so the specific cleanup action
+/// (`let _ = clear();`) doesn't have to be repeated at every call site.
+pub struct NetemGuard {
+    /// Held only for its `Drop` side effect (clears the applied profile);
+    /// never read.
+    #[allow(dead_code)]
+    clear_on_drop: DropGuard<fn()>,
+}
 
 impl NetemGuard {
     pub fn apply(profile: NetemProfile) -> Result<Self, NetemError> {
         apply_profile(profile)?;
-        Ok(Self)
-    }
-}
-
-impl Drop for NetemGuard {
-    fn drop(&mut self) {
-        let _ = clear();
+        Ok(Self {
+            clear_on_drop: DropGuard::new(|| {
+                let _ = clear();
+            }),
+        })
     }
 }
 
